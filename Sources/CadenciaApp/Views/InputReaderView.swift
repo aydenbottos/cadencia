@@ -42,7 +42,7 @@ public struct InputReaderView: View {
 
             // Floating Tap-to-Gloss Liquid Glass Popover Card
             if let gloss = controller.selectedGlossItem {
-                glossPopoverCard(item: gloss.item, clue: gloss.clue, surface: gloss.surface)
+                glossPopoverCard(item: gloss.item, clue: gloss.contextClue, surface: gloss.surface)
                     .padding(.horizontal, 18)
                     .padding(.bottom, 92)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
