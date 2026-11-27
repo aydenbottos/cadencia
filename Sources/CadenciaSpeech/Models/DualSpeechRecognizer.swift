@@ -142,8 +142,10 @@ public actor DualSpeechRecognizer {
         assetManager: ModelAssetManager,
         parakeetModels: AsrModels? = nil
     ) async throws {
-        let needParakeet = parakeetModels != nil || (!isParakeetReady && (await assetManager.isModelInstalled(.parakeetUltra)))
-        let needZipa = !isZipaReady && (await assetManager.isModelInstalled(.zipaPhoneme))
+        let parakeetInstalled = await assetManager.isModelInstalled(.parakeetUltra)
+        let zipaInstalled = await assetManager.isModelInstalled(.zipaPhoneme)
+        let needParakeet = parakeetModels != nil || (!isParakeetReady && parakeetInstalled)
+        let needZipa = !isZipaReady && zipaInstalled
         let needVad = !isVADReady
         let zipaDir = await assetManager.directory(for: .zipaPhoneme)
         let zipa = self.zipaEngine
