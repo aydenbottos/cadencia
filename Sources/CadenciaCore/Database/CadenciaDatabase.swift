@@ -30,7 +30,7 @@ private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.sel
 /// - Strict APPEND-ONLY `evidence_events` table enforced by SQLite BEFORE UPDATE/DELETE ABORT triggers
 /// - Weekly audits, research assessments (Vocab Size, EIT, Native Listening), sessions, and serial state
 public actor CadenciaDatabase {
-    private var db: OpaquePointer?
+    private nonisolated(unsafe) var db: OpaquePointer?
     public let dbURL: URL
 
     public init(databaseURL: URL? = nil, seedURL: URL? = nil) throws {

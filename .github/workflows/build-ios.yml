@@ -61,13 +61,15 @@ jobs:
             models/coreml/zipa_config.json
           key: zipa-cr-large-300m-fp16-mlmodelc-${{ hashFiles('tools/convert_zipa_coreml.py') }}
 
+      - name: Install uv (for pinned Python 3.12 Core ML toolchain)
+        if: steps.cache-zipa.outputs.cache-hit != 'true'
+        uses: astral-sh/setup-uv@v6
+
       - name: Convert & compile ZIPA CR Large 300M FP16 on Apple Silicon (cache miss only)
         if: steps.cache-zipa.outputs.cache-hit != 'true'
         run: |
-          python3 --version
-          python3 -m venv .venv-ci-coreml
-          .venv-ci-coreml/bin/pip install --upgrade pip
-          .venv-ci-coreml/bin/pip install torch==2.7.0 coremltools==9.0 "numpy<2" huggingface_hub
+          uv venv --python 3.12 .venv-ci-coreml
+          uv pip install --python .venv-ci-coreml/bin/python torch==2.7.0 coremltools==9.0 "numpy<2" huggingface_hub
           .venv-ci-coreml/bin/python tools/convert_zipa_coreml.py --auto-download --skip-onnx
           xcrun coremlcompiler compile \
             models/coreml/ZipaCRLarge300M_FP16.mlpackage \
