@@ -425,6 +425,13 @@ public struct WordTimingSpan: Sendable, Codable, Hashable {
     public let word: String
     public let startTime: TimeInterval
     public let endTime: TimeInterval
+
+    public init(wordIndex: Int, word: String, startTime: TimeInterval, endTime: TimeInterval) {
+        self.wordIndex = wordIndex
+        self.word = word
+        self.startTime = startTime
+        self.endTime = endTime
+    }
 }
 
 public struct SynthesizedAudioClip: Sendable {
@@ -435,6 +442,24 @@ public struct SynthesizedAudioClip: Sendable {
     public let synthesisLatencyMs: Double
     public let realTimeFactor: Double
     public let cachedFileURL: URL?
+
+    public init(
+        samples: [Float],
+        sampleRate: Double,
+        durationSeconds: TimeInterval,
+        wordTimings: [WordTimingSpan],
+        synthesisLatencyMs: Double,
+        realTimeFactor: Double,
+        cachedFileURL: URL?
+    ) {
+        self.samples = samples
+        self.sampleRate = sampleRate
+        self.durationSeconds = durationSeconds
+        self.wordTimings = wordTimings
+        self.synthesisLatencyMs = synthesisLatencyMs
+        self.realTimeFactor = realTimeFactor
+        self.cachedFileURL = cachedFileURL
+    }
 }
 
 // MARK: - Native On-Device NVIDIA Magpie v2607 Core ML Engine + Pitch-Preserving Pace Player
@@ -678,7 +703,7 @@ public actor MagpieV2607Engine {
             mbPtr[i] = i < tLen ? 1.0 : 0.0
         }
 
-        let encOut = try textEnc.prediction(from: MLDictionaryFeatureProvider(dictionary: [
+        let encOut = try await textEnc.prediction(from: MLDictionaryFeatureProvider(dictionary: [
             "text_tokens": MLFeatureValue(multiArray: tokensArr),
             "text_mask": MLFeatureValue(multiArray: maskArr),
         ]))
@@ -695,7 +720,7 @@ public actor MagpieV2607Engine {
             spkDst[i] = Float16(spkSrc[i])
         }
 
-        let prefillOut = try prefill.prediction(from: MLDictionaryFeatureProvider(dictionary: [
+        let prefillOut = try await prefill.prediction(from: MLDictionaryFeatureProvider(dictionary: [
             "input": MLFeatureValue(multiArray: spkArr),
             "encoder_output": MLFeatureValue(multiArray: encoderOutput),
             "encoder_mask": MLFeatureValue(multiArray: maskArr),

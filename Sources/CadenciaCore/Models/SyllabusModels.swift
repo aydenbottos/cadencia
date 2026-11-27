@@ -250,6 +250,50 @@ public struct ProtocolParameters: Codable, Sendable, Equatable {
     public var newCognateHalfLifeDays: Double
     public var isFrozen: Bool
 
+    public init(
+        strongSuccessMultiplier: Double,
+        weakSuccessMultiplier: Double,
+        failureMultiplier: Double,
+        dueRecallThreshold: Double,
+        scheduledShareCap: Double,
+        scheduledShareFloor: Double,
+        maxNewItemsPerSession: Int,
+        maxNewItemsPerPassage: Int,
+        passageMinWords: Int,
+        passageMaxWords: Int,
+        newItemMinOccurrences: Int,
+        newItemMinWordSpacing: Int,
+        knownMinHalfLifeDays: Double,
+        knownMinSuccesses: Int,
+        knownMinEarSuccesses: Int,
+        productiveMinUses: Int,
+        doubtPaceMultiplier: Double,
+        newRegularHalfLifeDays: Double,
+        newCognateHalfLifeDays: Double,
+        isFrozen: Bool
+    ) {
+        self.strongSuccessMultiplier = strongSuccessMultiplier
+        self.weakSuccessMultiplier = weakSuccessMultiplier
+        self.failureMultiplier = failureMultiplier
+        self.dueRecallThreshold = dueRecallThreshold
+        self.scheduledShareCap = scheduledShareCap
+        self.scheduledShareFloor = scheduledShareFloor
+        self.maxNewItemsPerSession = maxNewItemsPerSession
+        self.maxNewItemsPerPassage = maxNewItemsPerPassage
+        self.passageMinWords = passageMinWords
+        self.passageMaxWords = passageMaxWords
+        self.newItemMinOccurrences = newItemMinOccurrences
+        self.newItemMinWordSpacing = newItemMinWordSpacing
+        self.knownMinHalfLifeDays = knownMinHalfLifeDays
+        self.knownMinSuccesses = knownMinSuccesses
+        self.knownMinEarSuccesses = knownMinEarSuccesses
+        self.productiveMinUses = productiveMinUses
+        self.doubtPaceMultiplier = doubtPaceMultiplier
+        self.newRegularHalfLifeDays = newRegularHalfLifeDays
+        self.newCognateHalfLifeDays = newCognateHalfLifeDays
+        self.isFrozen = isFrozen
+    }
+
     /// Exact defaults from Signal-starvation hypothesis test protocol (pp. 5-7, 14-15)
     public static let protocolDefaults = ProtocolParameters(
         strongSuccessMultiplier: 2.2,
@@ -284,6 +328,26 @@ public struct SerialGenre: Identifiable, Codable, Sendable, Hashable {
     public let premise: String
     public let accentPalette: String
     public let protagonist: String
+
+    public init(
+        id: String,
+        titleEs: String,
+        titleEn: String,
+        tagline: String,
+        setting: String,
+        premise: String,
+        accentPalette: String,
+        protagonist: String
+    ) {
+        self.id = id
+        self.titleEs = titleEs
+        self.titleEn = titleEn
+        self.tagline = tagline
+        self.setting = setting
+        self.premise = premise
+        self.accentPalette = accentPalette
+        self.protagonist = protagonist
+    }
 }
 
 public struct LearnerProfile: Codable, Sendable {
@@ -298,6 +362,32 @@ public struct LearnerProfile: Codable, Sendable {
     public var medianReadingWPM: Double
     public var parameters: ProtocolParameters
     public var createdAt: Date
+
+    public init(
+        learnerId: String,
+        codedGroupLabel: String,
+        displayName: String,
+        studyMode: StudyMode,
+        selectedSerialId: String,
+        nonfictionTopics: [String],
+        currentSessionNumber: Int,
+        totalLoggedSeconds: Double,
+        medianReadingWPM: Double,
+        parameters: ProtocolParameters,
+        createdAt: Date
+    ) {
+        self.learnerId = learnerId
+        self.codedGroupLabel = codedGroupLabel
+        self.displayName = displayName
+        self.studyMode = studyMode
+        self.selectedSerialId = selectedSerialId
+        self.nonfictionTopics = nonfictionTopics
+        self.currentSessionNumber = currentSessionNumber
+        self.totalLoggedSeconds = totalLoggedSeconds
+        self.medianReadingWPM = medianReadingWPM
+        self.parameters = parameters
+        self.createdAt = createdAt
+    }
 
     public var currentWeek: Int {
         min(8, max(1, ((currentSessionNumber - 1) / 6) + 1))

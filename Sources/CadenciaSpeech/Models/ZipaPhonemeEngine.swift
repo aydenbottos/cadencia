@@ -10,6 +10,15 @@ public struct ZipaPhonemeResult: Sendable {
     public let fbankMs: Double
     public let inferenceMs: Double
     public let totalLatencyMs: Double
+
+    public init(ipaString: String, phoneTokens: [String], bucketUsed: Int, fbankMs: Double, inferenceMs: Double, totalLatencyMs: Double) {
+        self.ipaString = ipaString
+        self.phoneTokens = phoneTokens
+        self.bucketUsed = bucketUsed
+        self.fbankMs = fbankMs
+        self.inferenceMs = inferenceMs
+        self.totalLatencyMs = totalLatencyMs
+    }
 }
 
 /// Native Core ML FP16 Multifunction ANE runtime for **ZIPA CR Large 300M**
@@ -96,7 +105,7 @@ public actor ZipaPhonemeEngine {
             let dummyLen = try MLMultiArray(shape: [1], dataType: .int32)
             memset(dummyX.dataPointer, 0, dummyX.count * MemoryLayout<Float>.stride)
             dummyLen.dataPointer.bindMemory(to: Int32.self, capacity: 1)[0] = 64
-            _ = try? warmModel.prediction(from: MLDictionaryFeatureProvider(dictionary: [
+            _ = try? await warmModel.prediction(from: MLDictionaryFeatureProvider(dictionary: [
                 "x": MLFeatureValue(multiArray: dummyX),
                 "x_lens": MLFeatureValue(multiArray: dummyLen),
             ]))
@@ -146,7 +155,7 @@ public actor ZipaPhonemeEngine {
             let lenArr = try MLMultiArray(shape: [1], dataType: .int32)
             lenArr.dataPointer.bindMemory(to: Int32.self, capacity: 1)[0] = Int32(chunkFrames)
 
-            let out = try model.prediction(from: MLDictionaryFeatureProvider(dictionary: [
+            let out = try await model.prediction(from: MLDictionaryFeatureProvider(dictionary: [
                 "x": MLFeatureValue(multiArray: xArr),
                 "x_lens": MLFeatureValue(multiArray: lenArr),
             ]))

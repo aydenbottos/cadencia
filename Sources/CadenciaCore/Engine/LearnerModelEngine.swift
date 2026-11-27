@@ -158,6 +158,24 @@ public struct LearnerModelEngine: Sendable {
         public let failCount: Int
         public let isCognate: Bool
         public let observedCorrect: Bool
+
+        public init(
+            itemId: String,
+            deltaDays: Double,
+            strongCount: Int,
+            weakCount: Int,
+            failCount: Int,
+            isCognate: Bool,
+            observedCorrect: Bool
+        ) {
+            self.itemId = itemId
+            self.deltaDays = deltaDays
+            self.strongCount = strongCount
+            self.weakCount = weakCount
+            self.failCount = failCount
+            self.isCognate = isCognate
+            self.observedCorrect = observedCorrect
+        }
     }
 
     /// Refits `(strongSuccessMultiplier, weakSuccessMultiplier, failureMultiplier)` via bounded

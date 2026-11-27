@@ -14,12 +14,40 @@ public struct DualRecognitionOutput: Sendable {
     public let parakeetLatencyMs: Double
     public let zipaLatencyMs: Double
     public let totalWallLatencyMs: Double
+
+    public init(
+        transcriptEs: String,
+        learnerIPA: String,
+        canonicalSpanishIPA: String,
+        phonemeAccuracy: Double,
+        alignments: [PhonemeAlignmentCell],
+        audioDurationSeconds: Double,
+        parakeetLatencyMs: Double,
+        zipaLatencyMs: Double,
+        totalWallLatencyMs: Double
+    ) {
+        self.transcriptEs = transcriptEs
+        self.learnerIPA = learnerIPA
+        self.canonicalSpanishIPA = canonicalSpanishIPA
+        self.phonemeAccuracy = phonemeAccuracy
+        self.alignments = alignments
+        self.audioDurationSeconds = audioDurationSeconds
+        self.parakeetLatencyMs = parakeetLatencyMs
+        self.zipaLatencyMs = zipaLatencyMs
+        self.totalWallLatencyMs = totalWallLatencyMs
+    }
 }
 
 public struct LiveMicTelemetry: Sendable {
     public let rmsLevel: Float
     public let spectrumBands: [Float] // 16 normalized bands for Metal Resonance Orb
     public let isSpeechActive: Bool
+
+    public init(rmsLevel: Float, spectrumBands: [Float], isSpeechActive: Bool) {
+        self.rmsLevel = rmsLevel
+        self.spectrumBands = spectrumBands
+        self.isSpeechActive = isSpeechActive
+    }
 }
 
 /// Concurrent Dual-Engine On-Device Learner Speech-to-Text Orchestrator:

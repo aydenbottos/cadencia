@@ -13,6 +13,28 @@ public struct WeeklyPlanSpec: Sendable, Codable, Hashable {
     public let hasExamSpeakingFormat: Bool
     public let hasUnscriptedNativeAudio: Bool
 
+    public init(
+        week: Int,
+        paceWPM: Int,
+        newItemsPerSession: Int,
+        cumulativeItemsTarget: Int,
+        scheduledWordShareTarget: Double,
+        audioFirstFraction: Double,
+        hasWritingTasks: Bool,
+        hasExamSpeakingFormat: Bool,
+        hasUnscriptedNativeAudio: Bool
+    ) {
+        self.week = week
+        self.paceWPM = paceWPM
+        self.newItemsPerSession = newItemsPerSession
+        self.cumulativeItemsTarget = cumulativeItemsTarget
+        self.scheduledWordShareTarget = scheduledWordShareTarget
+        self.audioFirstFraction = audioFirstFraction
+        self.hasWritingTasks = hasWritingTasks
+        self.hasExamSpeakingFormat = hasExamSpeakingFormat
+        self.hasUnscriptedNativeAudio = hasUnscriptedNativeAudio
+    }
+
     /// Exact weekly schedule table from protocol PDF p. 8
     public static let eightWeekPlan: [WeeklyPlanSpec] = [
         WeeklyPlanSpec(week: 1, paceWPM: 75,  newItemsPerSession: 73,  cumulativeItemsTarget: 440,  scheduledWordShareTarget: 0.11, audioFirstFraction: 0.00, hasWritingTasks: false, hasExamSpeakingFormat: false, hasUnscriptedNativeAudio: false),
@@ -142,6 +164,46 @@ public struct PassagePlan: Codable, Sendable {
     public let voice: MagpieVoice
     public let accent: SpanishRegionalAccent
     public let priorContextWordsByItem: [String: [String]]
+
+    public init(
+        passageId: String,
+        sessionNumber: Int,
+        passageIndexInSession: Int,
+        blockType: SessionBlockType,
+        isBootstrap: Bool,
+        isAudioFirst: Bool,
+        targetWPM: Int,
+        format: PassageFormat,
+        topicOrEpisodeTitle: String,
+        storySummarySoFar: String,
+        dueItems: [SyllabusItem],
+        newItems: [SyllabusItem],
+        grammarPatterns: [SyllabusItem],
+        allowedKnownLemmas: [String],
+        holdoutBannedLemmas: [String],
+        voice: MagpieVoice,
+        accent: SpanishRegionalAccent,
+        priorContextWordsByItem: [String: [String]]
+    ) {
+        self.passageId = passageId
+        self.sessionNumber = sessionNumber
+        self.passageIndexInSession = passageIndexInSession
+        self.blockType = blockType
+        self.isBootstrap = isBootstrap
+        self.isAudioFirst = isAudioFirst
+        self.targetWPM = targetWPM
+        self.format = format
+        self.topicOrEpisodeTitle = topicOrEpisodeTitle
+        self.storySummarySoFar = storySummarySoFar
+        self.dueItems = dueItems
+        self.newItems = newItems
+        self.grammarPatterns = grammarPatterns
+        self.allowedKnownLemmas = allowedKnownLemmas
+        self.holdoutBannedLemmas = holdoutBannedLemmas
+        self.voice = voice
+        self.accent = accent
+        self.priorContextWordsByItem = priorContextWordsByItem
+    }
 }
 
 public struct NewItemGloss: Codable, Sendable, Hashable {
@@ -150,6 +212,14 @@ public struct NewItemGloss: Codable, Sendable, Hashable {
     public let englishGloss: String
     public let contextClueNote: String
     public let visualCueSymbol: String
+
+    public init(itemId: String, spanish: String, englishGloss: String, contextClueNote: String, visualCueSymbol: String) {
+        self.itemId = itemId
+        self.spanish = spanish
+        self.englishGloss = englishGloss
+        self.contextClueNote = contextClueNote
+        self.visualCueSymbol = visualCueSymbol
+    }
 }
 
 public struct PassageProbe: Identifiable, Codable, Sendable, Hashable {
@@ -160,6 +230,24 @@ public struct PassageProbe: Identifiable, Codable, Sendable, Hashable {
     public let options: [String]
     public let correctOptionIndex: Int
     public let hingeExplanation: String
+
+    public init(
+        id: String,
+        targetDueItemId: String,
+        targetDueLemma: String,
+        questionEn: String,
+        options: [String],
+        correctOptionIndex: Int,
+        hingeExplanation: String
+    ) {
+        self.id = id
+        self.targetDueItemId = targetDueItemId
+        self.targetDueLemma = targetDueLemma
+        self.questionEn = questionEn
+        self.options = options
+        self.correctOptionIndex = correctOptionIndex
+        self.hingeExplanation = hingeExplanation
+    }
 }
 
 public struct GrammarMicroNote: Identifiable, Codable, Sendable, Hashable {
@@ -171,6 +259,24 @@ public struct GrammarMicroNote: Identifiable, Codable, Sendable, Hashable {
     public let contrastAEn: String
     public let contrastBEs: String
     public let contrastBEn: String
+
+    public init(
+        grammarItemId: String,
+        title: String,
+        noteEn: String,
+        contrastAEs: String,
+        contrastAEn: String,
+        contrastBEs: String,
+        contrastBEn: String
+    ) {
+        self.grammarItemId = grammarItemId
+        self.title = title
+        self.noteEn = noteEn
+        self.contrastAEs = contrastAEs
+        self.contrastAEn = contrastAEn
+        self.contrastBEs = contrastBEs
+        self.contrastBEn = contrastBEn
+    }
 }
 
 public struct PassageSentence: Identifiable, Codable, Sendable, Hashable {
@@ -178,6 +284,13 @@ public struct PassageSentence: Identifiable, Codable, Sendable, Hashable {
     public let spanish: String
     public let englishLine: String? // Shown on tap in Bootstrap Sessions 1-4
     public let wordTokens: [String]
+
+    public init(id: Int, spanish: String, englishLine: String?, wordTokens: [String]) {
+        self.id = id
+        self.spanish = spanish
+        self.englishLine = englishLine
+        self.wordTokens = wordTokens
+    }
 }
 
 public struct GeneratedPassage: Identifiable, Codable, Sendable {
@@ -207,6 +320,62 @@ public struct GeneratedPassage: Identifiable, Codable, Sendable {
     public let scheduledWordShare: Double
     public let flaggedForNativeAudit: Bool
     public let createdAt: Date
+
+    public init(
+        id: String,
+        sessionNumber: Int,
+        blockType: SessionBlockType,
+        format: PassageFormat,
+        titleEs: String,
+        titleEn: String,
+        episodeSummaryForNext: String,
+        sentences: [PassageSentence],
+        fullText: String,
+        wordCount: Int,
+        newItemGlosses: [NewItemGloss],
+        probes: [PassageProbe],
+        grammarNotes: [GrammarMicroNote],
+        dueItemIds: [String],
+        newItemIds: [String],
+        grammarItemIds: [String],
+        voice: MagpieVoice,
+        accent: SpanishRegionalAccent,
+        targetWPM: Int,
+        isAudioFirst: Bool,
+        isBootstrap: Bool,
+        rewriteAttempts: Int,
+        dueListWasReduced: Bool,
+        scheduledWordShare: Double,
+        flaggedForNativeAudit: Bool,
+        createdAt: Date
+    ) {
+        self.id = id
+        self.sessionNumber = sessionNumber
+        self.blockType = blockType
+        self.format = format
+        self.titleEs = titleEs
+        self.titleEn = titleEn
+        self.episodeSummaryForNext = episodeSummaryForNext
+        self.sentences = sentences
+        self.fullText = fullText
+        self.wordCount = wordCount
+        self.newItemGlosses = newItemGlosses
+        self.probes = probes
+        self.grammarNotes = grammarNotes
+        self.dueItemIds = dueItemIds
+        self.newItemIds = newItemIds
+        self.grammarItemIds = grammarItemIds
+        self.voice = voice
+        self.accent = accent
+        self.targetWPM = targetWPM
+        self.isAudioFirst = isAudioFirst
+        self.isBootstrap = isBootstrap
+        self.rewriteAttempts = rewriteAttempts
+        self.dueListWasReduced = dueListWasReduced
+        self.scheduledWordShare = scheduledWordShare
+        self.flaggedForNativeAudit = flaggedForNativeAudit
+        self.createdAt = createdAt
+    }
 }
 
 public struct ContractViolation: Codable, Sendable, Hashable {
@@ -214,6 +383,13 @@ public struct ContractViolation: Codable, Sendable, Hashable {
     public let ruleName: String
     public let detail: String
     public let offendingTokens: [String]
+
+    public init(ruleNumber: Int, ruleName: String, detail: String, offendingTokens: [String]) {
+        self.ruleNumber = ruleNumber
+        self.ruleName = ruleName
+        self.detail = detail
+        self.offendingTokens = offendingTokens
+    }
 }
 
 public struct VerificationReport: Codable, Sendable {
@@ -229,6 +405,34 @@ public struct VerificationReport: Codable, Sendable {
     public let stageBPassed: Bool
     public let stageBFeedback: String?
     public let violations: [ContractViolation]
+
+    public init(
+        passed: Bool,
+        totalWords: Int,
+        closedVocabCompliance: Double,
+        scheduledWordShare: Double,
+        missingDueItems: [String],
+        underSpacedNewItems: [String],
+        freshContextCollisions: [String],
+        holdoutLeaks: [String],
+        offListLemmas: [String],
+        stageBPassed: Bool,
+        stageBFeedback: String?,
+        violations: [ContractViolation]
+    ) {
+        self.passed = passed
+        self.totalWords = totalWords
+        self.closedVocabCompliance = closedVocabCompliance
+        self.scheduledWordShare = scheduledWordShare
+        self.missingDueItems = missingDueItems
+        self.underSpacedNewItems = underSpacedNewItems
+        self.freshContextCollisions = freshContextCollisions
+        self.holdoutLeaks = holdoutLeaks
+        self.offListLemmas = offListLemmas
+        self.stageBPassed = stageBPassed
+        self.stageBFeedback = stageBFeedback
+        self.violations = violations
+    }
 }
 
 // MARK: - Speaking & Writing Output Models
@@ -239,6 +443,22 @@ public struct PhonemeAlignmentCell: Identifiable, Codable, Sendable, Hashable {
     public let observedPhone: String
     public let distance: Double // 0.0 = exact, <=0.35 = close allophone, >0.35 = mismatch
     public let coachingHint: String?
+
+    public var isExactMatch: Bool { distance < 0.01 }
+
+    public init(
+        id: Int,
+        expectedPhone: String,
+        observedPhone: String,
+        distance: Double,
+        coachingHint: String?
+    ) {
+        self.id = id
+        self.expectedPhone = expectedPhone
+        self.observedPhone = observedPhone
+        self.distance = distance
+        self.coachingHint = coachingHint
+    }
 }
 
 public struct SpokenTurnEvaluation: Identifiable, Codable, Sendable {
@@ -255,6 +475,36 @@ public struct SpokenTurnEvaluation: Identifiable, Codable, Sendable {
     public let failedGrammarPatternIds: [String]
     public let parakeetLatencyMs: Double
     public let zipaLatencyMs: Double
+
+    public init(
+        id: String,
+        timestamp: Date,
+        learnerTranscript: String,
+        learnerIPA: String,
+        canonicalSpanishIPA: String,
+        phonemeAccuracy: Double,
+        alignments: [PhonemeAlignmentCell],
+        partnerRecastEs: String?,
+        partnerReplyEs: String,
+        correctlyUsedItemIds: [String],
+        failedGrammarPatternIds: [String],
+        parakeetLatencyMs: Double,
+        zipaLatencyMs: Double
+    ) {
+        self.id = id
+        self.timestamp = timestamp
+        self.learnerTranscript = learnerTranscript
+        self.learnerIPA = learnerIPA
+        self.canonicalSpanishIPA = canonicalSpanishIPA
+        self.phonemeAccuracy = phonemeAccuracy
+        self.alignments = alignments
+        self.partnerRecastEs = partnerRecastEs
+        self.partnerReplyEs = partnerReplyEs
+        self.correctlyUsedItemIds = correctlyUsedItemIds
+        self.failedGrammarPatternIds = failedGrammarPatternIds
+        self.parakeetLatencyMs = parakeetLatencyMs
+        self.zipaLatencyMs = zipaLatencyMs
+    }
 }
 
 public struct WritingSubmissionFeedback: Identifiable, Codable, Sendable {
@@ -266,6 +516,26 @@ public struct WritingSubmissionFeedback: Identifiable, Codable, Sendable {
     public let failedGrammarPatternIds: [String]
     public let wordCount: Int
     public let elapsedSeconds: Double
+
+    public init(
+        id: String,
+        promptEs: String,
+        learnerText: String,
+        recastSentences: [RecastPair],
+        correctlyUsedItemIds: [String],
+        failedGrammarPatternIds: [String],
+        wordCount: Int,
+        elapsedSeconds: Double
+    ) {
+        self.id = id
+        self.promptEs = promptEs
+        self.learnerText = learnerText
+        self.recastSentences = recastSentences
+        self.correctlyUsedItemIds = correctlyUsedItemIds
+        self.failedGrammarPatternIds = failedGrammarPatternIds
+        self.wordCount = wordCount
+        self.elapsedSeconds = elapsedSeconds
+    }
 }
 
 public struct RecastPair: Codable, Sendable, Hashable {
@@ -273,6 +543,13 @@ public struct RecastPair: Codable, Sendable, Hashable {
     public let corrected: String
     public let hadError: Bool
     public let failedPatternId: String?
+
+    public init(original: String, corrected: String, hadError: Bool, failedPatternId: String?) {
+        self.original = original
+        self.corrected = corrected
+        self.hadError = hadError
+        self.failedPatternId = failedPatternId
+    }
 }
 
 public struct SessionSummary: Identifiable, Codable, Sendable {
@@ -296,4 +573,48 @@ public struct SessionSummary: Identifiable, Codable, Sendable {
     public let fatigueRating: Int?     // 1-7
     public let enjoymentRating: Int?   // 1-7
     public let noOtherSpanishConfirmed: Bool
+
+    public init(
+        id: String,
+        sessionNumber: Int,
+        week: Int,
+        studyMode: StudyMode,
+        startedAt: Date,
+        endedAt: Date,
+        activeInputSeconds: Double,
+        activeOutputSeconds: Double,
+        passagesCompleted: Int,
+        runningWordsProcessed: Int,
+        usableEventsCount: Int,
+        usableEventsPerInputMinute: Double,
+        probesCorrect: Int,
+        probesTotal: Int,
+        newItemsIntroduced: Int,
+        itemsPromotedToKnown: Int,
+        itemsPromotedToProductive: Int,
+        fatigueRating: Int?,
+        enjoymentRating: Int?,
+        noOtherSpanishConfirmed: Bool
+    ) {
+        self.id = id
+        self.sessionNumber = sessionNumber
+        self.week = week
+        self.studyMode = studyMode
+        self.startedAt = startedAt
+        self.endedAt = endedAt
+        self.activeInputSeconds = activeInputSeconds
+        self.activeOutputSeconds = activeOutputSeconds
+        self.passagesCompleted = passagesCompleted
+        self.runningWordsProcessed = runningWordsProcessed
+        self.usableEventsCount = usableEventsCount
+        self.usableEventsPerInputMinute = usableEventsPerInputMinute
+        self.probesCorrect = probesCorrect
+        self.probesTotal = probesTotal
+        self.newItemsIntroduced = newItemsIntroduced
+        self.itemsPromotedToKnown = itemsPromotedToKnown
+        self.itemsPromotedToProductive = itemsPromotedToProductive
+        self.fatigueRating = fatigueRating
+        self.enjoymentRating = enjoymentRating
+        self.noOtherSpanishConfirmed = noOtherSpanishConfirmed
+    }
 }
