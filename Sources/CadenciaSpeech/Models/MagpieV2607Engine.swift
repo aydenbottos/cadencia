@@ -307,7 +307,6 @@ struct MagpieLocalTransformerWeights: Sendable {
 
 struct MagpieSpanishTokenizer: Sendable {
     private let spanishOffset = 96
-    private let bosTokenId: Int32 = 2360
     private let eosTokenId: Int32 = 2361
     private let token2Id: [String: Int32]
     private let phonemeDict: [String: [String]]
@@ -326,9 +325,9 @@ struct MagpieSpanishTokenizer: Sendable {
                 parsed.reserveCapacity(raw.count)
                 for (k, v) in raw {
                     if let arr = v as? [String] {
-                        parsed[k.uppercased()] = arr
+                        parsed[k.uppercased(with: Locale(identifier: "es_ES"))] = arr
                     } else if let nested = v as? [[String]], let first = nested.first {
-                        parsed[k.uppercased()] = first
+                        parsed[k.uppercased(with: Locale(identifier: "es_ES"))] = first
                     }
                 }
                 self.phonemeDict = parsed
@@ -340,7 +339,8 @@ struct MagpieSpanishTokenizer: Sendable {
         }
     }
 
-    /// Tokenizes Spanish prose into Magpie AggregatedTTSTokenizer IDs with regional accent adaptation:
+    /// Tokenizes Spanish prose into Magpie AggregatedTTSTokenizer IDs matching NeMo's
+    /// `chunk_and_tokenize_text_by_sentence` (NO text_bos_id; leading/trailing space + trailing eos_token_id=2361):
     /// - `.castilian` (`es-ES`): keeps distinción `/θ/` and `/ʎ/`
     /// - `.latinAmerican` (`es-419`): maps `/θ/` -> `/s/` (seseo) and `/ʎ/` -> `/ʝ/` (yeísmo)
     /// - `.rioplatense` (`es-AR`): maps `/θ/` -> `/s/` (seseo) and `/ʎ/`, `/ʝ/` -> `/ʃ/` (sheísmo)
@@ -349,8 +349,8 @@ struct MagpieSpanishTokenizer: Sendable {
         var ids: [Int32] = []
         ids.reserveCapacity(128)
         let spaceId = (token2Id[" "] ?? 100) + Int32(spanishOffset)
-        ids.append(bosTokenId)
-        ids.append(spaceId) // Spanish tokenizer uses pad_with_space = true
+        let esLocale = Locale(identifier: "es_ES")
+        ids.append(spaceId) // Spanish tokenizer uses pad_with_space = true (matches tokenizer_references.json)
 
         // Split on inline | ... | IPA overrides
         let segments = text.components(separatedBy: "|")
@@ -358,7 +358,8 @@ struct MagpieSpanishTokenizer: Sendable {
             if segIdx % 2 == 1 {
                 // Direct IPA symbols separated by whitespace
                 for sym in seg.split(separator: " ") {
-                    if let localId = token2Id[String(sym)] {
+                    let s = sym == "g" ? "ɡ" : String(sym)
+                    if let localId = token2Id[s] {
                         ids.append(localId + Int32(spanishOffset))
                     }
                 }
@@ -379,10 +380,13 @@ struct MagpieSpanishTokenizer: Sendable {
 
                 if !core.isEmpty {
                     let phones: [String]
-                    if let dictPhones = phonemeDict[core.uppercased()] {
+                    let upperKey = core.uppercased(with: esLocale)
+                    if let dictPhones = phonemeDict[upperKey] {
                         phones = applyRegionalPhonology(dictPhones, accent: accent)
                     } else {
+                        // OOV fallback: normalize ASCII 'g' -> IPA 'ɡ' so every phoneme maps cleanly in spanish_phoneme_token2id
                         let ipa = SpanishLemmatizer.wordToIPA(core, accent: accent)
+                            .replacingOccurrences(of: "g", with: "ɡ")
                         phones = ipa.map { String($0) }
                     }
                     for ph in phones {
@@ -527,6 +531,12 @@ public actor MagpieV2607Engine {
         let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
         self.audioCacheDir = caches.appendingPathComponent("CadenciaAudioCache", isDirectory: true)
         try? FileManager.default.createDirectory(at: self.audioCacheDir, withIntermediateDirectories: true)
+        // Purge legacy pre-v2 cached WAV files so upgraded engine audio is always freshly generated
+        if let files = try? FileManager.default.contentsOfDirectory(at: self.audioCacheDir, includingPropertiesForKeys: nil) {
+            for f in files where !f.lastPathComponent.hasPrefix("v2_") {
+                try? FileManager.default.removeItem(at: f)
+            }
+        }
     }
 
     public func setAudioLevelHandler(_ handler: (@Sendable (Float) -> Void)?) {
@@ -549,13 +559,10 @@ public actor MagpieV2607Engine {
         }
 
         let aneConfig = MLModelConfiguration()
-        aneConfig.computeUnits = .cpuAndNeuralEngine
-
-        let gpuConfig = MLModelConfiguration()
-        gpuConfig.computeUnits = .cpuAndGPU // SWIFT_PORT_FINDINGS: avoids ANECCompile() failure on incrementing KV scatter
+        aneConfig.computeUnits = .cpuAndNeuralEngine // Phase D verified: ANE gives clean EOS + 2× speedup on text_encoder, prefill & decoder_step!
 
         let codecConfig = MLModelConfiguration()
-        codecConfig.computeUnits = .cpuOnly // PERF.md: NanoCodec v3 runs cleanly without fp16 audio drift
+        codecConfig.computeUnits = .cpuOnly // Phase F verified: FP32 NanoCodec v3 on CPU avoids fp16 vocoder noise completely
 
         let textEncURL = modelDir.appendingPathComponent("text_encoder.mlmodelc")
         let prefillURL = modelDir.appendingPathComponent("decoder_prefill.mlmodelc")
@@ -567,7 +574,7 @@ public actor MagpieV2607Engine {
         // Load all 4 Core ML models concurrently!
         async let loadedTextEnc = MLModel.load(contentsOf: textEncURL, configuration: aneConfig)
         async let loadedPrefill = MLModel.load(contentsOf: prefillURL, configuration: aneConfig)
-        async let loadedDecStep = MLModel.load(contentsOf: decStepURL, configuration: gpuConfig)
+        async let loadedDecStep = MLModel.load(contentsOf: decStepURL, configuration: aneConfig)
         async let loadedCodec = MLModel.load(contentsOf: codecURL, configuration: codecConfig)
 
         // Load tokenizer + local transformer + speaker/audio embeddings while Core ML compiles in parallel
@@ -628,18 +635,76 @@ public actor MagpieV2607Engine {
         return arr
     }
 
-    private func convertMultiArray(_ src: MLMultiArray, to targetType: MLMultiArrayDataType) throws -> MLMultiArray {
-        if src.dataType == targetType { return src }
+    /// Stride-aware 3D tensor conversion (e.g. `[1, 256, 768]` Float32 -> Float16).
+    /// Handles ANE IOSurface-padded `MLMultiArray` outputs cleanly without row skew!
+    private func convertEncoderOutput3D(_ src: MLMultiArray, to targetType: MLMultiArrayDataType) throws -> MLMultiArray {
+        let d0 = src.shape[0].intValue
+        let d1 = src.shape[1].intValue
+        let d2 = src.shape[2].intValue
+        let s0 = src.strides[0].intValue
+        let s1 = src.strides[1].intValue
+        let s2 = src.strides[2].intValue
+        let srcContiguous = (s2 == 1 && s1 == d2 && s0 == d1 * d2)
+        if src.dataType == targetType && srcContiguous { return src }
+
         let dst = try MLMultiArray(shape: src.shape, dataType: targetType)
-        let count = src.count
-        if src.dataType == .float32 && targetType == .float16 {
-            let s = src.dataPointer.bindMemory(to: Float.self, capacity: count)
-            let d = dst.dataPointer.bindMemory(to: Float16.self, capacity: count)
-            for i in 0..<count { d[i] = Float16(s[i]) }
-        } else if src.dataType == .float16 && targetType == .float32 {
-            let s = src.dataPointer.bindMemory(to: Float16.self, capacity: count)
-            let d = dst.dataPointer.bindMemory(to: Float.self, capacity: count)
-            for i in 0..<count { d[i] = Float(s[i]) }
+        let ds0 = dst.strides[0].intValue
+        let ds1 = dst.strides[1].intValue
+        let ds2 = dst.strides[2].intValue
+
+        switch (src.dataType, targetType) {
+        case (.float32, .float16):
+            let sp = src.dataPointer.assumingMemoryBound(to: Float.self)
+            let dp = dst.dataPointer.assumingMemoryBound(to: Float16.self)
+            for i in 0..<d0 {
+                for j in 0..<d1 {
+                    let sBase = i * s0 + j * s1
+                    let dBase = i * ds0 + j * ds1
+                    for k in 0..<d2 {
+                        dp[dBase + k * ds2] = Float16(sp[sBase + k * s2])
+                    }
+                }
+            }
+        case (.float16, .float32):
+            let sp = src.dataPointer.assumingMemoryBound(to: Float16.self)
+            let dp = dst.dataPointer.assumingMemoryBound(to: Float.self)
+            for i in 0..<d0 {
+                for j in 0..<d1 {
+                    let sBase = i * s0 + j * s1
+                    let dBase = i * ds0 + j * ds1
+                    for k in 0..<d2 {
+                        dp[dBase + k * ds2] = Float(sp[sBase + k * s2])
+                    }
+                }
+            }
+        case (.float16, .float16):
+            let sp = src.dataPointer.assumingMemoryBound(to: Float16.self)
+            let dp = dst.dataPointer.assumingMemoryBound(to: Float16.self)
+            for i in 0..<d0 {
+                for j in 0..<d1 {
+                    let sBase = i * s0 + j * s1
+                    let dBase = i * ds0 + j * ds1
+                    if s2 == 1 && ds2 == 1 {
+                        memcpy(dp.advanced(by: dBase), sp.advanced(by: sBase), d2 * MemoryLayout<Float16>.stride)
+                    } else {
+                        for k in 0..<d2 { dp[dBase + k * ds2] = sp[sBase + k * s2] }
+                    }
+                }
+            }
+        default:
+            let sp = src.dataPointer.assumingMemoryBound(to: Float.self)
+            let dp = dst.dataPointer.assumingMemoryBound(to: Float.self)
+            for i in 0..<d0 {
+                for j in 0..<d1 {
+                    let sBase = i * s0 + j * s1
+                    let dBase = i * ds0 + j * ds1
+                    if s2 == 1 && ds2 == 1 {
+                        memcpy(dp.advanced(by: dBase), sp.advanced(by: sBase), d2 * MemoryLayout<Float>.stride)
+                    } else {
+                        for k in 0..<d2 { dp[dBase + k * ds2] = sp[sBase + k * s2] }
+                    }
+                }
+            }
         }
         return dst
     }
@@ -781,7 +846,7 @@ public actor MagpieV2607Engine {
         let prefillEncType = inputDataType(for: prefill, featureName: "encoder_output", defaultType: .float16)
         let prefillMaskType = inputDataType(for: prefill, featureName: "encoder_mask", defaultType: .float32)
 
-        let encoderOutputPrefill = try convertMultiArray(rawEncoderOutput, to: prefillEncType)
+        let encoderOutputPrefill = try convertEncoderOutput3D(rawEncoderOutput, to: prefillEncType)
         let prefillMaskArr = (prefillMaskType == textMaskType)
             ? textMaskArr
             : try makeMaskArray(length: Self.maxTextLen, validCount: tLen, dataType: prefillMaskType)
@@ -804,13 +869,15 @@ public actor MagpieV2607Engine {
             "encoder_mask": MLFeatureValue(multiArray: prefillMaskArr),
         ]))
         var (condK, condV) = try splitPrefillKV(prefillOut)
-        var uncondK = try cloneArrayList(cachedUncondK ?? condK)
-        var uncondV = try cloneArrayList(cachedUncondV ?? condV)
+        var uncondK = try cloneKVList4D(cachedUncondK ?? condK)
+        var uncondV = try cloneKVList4D(cachedUncondV ?? condV)
 
         // Prepare decoder_step encoder tensors matching decoder_step's exact modelDescription dtypes
         let stepEncType = inputDataType(for: decStep, featureName: "encoder_output", defaultType: .float16)
         let stepMaskType = inputDataType(for: decStep, featureName: "encoder_mask", defaultType: .float32)
-        let encoderOutputStep = try convertMultiArray(rawEncoderOutput, to: stepEncType)
+        let encoderOutputStep = (stepEncType == prefillEncType)
+            ? encoderOutputPrefill
+            : try convertEncoderOutput3D(rawEncoderOutput, to: stepEncType)
         let stepMaskArr = (stepMaskType == prefillMaskType)
             ? prefillMaskArr
             : try makeMaskArray(length: Self.maxTextLen, validCount: tLen, dataType: stepMaskType)
@@ -819,41 +886,46 @@ public actor MagpieV2607Engine {
         memset(zeroEnc.dataPointer, 0, zeroEnc.count * (stepEncType == .float16 ? 2 : 4))
         let uncondMask = try makeMaskArray(length: Self.maxTextLen, validCount: 1, dataType: stepMaskType)
 
-        // 3. Autoregressive frame generation loop
-        let maxSteps = min(360, max(32, tLen * 5))
+        // 3. Autoregressive frame generation loop (matching generate_coreml.py exact per-layer position propagation)
+        let maxSteps = min(400, max(36, tLen * 6))
         let minFrames = 4
         var currentCodes = [Int32](repeating: 2016, count: 8) // audio_bos_id = 2016
         var generatedFrames: [[Int32]] = []
         generatedFrames.reserveCapacity(maxSteps)
-        var posVal: Float16 = 110.0
+
+        let initPos = try MLMultiArray(shape: [1], dataType: .float16)
+        initPos.dataPointer.assumingMemoryBound(to: Float16.self)[0] = Float16(110.0)
+        var condPos = [MLMultiArray](repeating: initPos, count: Self.nLayers)
+        var uncondPos = [MLMultiArray](repeating: initPos, count: Self.nLayers)
 
         for step in 0..<maxSteps {
             let audioEmbArr = try embedAudioCodesFP16(codes: currentCodes)
 
-            let (condHidden, nextCK, nextCV) = try runDecoderStep(
+            let (condHidden, nextCK, nextCV, nextCPos) = try runDecoderStep(
                 model: decStep,
                 audioEmbed: audioEmbArr,
                 encoderOutput: encoderOutputStep,
                 encoderMask: stepMaskArr,
                 cacheK: condK,
                 cacheV: condV,
-                position: posVal
+                positions: condPos
             )
             condK = nextCK
             condV = nextCV
+            condPos = nextCPos
 
-            let (uncondHidden, nextUK, nextUV) = try runDecoderStep(
+            let (uncondHidden, nextUK, nextUV, nextUPos) = try runDecoderStep(
                 model: decStep,
                 audioEmbed: audioEmbArr,
                 encoderOutput: zeroEnc,
                 encoderMask: uncondMask,
                 cacheK: uncondK,
                 cacheV: uncondV,
-                position: posVal
+                positions: uncondPos
             )
             uncondK = nextUK
             uncondV = nextUV
-            posVal += 1.0
+            uncondPos = nextUPos
 
             let nextCodes = lt.sampleCodebooks(
                 condHidden: condHidden,
@@ -903,13 +975,14 @@ public actor MagpieV2607Engine {
         )
     }
 
-    // MARK: - Real-Time Pitch-Preserving Playback (70 -> 140 WPM via AVAudioUnitTimePitch)
+    // MARK: - Real-Time Pitch-Preserving Playback (Natural 120 WPM baseline; bypassed at 1.0× for pure PCM)
 
-    public func play(clip: SynthesizedAudioClip, targetWPM: Int, baselineNativeWPM: Double = 140.0) async throws {
+    public func play(clip: SynthesizedAudioClip, targetWPM: Int, baselineNativeWPM: Double = 120.0) async throws {
         stopPlayback()
         #if os(iOS)
+        // Use .playback + .spokenAudio so iPhone plays full-fidelity speaker audio (NOT .playAndRecord VoIP DSP!)
         let session = AVAudioSession.sharedInstance()
-        try session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .allowBluetooth])
+        try session.setCategory(.playback, mode: .spokenAudio, options: [])
         try session.setActive(true)
         #endif
 
@@ -917,10 +990,12 @@ public actor MagpieV2607Engine {
         let player = AVAudioPlayerNode()
         let timePitch = AVAudioUnitTimePitch()
 
-        // Smooth pitch-preserving rate scaling to match the exact week's WPM (75 -> 140 WPM, PDF p. 8)
-        let rate = Float(max(0.55, min(1.35, Double(targetWPM) / baselineNativeWPM)))
+        // Clamp rate to [0.78, 1.25] so phase-vocoder time-stretching never introduces robotic artifacts,
+        // and bypass AVAudioUnitTimePitch completely when near native 1.0× speed!
+        let rate = Float(max(0.78, min(1.25, Double(targetWPM) / baselineNativeWPM)))
         timePitch.rate = rate
-        timePitch.pitch = 0.0 // Zero formant/pitch distortion!
+        timePitch.pitch = 0.0
+        timePitch.bypass = abs(rate - 1.0) < 0.04
 
         engine.attach(player)
         engine.attach(timePitch)
@@ -962,8 +1037,10 @@ public actor MagpieV2607Engine {
         onAudioLevelUpdate?(0.0)
     }
 
-    public func updatePlaybackRate(targetWPM: Int, baselineNativeWPM: Double = 140.0) {
-        timePitchNode?.rate = Float(max(0.55, min(1.35, Double(targetWPM) / baselineNativeWPM)))
+    public func updatePlaybackRate(targetWPM: Int, baselineNativeWPM: Double = 120.0) {
+        let rate = Float(max(0.78, min(1.25, Double(targetWPM) / baselineNativeWPM)))
+        timePitchNode?.rate = rate
+        timePitchNode?.bypass = abs(rate - 1.0) < 0.04
     }
 
     public func stopPlayback() {
@@ -976,13 +1053,15 @@ public actor MagpieV2607Engine {
         onAudioLevelUpdate?(0.0)
     }
 
-    // MARK: - Core ML Tensor Helpers
+    // MARK: - Stride-Safe Core ML Tensor Helpers (Immune to ANE IOSurface Row Padding!)
 
+    /// Splits each `[2, 1, 512, 12, 64]` prefill output into contiguous `[1, 512, 12, 64]` K and V caches
+    /// respecting exact Core ML / ANE IOSurface strides (never corrupting KV rows with padding!).
     private func splitPrefillKV(_ out: MLFeatureProvider) throws -> ([MLMultiArray], [MLMultiArray]) {
         var ks: [MLMultiArray] = []
         var vs: [MLMultiArray] = []
-        let sliceCount = 1 * 512 * 12 * 64
-        let byteLen = sliceCount * MemoryLayout<Float16>.stride
+        ks.reserveCapacity(Self.nLayers)
+        vs.reserveCapacity(Self.nLayers)
 
         for i in 0..<Self.nLayers {
             guard let combined = out.featureValue(for: Self.prefillKVKeys[i])?.multiArrayValue else {
@@ -990,19 +1069,87 @@ public actor MagpieV2607Engine {
             }
             let kArr = try MLMultiArray(shape: [1, 512, 12, 64], dataType: .float16)
             let vArr = try MLMultiArray(shape: [1, 512, 12, 64], dataType: .float16)
-            memcpy(kArr.dataPointer, combined.dataPointer, byteLen)
-            memcpy(vArr.dataPointer, combined.dataPointer.advanced(by: byteLen), byteLen)
+            memset(kArr.dataPointer, 0, kArr.count * MemoryLayout<Float16>.stride)
+            memset(vArr.dataPointer, 0, vArr.count * MemoryLayout<Float16>.stride)
+
+            let s0 = combined.strides[0].intValue
+            let s2 = combined.strides[2].intValue
+            let s3 = combined.strides[3].intValue
+            let s4 = combined.strides[4].intValue
+
+            let kd1 = kArr.strides[1].intValue
+            let kd2 = kArr.strides[2].intValue
+            let kd3 = kArr.strides[3].intValue
+
+            let vd1 = vArr.strides[1].intValue
+            let vd2 = vArr.strides[2].intValue
+            let vd3 = vArr.strides[3].intValue
+
+            let src = combined.dataPointer.assumingMemoryBound(to: Float16.self)
+            let kDst = kArr.dataPointer.assumingMemoryBound(to: Float16.self)
+            let vDst = vArr.dataPointer.assumingMemoryBound(to: Float16.self)
+
+            let fastHeadCopy = (s4 == 1 && kd3 == 1 && vd3 == 1)
+            let headBytes = 64 * MemoryLayout<Float16>.stride
+
+            // Copy all 512 time slots stride-safely (guaranteed identical for both contiguous & ANE-padded IOSurface!)
+            for t in 0..<512 {
+                let sT = t * s2
+                let kT = t * kd1
+                let vT = t * vd1
+                for h in 0..<12 {
+                    let sK = sT + h * s3
+                    let sV = s0 + sK
+                    let kOff = kT + h * kd2
+                    let vOff = vT + h * vd2
+                    if fastHeadCopy {
+                        memcpy(kDst.advanced(by: kOff), src.advanced(by: sK), headBytes)
+                        memcpy(vDst.advanced(by: vOff), src.advanced(by: sV), headBytes)
+                    } else {
+                        for d in 0..<64 {
+                            kDst[kOff + d * kd3] = src[sK + d * s4]
+                            vDst[vOff + d * vd3] = src[sV + d * s4]
+                        }
+                    }
+                }
+            }
             ks.append(kArr)
             vs.append(vArr)
         }
         return (ks, vs)
     }
 
-    private func cloneArrayList(_ list: [MLMultiArray]) throws -> [MLMultiArray] {
+    private func cloneKVList4D(_ list: [MLMultiArray]) throws -> [MLMultiArray] {
         try list.map { src in
             let dst = try MLMultiArray(shape: src.shape, dataType: src.dataType)
-            let bytes = src.count * (src.dataType == .float16 ? 2 : 4)
-            memcpy(dst.dataPointer, src.dataPointer, bytes)
+            let d1 = src.shape[1].intValue
+            let d2 = src.shape[2].intValue
+            let d3 = src.shape[3].intValue
+            let s1 = src.strides[1].intValue
+            let s2 = src.strides[2].intValue
+            let s3 = src.strides[3].intValue
+            let ds1 = dst.strides[1].intValue
+            let ds2 = dst.strides[2].intValue
+            let ds3 = dst.strides[3].intValue
+            let elemBytes = src.dataType == .float16 ? 2 : 4
+
+            if s3 == 1 && ds3 == 1 && s2 == d3 && ds2 == d3 && s1 == d2 * d3 && ds1 == d2 * d3 {
+                memcpy(dst.dataPointer, src.dataPointer, src.count * elemBytes)
+            } else {
+                let sp = src.dataPointer.assumingMemoryBound(to: Float16.self)
+                let dp = dst.dataPointer.assumingMemoryBound(to: Float16.self)
+                for t in 0..<d1 {
+                    for h in 0..<d2 {
+                        let sBase = t * s1 + h * s2
+                        let dBase = t * ds1 + h * ds2
+                        if s3 == 1 && ds3 == 1 {
+                            memcpy(dp.advanced(by: dBase), sp.advanced(by: sBase), d3 * MemoryLayout<Float16>.stride)
+                        } else {
+                            for d in 0..<d3 { dp[dBase + d * ds3] = sp[sBase + d * s3] }
+                        }
+                    }
+                }
+            }
             return dst
         }
     }
@@ -1020,8 +1167,9 @@ public actor MagpieV2607Engine {
         vDSP_vsmul(acc, 1, &scale, &acc, 1, 768)
 
         let arr = try MLMultiArray(shape: [1, 1, 768], dataType: .float16)
-        let dst = arr.dataPointer.bindMemory(to: Float16.self, capacity: 768)
-        for i in 0..<768 { dst[i] = Float16(acc[i]) }
+        let dst = arr.dataPointer.assumingMemoryBound(to: Float16.self)
+        let strideLast = arr.strides.last?.intValue ?? 1
+        for i in 0..<768 { dst[i * strideLast] = Float16(acc[i]) }
         return arr
     }
 
@@ -1032,21 +1180,18 @@ public actor MagpieV2607Engine {
         encoderMask: MLMultiArray,
         cacheK: [MLMultiArray],
         cacheV: [MLMultiArray],
-        position: Float16
-    ) throws -> (hidden: [Float], newK: [MLMultiArray], newV: [MLMultiArray]) {
+        positions: [MLMultiArray]
+    ) throws -> (hidden: [Float], newK: [MLMultiArray], newV: [MLMultiArray], newPos: [MLMultiArray]) {
         var dict: [String: MLFeatureValue] = [
             "audio_embed": MLFeatureValue(multiArray: audioEmbed),
             "encoder_output": MLFeatureValue(multiArray: encoderOutput),
             "encoder_mask": MLFeatureValue(multiArray: encoderMask),
         ]
-        let posArr = try MLMultiArray(shape: [1], dataType: .float16)
-        posArr.dataPointer.bindMemory(to: Float16.self, capacity: 1)[0] = position
-        let posFeat = MLFeatureValue(multiArray: posArr)
 
         for i in 0..<Self.nLayers {
             dict["cache_k\(i)"] = MLFeatureValue(multiArray: cacheK[i])
             dict["cache_v\(i)"] = MLFeatureValue(multiArray: cacheV[i])
-            dict["position\(i)"] = posFeat
+            dict["position\(i)"] = MLFeatureValue(multiArray: positions[i])
         }
 
         let out = try model.prediction(from: MLDictionaryFeatureProvider(dictionary: dict))
@@ -1054,26 +1199,32 @@ public actor MagpieV2607Engine {
             throw NSError(domain: "MagpieV2607Engine", code: 502, userInfo: [NSLocalizedDescriptionKey: "Missing decoder hidden state"])
         }
         var hidden = [Float](repeating: 0, count: 768)
+        let hStride = hidArr.strides.last?.intValue ?? 1
         if hidArr.dataType == .float16 {
-            let src = hidArr.dataPointer.bindMemory(to: Float16.self, capacity: 768)
-            for i in 0..<768 { hidden[i] = Float(src[i]) }
+            let src = hidArr.dataPointer.assumingMemoryBound(to: Float16.self)
+            for i in 0..<768 { hidden[i] = Float(src[i * hStride]) }
         } else {
-            let src = hidArr.dataPointer.bindMemory(to: Float.self, capacity: 768)
-            for i in 0..<768 { hidden[i] = src[i] }
+            let src = hidArr.dataPointer.assumingMemoryBound(to: Float.self)
+            for i in 0..<768 { hidden[i] = src[i * hStride] }
         }
 
         var nextK: [MLMultiArray] = []
         var nextV: [MLMultiArray] = []
+        var nextPos: [MLMultiArray] = []
         nextK.reserveCapacity(Self.nLayers)
         nextV.reserveCapacity(Self.nLayers)
+        nextPos.reserveCapacity(Self.nLayers)
         for i in 0..<Self.nLayers {
             nextK.append(out.featureValue(for: Self.kOutKeys[i])!.multiArrayValue!)
             nextV.append(out.featureValue(for: Self.vOutKeys[i])!.multiArrayValue!)
+            nextPos.append(out.featureValue(for: Self.posOutKeys[i])!.multiArrayValue!)
         }
-        return (hidden, nextK, nextV)
+        return (hidden, nextK, nextV, nextPos)
     }
 
     /// Auto-dispatches between monolithic (T_in=256) and chunked sliding-window NanoCodec v3 (T_in=24, stride=8, overlap=16).
+    /// Uses **edge-replication padding** (clamping out-of-range indices to `[0, T-1]`) instead of zero-padding,
+    /// eliminating the 700× start/end transient click caused by codebook entry 0 (FluidInference Phase C v2 step 7).
     private func decodeNanoCodec(model: MLModel, frames: [[Int32]]) throws -> [Float] {
         let totalFrames = frames.count
         guard totalFrames > 0 else { return [] }
@@ -1081,19 +1232,20 @@ public actor MagpieV2607Engine {
 
         if tIn >= 256 && totalFrames <= tIn {
             let tokArr = try MLMultiArray(shape: [1, 8, NSNumber(value: tIn)], dataType: .int32)
-            let ptr = tokArr.dataPointer.bindMemory(to: Int32.self, capacity: 8 * tIn)
-            memset(ptr, 0, 8 * tIn * MemoryLayout<Int32>.stride)
-            for t in 0..<totalFrames {
-                for cb in 0..<8 { ptr[cb * tIn + t] = frames[t][cb] }
+            let ptr = tokArr.dataPointer.assumingMemoryBound(to: Int32.self)
+            let cbStride = tokArr.strides[1].intValue
+            let tStride = tokArr.strides[2].intValue
+            for slot in 0..<tIn {
+                let frameIdx = min(totalFrames - 1, slot)
+                for cb in 0..<8 { ptr[cb * cbStride + slot * tStride] = frames[frameIdx][cb] }
             }
             let out = try model.prediction(from: MLDictionaryFeatureProvider(dictionary: ["tokens": MLFeatureValue(multiArray: tokArr)]))
             let audioArr = out.featureValue(for: "audio")!.multiArrayValue!
-            let expected = totalFrames * Self.samplesPerFrame
-            let src = audioArr.dataPointer.bindMemory(to: Float.self, capacity: audioArr.count)
-            return Array(UnsafeBufferPointer(start: src, count: min(expected, audioArr.count)))
+            let expected = min(totalFrames * Self.samplesPerFrame, audioArr.count)
+            return extractAudioFloats(from: audioArr, start: 0, count: expected)
         }
 
-        // Chunked sliding-window NanoCodec v3: stride = tIn / 3 (8), overlap = tIn - stride (16)
+        // Chunked sliding-window NanoCodec v3: T_in=24, stride=8, overlap=16, edge-replicated padding!
         let strideLen = max(1, tIn / 3)
         let overlap = tIn - strideLen
         let keepStart = overlap * Self.samplesPerFrame
@@ -1102,29 +1254,57 @@ public actor MagpieV2607Engine {
         var pcmOut: [Float] = []
         pcmOut.reserveCapacity(totalFrames * Self.samplesPerFrame)
         let tokArr = try MLMultiArray(shape: [1, 8, NSNumber(value: tIn)], dataType: .int32)
-        let ptr = tokArr.dataPointer.bindMemory(to: Int32.self, capacity: 8 * tIn)
+        let ptr = tokArr.dataPointer.assumingMemoryBound(to: Int32.self)
+        let cbStride = tokArr.strides[1].intValue
+        let tStride = tokArr.strides[2].intValue
 
         var start = 0
         while start < totalFrames {
-            memset(ptr, 0, 8 * tIn * MemoryLayout<Int32>.stride)
             let ctxStart = start - overlap
             for slot in 0..<tIn {
-                let frameIdx = ctxStart + slot
-                if frameIdx >= 0 && frameIdx < totalFrames {
-                    for cb in 0..<8 { ptr[cb * tIn + slot] = frames[frameIdx][cb] }
+                // Edge-replication padding: replicate frames[0] for left context & frames[T-1] for right tail!
+                let frameIdx = min(totalFrames - 1, max(0, ctxStart + slot))
+                for cb in 0..<8 {
+                    ptr[cb * cbStride + slot * tStride] = frames[frameIdx][cb]
                 }
             }
             let out = try model.prediction(from: MLDictionaryFeatureProvider(dictionary: ["tokens": MLFeatureValue(multiArray: tokArr)]))
             let audioArr = out.featureValue(for: "audio")!.multiArrayValue!
-            let src = audioArr.dataPointer.bindMemory(to: Float.self, capacity: audioArr.count)
-            let endIdx = min(audioArr.count, keepStart + keepCount)
-            if keepStart < endIdx {
-                pcmOut.append(contentsOf: UnsafeBufferPointer(start: src.advanced(by: keepStart), count: endIdx - keepStart))
+            let available = max(0, min(keepCount, audioArr.count - keepStart))
+            if available > 0 {
+                pcmOut.append(contentsOf: extractAudioFloats(from: audioArr, start: keepStart, count: available))
             }
             start += strideLen
         }
         let expected = totalFrames * Self.samplesPerFrame
-        return Array(pcmOut.prefix(expected))
+        var trimmed = Array(pcmOut.prefix(expected))
+        // Apply ultra-gentle 6ms cosine fade-in / fade-out at utterance boundaries for click-free silence transitions
+        let fadeLen = min(132, trimmed.count / 4)
+        for i in 0..<fadeLen {
+            let g = 0.5 * (1.0 - cosf(.pi * Float(i) / Float(fadeLen)))
+            trimmed[i] *= g
+            trimmed[trimmed.count - 1 - i] *= g
+        }
+        return trimmed
+    }
+
+    private func extractAudioFloats(from audioArr: MLMultiArray, start: Int, count: Int) -> [Float] {
+        guard count > 0 else { return [] }
+        let s = audioArr.strides.last?.intValue ?? 1
+        if audioArr.dataType == .float32 {
+            let src = audioArr.dataPointer.assumingMemoryBound(to: Float.self)
+            if s == 1 {
+                return Array(UnsafeBufferPointer(start: src.advanced(by: start), count: count))
+            }
+            var out = [Float](repeating: 0, count: count)
+            for i in 0..<count { out[i] = src[(start + i) * s] }
+            return out
+        } else {
+            let src = audioArr.dataPointer.assumingMemoryBound(to: Float16.self)
+            var out = [Float](repeating: 0, count: count)
+            for i in 0..<count { out[i] = Float(src[(start + i) * s]) }
+            return out
+        }
     }
 
     // MARK: - Word Timing Estimation & Disk WAV Cache
@@ -1155,9 +1335,9 @@ public actor MagpieV2607Engine {
     }
 
     private func cacheURL(for text: String, voice: MagpieVoice, accent: SpanishRegionalAccent) -> URL {
-        let key = "\(voice.rawValue)_\(accent.rawValue)_\(text)"
+        let key = "v2_clean_\(voice.rawValue)_\(accent.rawValue)_\(text)"
         let digest = SHA256.hash(data: Data(key.utf8)).prefix(16).map { String(format: "%02x", $0) }.joined()
-        return audioCacheDir.appendingPathComponent("\(digest).wav")
+        return audioCacheDir.appendingPathComponent("v2_\(digest).wav")
     }
 
     private func saveWAV(samples: [Float], sampleRate: Double, to url: URL) throws {

@@ -13,6 +13,8 @@ public struct HardwareSettingsView: View {
 
     @State private var isBenchmarking: Bool = false
     @State private var benchmarkOutput: String?
+    @State private var lastBenchmarkClip: SynthesizedAudioClip?
+    @State private var isPlayingBenchmarkSample: Bool = false
 
     @State private var selectedMode: StudyMode = .soloPilot
     @State private var selectedSerialId: String = "madrid_noir"
@@ -337,10 +339,11 @@ public struct HardwareSettingsView: View {
                                     voice: .sofia,
                                     accent: .castilian
                                 )
+                                lastBenchmarkClip = clip
                                 let ms = Date().timeIntervalSince(t0) * 1000.0
                                 let rtf = (ms / 1000.0) / max(0.01, clip.durationSeconds)
                                 ttsSummary = String(
-                                    format: "Magpie v2607: %.0f ms for %.1fs audio (RTF %.2f×)",
+                                    format: "Magpie v2607 (FP16 AR + FP32 NanoCodec): %.0f ms for %.1fs audio (RTF %.2f×)",
                                     ms, clip.durationSeconds, rtf
                                 )
                             } catch {
@@ -377,6 +380,24 @@ public struct HardwareSettingsView: View {
                     .padding(12)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(Color.black.opacity(0.35), in: RoundedRectangle(cornerRadius: 12))
+            }
+
+            if let clip = lastBenchmarkClip {
+                Button {
+                    Task {
+                        isPlayingBenchmarkSample = true
+                        defer { isPlayingBenchmarkSample = false }
+                        try? await appState.magpieEngine.play(clip: clip, targetWPM: 120)
+                    }
+                } label: {
+                    Label(isPlayingBenchmarkSample ? "Playing Native 1.0× Sample…" : "Play Native 1.0× Magpie Sample", systemImage: isPlayingBenchmarkSample ? "speaker.wave.3.fill" : "play.circle.fill")
+                        .font(CadenciaFont.uiCaption(12, weight: .bold))
+                        .foregroundStyle(CadenciaPalette.ivoryText)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 9)
+                        .cadenciaGlassPill(tint: CadenciaPalette.saffronGold, interactive: false)
+                }
+                .disabled(isPlayingBenchmarkSample)
             }
         }
         .padding(18)

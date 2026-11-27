@@ -356,7 +356,7 @@ private struct ItemForgettingDetailSheet: View {
                                     if let clip = try? await appState.magpieEngine.synthesizeSentence(
                                         text: item.spanish, voice: .sofia, accent: .castilian
                                     ) {
-                                        try? await appState.magpieEngine.play(clip: clip, targetWPM: 100)
+                                        try? await appState.magpieEngine.play(clip: clip, targetWPM: 120)
                                     }
                                 }
                             } label: {

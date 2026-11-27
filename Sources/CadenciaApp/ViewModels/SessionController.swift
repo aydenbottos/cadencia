@@ -461,7 +461,7 @@ public final class SessionController {
                     if let wordClip = try? await appState.magpieEngine.synthesizeSentence(
                         text: surface, voice: passage.voice, accent: passage.accent
                     ) {
-                        try? await appState.magpieEngine.play(clip: wordClip, targetWPM: 100)
+                        try? await appState.magpieEngine.play(clip: wordClip, targetWPM: 120)
                     }
                 }
             }
