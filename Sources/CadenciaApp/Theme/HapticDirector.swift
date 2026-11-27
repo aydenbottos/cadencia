@@ -108,7 +108,7 @@ public final class HapticDirector {
                 relativeTime: 0
             )
             let pattern = try CHHapticPattern(events: [ev], parameters: [])
-            let player = try engine.makePlayer(withPattern: pattern)
+            let player = try engine.makePlayer(with: pattern)
             try player.start(atTime: CHHapticTimeImmediate)
         } catch {
             UIImpactFeedbackGenerator(style: .medium).impactOccurred()
@@ -132,7 +132,7 @@ public final class HapticDirector {
                 )
             }
             let pattern = try CHHapticPattern(events: events, parameters: [])
-            let player = try engine.makePlayer(withPattern: pattern)
+            let player = try engine.makePlayer(with: pattern)
             try player.start(atTime: CHHapticTimeImmediate)
         } catch {
             UINotificationFeedbackGenerator().notificationOccurred(.success)
