@@ -124,7 +124,13 @@ for t in "${TARGETS[@]}"; do
     MERGED_OBJ="target/$t/release/ptts_ffi_merged.o"
     CLEAN_LIB="target/$t/release/libptts_ffi_clean.a"
     rm -f "$MERGED_OBJ" "$CLEAN_LIB"
-    ld -r -arch arm64 -all_load "$RAW_LIB" -o "$MERGED_OBJ"
+    if [ "$t" = "aarch64-apple-ios" ]; then
+        SDK_VER="$(xcrun --sdk iphoneos --show-sdk-version)"
+        ld -r -arch arm64 -platform_version ios 18.0 "$SDK_VER" -all_load "$RAW_LIB" -o "$MERGED_OBJ"
+    else
+        SDK_VER="$(xcrun --sdk macosx --show-sdk-version)"
+        ld -r -arch arm64 -platform_version macos 15.0 "$SDK_VER" -all_load "$RAW_LIB" -o "$MERGED_OBJ"
+    fi
     nmedit -s "$EXPORT_LIST" "$MERGED_OBJ"
     libtool -static -o "$CLEAN_LIB" "$MERGED_OBJ"
 
