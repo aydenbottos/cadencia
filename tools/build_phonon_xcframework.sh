@@ -98,10 +98,44 @@ unset CARGO_ENCODED_RUSTFLAGS || true
 TARGETS=(aarch64-apple-ios aarch64-apple-darwin)
 rustup target add "${TARGETS[@]}"
 
+EXPORT_LIST="$(mktemp)"
+cat > "$EXPORT_LIST" <<'SYM'
+_ptts_new
+_ptts_speak
+_ptts_voices
+_ptts_languages
+_ptts_set_voice
+_ptts_set_language
+_ptts_set_temperature
+_ptts_set_seed
+_ptts_last_error
+_ptts_free
+_ptts_export_coreml
+SYM
+
 for t in "${TARGETS[@]}"; do
     echo "==> Building libptts_ffi.a for ${t}"
     cargo build --release -p ptts-ffi --target "$t"
+
+    # Merge into a single relocatable object and localize all non-API Rust stdlib symbols
+    # (including _rust_eh_personality) so PhononCore never collides with other Rust xcframeworks
+    # such as FluidAudio's NemoTextProcessing (libtext_processing_rs.a).
+    RAW_LIB="target/$t/release/libptts_ffi.a"
+    MERGED_OBJ="target/$t/release/ptts_ffi_merged.o"
+    CLEAN_LIB="target/$t/release/libptts_ffi_clean.a"
+    rm -f "$MERGED_OBJ" "$CLEAN_LIB"
+    ld -r -arch arm64 -all_load "$RAW_LIB" -o "$MERGED_OBJ"
+    nmedit -s "$EXPORT_LIST" "$MERGED_OBJ"
+    libtool -static -o "$CLEAN_LIB" "$MERGED_OBJ"
+
+    echo "==> Exported global symbols in ${t}:"
+    nm -gU "$CLEAN_LIB"
+    if nm -gU "$CLEAN_LIB" | grep -q "_rust_eh_personality"; then
+        echo "ERROR: _rust_eh_personality was not localized in ${t}" >&2
+        exit 1
+    fi
 done
+rm -f "$EXPORT_LIST"
 
 HEADERS="$(mktemp -d)"
 cp ptts-ffi/include/ptts.h "$HEADERS/"
@@ -114,10 +148,10 @@ MAP
 
 rm -rf "$OUT_XCFRAMEWORK"
 xcodebuild -create-xcframework \
-    -library "target/aarch64-apple-ios/release/libptts_ffi.a" -headers "$HEADERS" \
-    -library "target/aarch64-apple-darwin/release/libptts_ffi.a" -headers "$HEADERS" \
+    -library "target/aarch64-apple-ios/release/libptts_ffi_clean.a" -headers "$HEADERS" \
+    -library "target/aarch64-apple-darwin/release/libptts_ffi_clean.a" -headers "$HEADERS" \
     -output "$OUT_XCFRAMEWORK"
 rm -rf "$HEADERS"
 
 echo "==> Built ${OUT_XCFRAMEWORK}:"
-du -sh "$OUT_XCFRAMEWORK"/*/libptts_ffi.a
+du -sh "$OUT_XCFRAMEWORK"/*/libptts_ffi_clean.a

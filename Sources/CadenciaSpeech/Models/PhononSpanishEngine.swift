@@ -3,6 +3,10 @@ import CryptoKit
 import Foundation
 import PhononCore
 
+private struct SendableOpaquePointer: @unchecked Sendable {
+    let raw: OpaquePointer
+}
+
 /// Owns a `PttsHandle*` safely across Swift 6 concurrency and guarantees cleanup on deinit.
 private final class PhononHandleBox: @unchecked Sendable {
     let raw: OpaquePointer
@@ -14,9 +18,9 @@ private final class PhononHandleBox: @unchecked Sendable {
     }
 
     deinit {
-        let ptr = raw
+        let ptr = SendableOpaquePointer(raw: raw)
         queue.async {
-            ptts_free(ptr)
+            ptts_free(ptr.raw)
         }
     }
 }
