@@ -28,7 +28,6 @@ targets:
       - sdk: CoreML.framework
       - sdk: Accelerate.framework
       - sdk: AVFoundation.framework
-      - sdk: Compression.framework
       - sdk: QuartzCore.framework
       - sdk: Security.framework
       - sdk: NaturalLanguage.framework
