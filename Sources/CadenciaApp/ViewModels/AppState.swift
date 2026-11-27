@@ -170,7 +170,9 @@ public final class AppState {
         let t0 = Date()
         try await magpieEngine.loadModels(from: dir)
         let ms = Int(Date().timeIntervalSince(t0) * 1000)
-        engineRuntimeNote[.magpieTTS] = "Loaded on ANE + CPU NanoCodec · \(ms) ms"
+        let ver = await magpieEngine.checkpointVersion
+        let fsf = await magpieEngine.frameStackingFactor
+        engineRuntimeNote[.magpieTTS] = "Loaded \(ver) (\(fsf)× stack · ANE+GPU+FP32) · \(ms) ms"
     }
 
     /// Loads installed local Core ML models in fastest-first order (Magpie -> Parakeet ANE -> ZIPA Metal GPU)
@@ -181,18 +183,20 @@ public final class AppState {
         let speech = self.speechRecognizer
         let assets = self.assetManager
 
-        // 1. NVIDIA Magpie v2607 TTS (ANE + CPU FP32 NanoCodec) — first so tutor voice is ready immediately!
+        // 1. NVIDIA Magpie v2607 TTS (ANE + Metal GPU step + CPU FP32 NanoCodec) — first so tutor voice is ready immediately!
         if await assets.isModelInstalled(.magpieTTS), !(await magpie.isLoaded) {
             await MainActor.run {
                 self.warmingLabel = "WARMING MAGPIE"
-                self.engineRuntimeNote[.magpieTTS] = "Loading on ANE + CPU…"
+                self.engineRuntimeNote[.magpieTTS] = "Loading on ANE + Metal GPU + CPU…"
             }
             let dir = await assets.directory(for: .magpieTTS)
             let t0 = Date()
             do {
                 try await magpie.loadModels(from: dir)
                 let ms = Int(Date().timeIntervalSince(t0) * 1000)
-                await MainActor.run { self.engineRuntimeNote[.magpieTTS] = "Loaded on ANE + FP32 NanoCodec · \(ms) ms" }
+                let ver = await magpie.checkpointVersion
+                let fsf = await magpie.frameStackingFactor
+                await MainActor.run { self.engineRuntimeNote[.magpieTTS] = "Loaded \(ver) (\(fsf)× stack · ANE+GPU+FP32) · \(ms) ms" }
             } catch {
                 await MainActor.run { self.engineRuntimeNote[.magpieTTS] = "Load error: \(error.localizedDescription)" }
             }
@@ -313,13 +317,24 @@ public final class AppState {
         self.constellationStars = buildConstellationStars(items: allSyllabusItems, records: recs, params: profile.parameters)
     }
 
+    public var installedMagpieCheckpointVersion: String? = nil
+
     public func refreshModelStatuses() async {
         let zipaBundled = await assetManager.isZipaBundledInApp()
+        let magpieVer = await assetManager.installedMagpieVersion()
+        self.installedMagpieCheckpointVersion = magpieVer
         for kind in ManagedModelKind.allCases {
             let installed = await assetManager.isModelInstalled(kind)
-            let readyMsg = (kind == .zipaPhoneme && zipaBundled)
-                ? "Built-in · ANE Ready"
-                : "Installed & ready on device"
+            let readyMsg: String
+            if kind == .zipaPhoneme && zipaBundled {
+                readyMsg = "Built-in · Metal GPU Ready"
+            } else if kind == .magpieTTS, let magpieVer {
+                readyMsg = magpieVer == "v2607"
+                    ? "Installed · v2607 GRPO (2× stack)"
+                    : "v2512 installed · Upgrade to v2607 available"
+            } else {
+                readyMsg = "Installed & ready on device"
+            }
             modelStatus[kind] = ModelDownloadProgress(
                 kind: kind,
                 fractionCompleted: installed ? 1.0 : 0.0,
@@ -362,20 +377,30 @@ public final class AppState {
             }
             modelStatus[.magpieTTS] = ModelDownloadProgress(
                 kind: .magpieTTS, fractionCompleted: 0.95,
-                statusMessage: "Loading Magpie v2607 into Neural Engine…",
+                statusMessage: "Loading Magpie v2607 (ANE + Metal GPU + FP32 NanoCodec)…",
                 isReady: false, errorMessage: nil
             )
             let dir = await assetManager.directory(for: .magpieTTS)
-            try await magpieEngine.loadModels(from: dir)
+            let t0 = Date()
+            try await magpieEngine.loadModels(from: dir, forceReload: true)
+            let ms = Int(Date().timeIntervalSince(t0) * 1000)
+            let ver = await magpieEngine.checkpointVersion
+            let fsf = await magpieEngine.frameStackingFactor
+            self.installedMagpieCheckpointVersion = ver
+            self.engineRuntimeNote[.magpieTTS] = "Loaded \(ver) (\(fsf)× stack · ANE+GPU+FP32) · \(ms) ms"
             modelStatus[.magpieTTS] = ModelDownloadProgress(
                 kind: .magpieTTS, fractionCompleted: 1.0,
-                statusMessage: "Installed & ready on device",
+                statusMessage: ver == "v2607" ? "Installed · v2607 GRPO (2× stack)" : "Installed & ready on device",
                 isReady: true, errorMessage: nil
             )
         } catch {
+            await refreshModelStatuses()
             modelStatus[.magpieTTS] = ModelDownloadProgress(
-                kind: .magpieTTS, fractionCompleted: 0, statusMessage: "Download / load failed",
-                isReady: false, errorMessage: error.localizedDescription
+                kind: .magpieTTS,
+                fractionCompleted: installedMagpieCheckpointVersion != nil ? 1.0 : 0.0,
+                statusMessage: "Download / upgrade failed",
+                isReady: installedMagpieCheckpointVersion != nil,
+                errorMessage: error.localizedDescription
             )
         }
     }

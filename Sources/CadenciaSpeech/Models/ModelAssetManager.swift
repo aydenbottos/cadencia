@@ -22,16 +22,16 @@ public enum ManagedModelKind: String, CaseIterable, Identifiable, Sendable {
 
     public var roleDescription: String {
         switch self {
-        case .magpieTTS: return "On-device neural Spanish tutor · 5 voices · 22.05kHz NanoCodec"
+        case .magpieTTS: return "On-device neural Spanish tutor · v2607 GRPO (2× stack) · 5 voices · FP32 NanoCodec"
         case .parakeetUltra: return "On-device learner speech-to-text · INT8 ANE · >100× real-time"
-        case .zipaPhoneme: return "On-device IPA phoneme recognizer · FP16 Multifunction ANE"
+        case .zipaPhoneme: return "On-device IPA phoneme recognizer · FP16 Multifunction Metal GPU"
         case .sileroVAD: return "Real-time speech endpointing & silence trimming"
         }
     }
 
     public var estimatedSizeMB: Int {
         switch self {
-        case .magpieTTS: return 680
+        case .magpieTTS: return 820
         case .parakeetUltra: return 640
         case .zipaPhoneme: return 590
         case .sileroVAD: return 4
@@ -66,6 +66,8 @@ public struct ModelDownloadProgress: Sendable {
 /// Zero computer/LAN interaction required.
 public actor ModelAssetManager {
     public static let magpieHuggingFaceRepo = "FluidInference/magpie-tts-multilingual-357m-coreml"
+    public static let magpieV2607DefaultReleaseURL = "https://github.com/aydenbottos/cadencia/releases/download/models-magpie-v2607/MagpieV2607_CoreML.zip"
+    public static let magpieV2607InfoPlistKey = "CadenciaMagpieV2607ReleaseURL"
     public static let zipaInfoPlistKey = "CadenciaZipaReleaseURL"
 
     public let rootDirectory: URL
@@ -126,17 +128,118 @@ public actor ModelAssetManager {
         }
     }
 
-    // MARK: - Download NVIDIA Magpie v2607 Core ML + Spanish Phoneme Assets
+    /// Returns `"v2607"` when genuine NVIDIA Magpie v2607 (frame_stacking_factor >= 2) is installed,
+    /// `"v2512"` when legacy FluidInference v2512 weights are installed, or `nil` when not installed.
+    public func installedMagpieVersion() -> String? {
+        guard isModelInstalled(.magpieTTS) else { return nil }
+        let constURL = directory(for: .magpieTTS).appendingPathComponent("constants/constants.json")
+        guard let data = try? Data(contentsOf: constURL),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return "v2512" }
+        if let ver = json["version"] as? String, ver == "v2607" { return "v2607" }
+        if let fsf = json["frame_stacking_factor"] as? Int, fsf >= 2 { return "v2607" }
+        return "v2512"
+    }
+
+    // MARK: - Download Genuine NVIDIA Magpie v2607 Core ML (Zero-Computer Cloud Release)
 
     public func downloadMagpieAssets(
         repoId: String = ModelAssetManager.magpieHuggingFaceRepo,
         onProgress: @escaping @Sendable (ModelDownloadProgress) -> Void
     ) async throws {
         let destRoot = directory(for: .magpieTTS)
+        try FileManager.default.createDirectory(at: destRoot.deletingLastPathComponent(), withIntermediateDirectories: true)
+
+        let configuredURL = (Bundle.main.object(forInfoDictionaryKey: Self.magpieV2607InfoPlistKey) as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let releaseURLString = (configuredURL?.isEmpty == false) ? configuredURL! : Self.magpieV2607DefaultReleaseURL
+
+        if let releaseURL = URL(string: releaseURLString) {
+            let tmpZip = rootDirectory.appendingPathComponent("magpie_v2607_download.zip")
+            let stagingDir = rootDirectory.appendingPathComponent("magpie_v2607_staging", isDirectory: true)
+            try? FileManager.default.removeItem(at: tmpZip)
+            try? FileManager.default.removeItem(at: stagingDir)
+
+            onProgress(.init(
+                kind: .magpieTTS,
+                fractionCompleted: 0.03,
+                statusMessage: "Downloading NVIDIA Magpie v2607 Core ML (GRPO 2× stack)…",
+                isReady: false,
+                errorMessage: nil
+            ))
+
+            do {
+                try await downloadFileWithProgress(from: releaseURL, to: tmpZip) { frac in
+                    onProgress(.init(
+                        kind: .magpieTTS,
+                        fractionCompleted: 0.03 + 0.80 * frac,
+                        statusMessage: "Downloading Magpie v2607: \(Int(frac * 100))%",
+                        isReady: false,
+                        errorMessage: nil
+                    ))
+                }
+
+                onProgress(.init(
+                    kind: .magpieTTS,
+                    fractionCompleted: 0.86,
+                    statusMessage: "Extracting precompiled Magpie v2607 Core ML bundles…",
+                    isReady: false,
+                    errorMessage: nil
+                ))
+
+                try FileManager.default.createDirectory(at: stagingDir, withIntermediateDirectories: true)
+                try MiniZipExtractor.extract(zipURL: tmpZip, to: stagingDir)
+                try? FileManager.default.removeItem(at: tmpZip)
+
+                // Verify extracted archive integrity before replacing any existing install
+                let required = [
+                    "text_encoder.mlmodelc",
+                    "decoder_prefill.mlmodelc",
+                    "decoder_step.mlmodelc",
+                    "nanocodec_decoder_v3.mlmodelc",
+                    "constants/constants.json",
+                    "tokenizer/spanish_phoneme_token2id.json",
+                ]
+                let fm = FileManager.default
+                if required.allSatisfy({ fm.fileExists(atPath: stagingDir.appendingPathComponent($0).path) }) {
+                    if fm.fileExists(atPath: destRoot.path) {
+                        try fm.removeItem(at: destRoot)
+                    }
+                    try fm.moveItem(at: stagingDir, to: destRoot)
+                    onProgress(.init(
+                        kind: .magpieTTS,
+                        fractionCompleted: 1.0,
+                        statusMessage: "Installed · v2607 GRPO (2× frame-stacked)",
+                        isReady: true,
+                        errorMessage: nil
+                    ))
+                    return
+                } else {
+                    try? fm.removeItem(at: stagingDir)
+                    throw NSError(domain: "ModelAssetManager", code: 500, userInfo: [
+                        NSLocalizedDescriptionKey: "Downloaded Magpie v2607 archive was incomplete."
+                    ])
+                }
+            } catch {
+                try? FileManager.default.removeItem(at: tmpZip)
+                try? FileManager.default.removeItem(at: stagingDir)
+                // If an existing v2512 install was being upgraded, surface the exact error instead of silently re-downloading v2512!
+                if installedMagpieVersion() != nil {
+                    throw error
+                }
+                // Otherwise fall back cleanly to HuggingFace legacy bundle only if GitHub Release is unavailable
+                onProgress(.init(
+                    kind: .magpieTTS,
+                    fractionCompleted: 0.04,
+                    statusMessage: "v2607 release unavailable · Falling back to HuggingFace mirror…",
+                    isReady: false,
+                    errorMessage: nil
+                ))
+            }
+        }
+
+        // Legacy HuggingFace mirror fallback (v2512)
         try FileManager.default.createDirectory(at: destRoot, withIntermediateDirectories: true)
-
-        onProgress(.init(kind: .magpieTTS, fractionCompleted: 0.02, statusMessage: "Fetching Magpie manifest…", isReady: false, errorMessage: nil))
-
         var filesToFetch: [String] = [
             "manifest.json",
             "constants/constants.json",
@@ -201,7 +304,7 @@ public actor ModelAssetManager {
             try await downloadFile(from: remoteURL, to: localURL)
         }
 
-        onProgress(.init(kind: .magpieTTS, fractionCompleted: 1.0, statusMessage: "Magpie v2607 Core ML ready", isReady: true, errorMessage: nil))
+        onProgress(.init(kind: .magpieTTS, fractionCompleted: 1.0, statusMessage: "Magpie Core ML ready", isReady: true, errorMessage: nil))
     }
 
     // MARK: - Download Parakeet Ultra 600M INT8 via FluidAudio
@@ -526,12 +629,22 @@ public enum MiniZipExtractor {
             guard payloadEnd <= totalLen else { continue }
 
             try fm.createDirectory(at: outURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-            let compressedSlice = data.subdata(in: payloadStart..<payloadEnd)
 
             if method == 0 {
-                // Stored (uncompressed) — zero-overhead direct write!
-                try compressedSlice.write(to: outURL, options: .atomic)
+                // Stored (uncompressed) — stream 4MB chunks directly from memory-mapped ZIP (constant <4MB RAM even on 850MB archives!)
+                fm.createFile(atPath: outURL.path, contents: nil)
+                let outHandle = try FileHandle(forWritingTo: outURL)
+                defer { try? outHandle.close() }
+                let chunkSize = 4 * 1024 * 1024
+                var offset = payloadStart
+                while offset < payloadEnd {
+                    let end = min(payloadEnd, offset + chunkSize)
+                    let slice = data[offset..<end]
+                    try outHandle.write(contentsOf: slice)
+                    offset = end
+                }
             } else if method == 8 {
+                let compressedSlice = data.subdata(in: payloadStart..<payloadEnd)
                 // Raw DEFLATE (RFC 1951) decoded via Apple's hardware-accelerated Compression.framework
                 var output = Data(count: max(1, uncompSize))
                 let decodedCount: Int = output.withUnsafeMutableBytes { dstBuf in

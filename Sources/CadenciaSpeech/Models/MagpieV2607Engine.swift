@@ -55,39 +55,95 @@ enum NpyLoader {
     }
 }
 
-// MARK: - Accelerate AMX/BLAS LocalTransformer (8-codebook AR head, <0.6ms/step)
+// MARK: - Accelerate AMX/BLAS KV-Cached LocalTransformer (Supports Both v2607 2L/12H/768D & v2512 1L/1H/256D)
+
+struct MagpieLocalTransformerLayer: Sendable {
+    let norm1W: [Float]   // [D]
+    let saQkvW: [Float]   // [3*D, D]
+    let saOW: [Float]     // [D, D]
+    let norm2W: [Float]   // [D]
+    let ffnW1: [Float]    // [4*D, D]
+    let ffnW2: [Float]    // [D, 4*D]
+}
 
 struct MagpieLocalTransformerWeights: Sendable {
-    let inProjW: [Float]      // [256, 768]
-    let inProjB: [Float]      // [256]
-    let posEmb: [Float]       // [10, 256]
-    let norm1W: [Float]       // [256]
-    let saQkvW: [Float]       // [768, 256]
-    let saOW: [Float]         // [256, 256]
-    let norm2W: [Float]       // [256]
-    let ffnW1: [Float]        // [1024, 256]
-    let ffnW2: [Float]        // [256, 1024]
-    let outProjW: [[Float]]   // 8 x [2024, 256]
-    let outProjB: [[Float]]   // 8 x [2024]
+    let nLayers: Int
+    let nHeads: Int
+    let hiddenDim: Int
+    let stackedCodebooks: Int
+    let inProjW: [Float]?        // nil in v2607 (d_model == hiddenDim == 768); [256, 768] in v2512
+    let inProjB: [Float]?        // nil in v2607; [256] in v2512
+    let posEmb: [Float]          // [maxCtx, D]
+    let layers: [MagpieLocalTransformerLayer]
+    let outProjW: [[Float]]      // stackedCodebooks x [2024, D]
+    let outProjB: [[Float]]      // stackedCodebooks x [2024]
 
-    static func load(from dir: URL) throws -> MagpieLocalTransformerWeights {
+    static func load(
+        from dir: URL,
+        nLayers: Int,
+        nHeads: Int,
+        hiddenDim: Int,
+        stackedCodebooks: Int,
+        hasInProj: Bool
+    ) throws -> MagpieLocalTransformerWeights {
         let ltDir = dir.appendingPathComponent("constants/local_transformer", isDirectory: true)
+        let fm = FileManager.default
+
+        let inProjWURL = ltDir.appendingPathComponent("in_proj_weight.npy")
+        let inProjBURL = ltDir.appendingPathComponent("in_proj_bias.npy")
+        let inProjW: [Float]? = (hasInProj && fm.fileExists(atPath: inProjWURL.path))
+            ? try NpyLoader.loadFloat32(from: inProjWURL).data
+            : nil
+        let inProjB: [Float]? = (hasInProj && fm.fileExists(atPath: inProjBURL.path))
+            ? try NpyLoader.loadFloat32(from: inProjBURL).data
+            : nil
+
+        let posEmb = try NpyLoader.loadFloat32(from: ltDir.appendingPathComponent("pos_emb.npy")).data
+
+        var layers: [MagpieLocalTransformerLayer] = []
+        layers.reserveCapacity(nLayers)
+        for l in 0..<nLayers {
+            let layeredPrefix = ltDir.appendingPathComponent("layer_\(l)_norm1_weight.npy")
+            if fm.fileExists(atPath: layeredPrefix.path) {
+                layers.append(MagpieLocalTransformerLayer(
+                    norm1W: try NpyLoader.loadFloat32(from: ltDir.appendingPathComponent("layer_\(l)_norm1_weight.npy")).data,
+                    saQkvW: try NpyLoader.loadFloat32(from: ltDir.appendingPathComponent("layer_\(l)_sa_qkv_weight.npy")).data,
+                    saOW: try NpyLoader.loadFloat32(from: ltDir.appendingPathComponent("layer_\(l)_sa_o_weight.npy")).data,
+                    norm2W: try NpyLoader.loadFloat32(from: ltDir.appendingPathComponent("layer_\(l)_norm2_weight.npy")).data,
+                    ffnW1: try NpyLoader.loadFloat32(from: ltDir.appendingPathComponent("layer_\(l)_ffn_conv1_weight.npy")).data,
+                    ffnW2: try NpyLoader.loadFloat32(from: ltDir.appendingPathComponent("layer_\(l)_ffn_conv2_weight.npy")).data
+                ))
+            } else {
+                // Legacy v2512 single-layer filenames
+                layers.append(MagpieLocalTransformerLayer(
+                    norm1W: try NpyLoader.loadFloat32(from: ltDir.appendingPathComponent("norm1_weight.npy")).data,
+                    saQkvW: try NpyLoader.loadFloat32(from: ltDir.appendingPathComponent("sa_qkv_weight.npy")).data,
+                    saOW: try NpyLoader.loadFloat32(from: ltDir.appendingPathComponent("sa_o_weight.npy")).data,
+                    norm2W: try NpyLoader.loadFloat32(from: ltDir.appendingPathComponent("norm2_weight.npy")).data,
+                    ffnW1: try NpyLoader.loadFloat32(from: ltDir.appendingPathComponent("ffn_conv1_weight.npy")).data,
+                    ffnW2: try NpyLoader.loadFloat32(from: ltDir.appendingPathComponent("ffn_conv2_weight.npy")).data
+                ))
+            }
+        }
+
         var outW: [[Float]] = []
         var outB: [[Float]] = []
-        for cb in 0..<8 {
+        outW.reserveCapacity(stackedCodebooks)
+        outB.reserveCapacity(stackedCodebooks)
+        for cb in 0..<stackedCodebooks {
             outW.append(try NpyLoader.loadFloat32(from: ltDir.appendingPathComponent("out_proj_\(cb)_weight.npy")).data)
             outB.append(try NpyLoader.loadFloat32(from: ltDir.appendingPathComponent("out_proj_\(cb)_bias.npy")).data)
         }
+
         return MagpieLocalTransformerWeights(
-            inProjW: try NpyLoader.loadFloat32(from: ltDir.appendingPathComponent("in_proj_weight.npy")).data,
-            inProjB: try NpyLoader.loadFloat32(from: ltDir.appendingPathComponent("in_proj_bias.npy")).data,
-            posEmb: try NpyLoader.loadFloat32(from: ltDir.appendingPathComponent("pos_emb.npy")).data,
-            norm1W: try NpyLoader.loadFloat32(from: ltDir.appendingPathComponent("norm1_weight.npy")).data,
-            saQkvW: try NpyLoader.loadFloat32(from: ltDir.appendingPathComponent("sa_qkv_weight.npy")).data,
-            saOW: try NpyLoader.loadFloat32(from: ltDir.appendingPathComponent("sa_o_weight.npy")).data,
-            norm2W: try NpyLoader.loadFloat32(from: ltDir.appendingPathComponent("norm2_weight.npy")).data,
-            ffnW1: try NpyLoader.loadFloat32(from: ltDir.appendingPathComponent("ffn_conv1_weight.npy")).data,
-            ffnW2: try NpyLoader.loadFloat32(from: ltDir.appendingPathComponent("ffn_conv2_weight.npy")).data,
+            nLayers: nLayers,
+            nHeads: nHeads,
+            hiddenDim: hiddenDim,
+            stackedCodebooks: stackedCodebooks,
+            inProjW: inProjW,
+            inProjB: inProjB,
+            posEmb: posEmb,
+            layers: layers,
             outProjW: outW,
             outProjB: outB
         )
@@ -125,7 +181,9 @@ struct MagpieLocalTransformerWeights: Sendable {
         for r in 0..<rows {
             let off = r * dim
             var mean: Float = 0
-            vDSP_meanv(Array(x[off..<(off + dim)]), 1, &mean, vDSP_Length(dim))
+            x.withUnsafeBufferPointer { ptr in
+                vDSP_meanv(ptr.baseAddress!.advanced(by: off), 1, &mean, vDSP_Length(dim))
+            }
             var varSum: Float = 0
             for c in 0..<dim {
                 let d = x[off + c] - mean
@@ -139,94 +197,17 @@ struct MagpieLocalTransformerWeights: Sendable {
         return out
     }
 
-    /// 1-layer causal LocalTransformer forward pass for T in [1..8], D=256.
-    func forward(sequence: [Float], seqLen T: Int) -> [Float] {
-        let D = 256
-        var x = sequence
-        // Add positional embedding
-        vDSP_vadd(x, 1, posEmb, 1, &x, 1, vDSP_Length(T * D))
-
-        // 1. Pre-norm causal self-attention
-        let xNorm1 = layerNormNoBias(x, rows: T, dim: D, weight: norm1W)
-        let qkv = linear(x: xNorm1, rows: T, inDim: D, w: saQkvW, outDim: 3 * D)
-
-        var q = [Float](repeating: 0, count: T * D)
-        var k = [Float](repeating: 0, count: T * D)
-        var v = [Float](repeating: 0, count: T * D)
-        for t in 0..<T {
-            let qkvOff = t * 3 * D
-            let dstOff = t * D
-            for d in 0..<D {
-                q[dstOff + d] = qkv[qkvOff + d]
-                k[dstOff + d] = qkv[qkvOff + D + d]
-                v[dstOff + d] = qkv[qkvOff + 2 * D + d]
-            }
+    private func projectInput(_ vec768: [Float]) -> [Float] {
+        if let w = inProjW {
+            return linear(x: vec768, rows: 1, inDim: 768, w: w, outDim: hiddenDim, bias: inProjB)
         }
-
-        let scale = 1.0 / sqrtf(Float(D))
-        var scores = [Float](repeating: 0, count: T * T)
-        q.withUnsafeBufferPointer { qPtr in
-            k.withUnsafeBufferPointer { kPtr in
-                scores.withUnsafeMutableBufferPointer { sPtr in
-                    cblas_sgemm(
-                        CblasRowMajor, CblasNoTrans, CblasTrans,
-                        Int32(T), Int32(T), Int32(D),
-                        scale, qPtr.baseAddress!, Int32(D),
-                        kPtr.baseAddress!, Int32(D),
-                        0.0, sPtr.baseAddress!, Int32(T)
-                    )
-                }
-            }
-        }
-        // Causal mask + row softmax
-        for r in 0..<T {
-            let off = r * T
-            var maxVal: Float = -Float.greatestFiniteMagnitude
-            for c in 0..<T {
-                if c > r { scores[off + c] = -1e9 }
-                maxVal = max(maxVal, scores[off + c])
-            }
-            var sumExp: Float = 0
-            for c in 0..<T {
-                let e = expf(scores[off + c] - maxVal)
-                scores[off + c] = e
-                sumExp += e
-            }
-            let inv = 1.0 / max(sumExp, 1e-12)
-            for c in 0..<T { scores[off + c] *= inv }
-        }
-
-        var ctx = [Float](repeating: 0, count: T * D)
-        scores.withUnsafeBufferPointer { sPtr in
-            v.withUnsafeBufferPointer { vPtr in
-                ctx.withUnsafeMutableBufferPointer { cPtr in
-                    cblas_sgemm(
-                        CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                        Int32(T), Int32(D), Int32(T),
-                        1.0, sPtr.baseAddress!, Int32(T),
-                        vPtr.baseAddress!, Int32(D),
-                        0.0, cPtr.baseAddress!, Int32(D)
-                    )
-                }
-            }
-        }
-        let saOut = linear(x: ctx, rows: T, inDim: D, w: saOW, outDim: D)
-        vDSP_vadd(x, 1, saOut, 1, &x, 1, vDSP_Length(T * D))
-
-        // 2. Pre-norm FFN (256 -> 1024 GELU -> 256)
-        let xNorm2 = layerNormNoBias(x, rows: T, dim: D, weight: norm2W)
-        var h = linear(x: xNorm2, rows: T, inDim: D, w: ffnW1, outDim: 1024)
-        let sqrt2OverPi: Float = 0.7978845608
-        for i in 0..<h.count {
-            let v = h[i]
-            h[i] = 0.5 * v * (1.0 + tanhf(sqrt2OverPi * (v + 0.044715 * v * v * v)))
-        }
-        let ffnOut = linear(x: h, rows: T, inDim: 1024, w: ffnW2, outDim: D)
-        vDSP_vadd(x, 1, ffnOut, 1, &x, 1, vDSP_Length(T * D))
-        return x
+        return vec768
     }
 
-    /// Samples all 8 NanoCodec codebooks autoregressively with Classifier-Free Guidance (CFG).
+    /// Samples all stacked NanoCodec codebooks (16 in v2607 = 2 frames x 8 codebooks; 8 in v2512)
+    /// autoregressively using KV-cached multi-head attention with batched `[cond, uncond]` AMX GEMMs!
+    /// Returns BOTH `sampled` (multinomial top-k) AND `greedy` (argmax) for exact NeMo
+    /// `eos_detection_method = "argmax_or_multinomial_any"`.
     func sampleCodebooks(
         condHidden: [Float],
         uncondHidden: [Float]?,
@@ -235,49 +216,150 @@ struct MagpieLocalTransformerWeights: Sendable {
         topK: Int,
         cfgScale: Float,
         forbidEOS: Bool
-    ) -> [Int32] {
+    ) -> (sampled: [Int32], greedy: [Int32]) {
+        let D = hiddenDim
+        let ffnDim = D * 4
+        let H = max(1, nHeads)
+        let dHead = D / H
+        let scale = 1.0 / sqrtf(Float(dHead))
+        let maxSteps = stackedCodebooks
         let forbidden: [Int] = forbidEOS
             ? [2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023]
             : [2016, 2018, 2019, 2020, 2021, 2022, 2023]
         let useCFG = uncondHidden != nil && abs(cfgScale - 1.0) > 1e-4
+        let lanes = useCFG ? 2 : 1
 
-        var condSeq = linear(x: condHidden, rows: 1, inDim: 768, w: inProjW, outDim: 256, bias: inProjB)
-        var uncondSeq = uncondHidden.map { linear(x: $0, rows: 1, inDim: 768, w: inProjW, outDim: 256, bias: inProjB) } ?? []
-        var codes = [Int32](repeating: 0, count: 8)
+        // Per-layer KV cache: [layer][lane][step * D + h * dHead + d]
+        var cacheK = Array(repeating: Array(repeating: [Float](repeating: 0, count: maxSteps * D), count: lanes), count: nLayers)
+        var cacheV = Array(repeating: Array(repeating: [Float](repeating: 0, count: maxSteps * D), count: lanes), count: nLayers)
 
-        for cb in 0..<8 {
+        var sampled = [Int32](repeating: 0, count: maxSteps)
+        var greedy = [Int32](repeating: 0, count: maxSteps)
+
+        var curInput = [Float](repeating: 0, count: lanes * D)
+        let c0 = projectInput(condHidden)
+        curInput.replaceSubrange(0..<D, with: c0)
+        if useCFG, let uh = uncondHidden {
+            let u0 = projectInput(uh)
+            curInput.replaceSubrange(D..<(2 * D), with: u0)
+        }
+
+        var scores = [Float](repeating: 0, count: maxSteps)
+        let sqrt2OverPi: Float = 0.7978845608
+
+        for cb in 0..<maxSteps {
             let seqLen = cb + 1
-            let condOut = forward(sequence: condSeq, seqLen: seqLen)
-            let lastCond = Array(condOut[((seqLen - 1) * 256)..<(seqLen * 256)])
-            var logits = linear(x: lastCond, rows: 1, inDim: 256, w: outProjW[cb], outDim: 2024, bias: outProjB[cb])
+            // Add positional embedding posEmb[cb] to each lane
+            var x = curInput
+            let posOff = cb * D
+            for lane in 0..<lanes {
+                let lOff = lane * D
+                for d in 0..<D { x[lOff + d] += posEmb[posOff + d] }
+            }
 
+            // Pass through all LocalTransformer layers with KV cache (1 token per lane!)
+            for l in 0..<nLayers {
+                let layer = layers[l]
+                let xNorm1 = layerNormNoBias(x, rows: lanes, dim: D, weight: layer.norm1W)
+                let qkv = linear(x: xNorm1, rows: lanes, inDim: D, w: layer.saQkvW, outDim: 3 * D)
+
+                var ctx = [Float](repeating: 0, count: lanes * D)
+                for lane in 0..<lanes {
+                    let qkvBase = lane * 3 * D
+                    let writeOff = cb * D
+                    // Store current K & V into KV cache
+                    for d in 0..<D {
+                        cacheK[l][lane][writeOff + d] = qkv[qkvBase + D + d]
+                        cacheV[l][lane][writeOff + d] = qkv[qkvBase + 2 * D + d]
+                    }
+
+                    // Multi-head causal attention over 0...cb
+                    let ctxLaneOff = lane * D
+                    for h in 0..<H {
+                        let hOff = h * dHead
+                        var maxScore: Float = -Float.greatestFiniteMagnitude
+                        for t in 0..<seqLen {
+                            let kOff = t * D + hOff
+                            var dot: Float = 0
+                            for d in 0..<dHead {
+                                dot += qkv[qkvBase + hOff + d] * cacheK[l][lane][kOff + d]
+                            }
+                            let s = dot * scale
+                            scores[t] = s
+                            if s > maxScore { maxScore = s }
+                        }
+                        var sumExp: Float = 0
+                        for t in 0..<seqLen {
+                            let e = expf(scores[t] - maxScore)
+                            scores[t] = e
+                            sumExp += e
+                        }
+                        let invSum = 1.0 / max(sumExp, 1e-12)
+                        for t in 0..<seqLen { scores[t] *= invSum }
+
+                        for t in 0..<seqLen {
+                            let w = scores[t]
+                            let vOff = t * D + hOff
+                            let dstOff = ctxLaneOff + hOff
+                            for d in 0..<dHead {
+                                ctx[dstOff + d] += w * cacheV[l][lane][vOff + d]
+                            }
+                        }
+                    }
+                }
+
+                let saOut = linear(x: ctx, rows: lanes, inDim: D, w: layer.saOW, outDim: D)
+                vDSP_vadd(x, 1, saOut, 1, &x, 1, vDSP_Length(lanes * D))
+
+                let xNorm2 = layerNormNoBias(x, rows: lanes, dim: D, weight: layer.norm2W)
+                var hAct = linear(x: xNorm2, rows: lanes, inDim: D, w: layer.ffnW1, outDim: ffnDim)
+                for i in 0..<hAct.count {
+                    let v = hAct[i]
+                    hAct[i] = 0.5 * v * (1.0 + tanhf(sqrt2OverPi * (v + 0.044715 * v * v * v)))
+                }
+                let ffnOut = linear(x: hAct, rows: lanes, inDim: ffnDim, w: layer.ffnW2, outDim: D)
+                vDSP_vadd(x, 1, ffnOut, 1, &x, 1, vDSP_Length(lanes * D))
+            }
+
+            // Output logits for codebook `cb` (batched across cond & uncond lanes)
+            let rawLogits = linear(x: x, rows: lanes, inDim: D, w: outProjW[cb], outDim: 2024, bias: outProjB[cb])
+            var logits = [Float](repeating: 0, count: 2024)
             if useCFG {
-                let uncondOut = forward(sequence: uncondSeq, seqLen: seqLen)
-                let lastUncond = Array(uncondOut[((seqLen - 1) * 256)..<(seqLen * 256)])
-                let uLogits = linear(x: lastUncond, rows: 1, inDim: 256, w: outProjW[cb], outDim: 2024, bias: outProjB[cb])
                 let oneMinus = 1.0 - cfgScale
                 for i in 0..<2024 {
-                    logits[i] = cfgScale * logits[i] + oneMinus * uLogits[i]
+                    logits[i] = cfgScale * rawLogits[i] + oneMinus * rawLogits[2024 + i]
                 }
+            } else {
+                logits = rawLogits
             }
 
             for fId in forbidden where fId < logits.count {
                 logits[fId] = -Float.greatestFiniteMagnitude
             }
 
-            let sampled = sampleTopK(logits: logits, temperature: temperature, topK: topK)
-            codes[cb] = Int32(sampled)
+            // Track BOTH greedy argmax AND top-k multinomial sample (exact NeMo EOS detection)
+            var bestIdx = 0
+            var bestVal = -Float.greatestFiniteMagnitude
+            for i in 0..<2024 where logits[i] > bestVal {
+                bestVal = logits[i]
+                bestIdx = i
+            }
+            greedy[cb] = Int32(bestIdx)
 
-            // Embed sampled codebook token -> project to LT 256-dim for next codebook
-            if cb < 7 {
-                let embOff = sampled * 768
+            let pick = sampleTopK(logits: logits, temperature: temperature, topK: topK)
+            sampled[cb] = Int32(pick)
+
+            if cb + 1 < maxSteps {
+                let embOff = pick * 768
                 let tokEmb = Array(audioEmbeddings[cb][embOff..<(embOff + 768)])
-                let nextVec = linear(x: tokEmb, rows: 1, inDim: 768, w: inProjW, outDim: 256, bias: inProjB)
-                condSeq.append(contentsOf: nextVec)
-                if useCFG { uncondSeq.append(contentsOf: nextVec) }
+                let nextVec = projectInput(tokEmb)
+                curInput.replaceSubrange(0..<D, with: nextVec)
+                if useCFG {
+                    curInput.replaceSubrange(D..<(2 * D), with: nextVec)
+                }
             }
         }
-        return codes
+        return (sampled, greedy)
     }
 
     private func sampleTopK(logits: [Float], temperature: Float, topK: Int) -> Int {
@@ -303,70 +385,220 @@ struct MagpieLocalTransformerWeights: Sendable {
     }
 }
 
-// MARK: - Spanish Phoneme Tokenizer with Native Inline Regional Accent Override
+// MARK: - Monotonic Cross-Attention Prior State (Exact NVIDIA NeMo Magpie v2607 Alignment Tracker)
 
-struct MagpieSpanishTokenizer: Sendable {
-    private let spanishOffset = 96
-    private let eosTokenId: Int32 = 2361
+public struct MagpieAttentionPriorState: Sendable {
+    public let textLen: Int
+    public let epsilon: Float
+    public let lookaheadWindow: Int
+    public let advanceThreshold: Int
+    public let decayThreshold: Int
+    public private(set) var lastAttended: Int
+    public private(set) var attendedCounts: [Int]
+    public private(set) var prior: [Float]
+
+    public init(
+        textLen: Int,
+        epsilon: Float = 0.1,
+        lookaheadWindow: Int = 6,
+        advanceThreshold: Int = 8,
+        decayThreshold: Int = 10
+    ) {
+        self.textLen = max(1, textLen)
+        self.epsilon = epsilon
+        self.lookaheadWindow = max(1, lookaheadWindow)
+        self.advanceThreshold = max(1, advanceThreshold)
+        self.decayThreshold = max(1, decayThreshold)
+        self.lastAttended = min(1, max(0, self.textLen - 1))
+        self.attendedCounts = [Int](repeating: 0, count: self.textLen)
+        self.prior = [Float](repeating: 1.0, count: self.textLen)
+    }
+
+    /// Updates monotonic alignment state from mean post-softmax cross-attention scores (`layers [4,5,8,9]`)
+    /// matching NVIDIA NeMo `MagpieTTSModel.get_most_attended_text_timestep` + `construct_inference_prior`.
+    public mutating func update(alignmentScores: [Float]) {
+        guard textLen > 0, alignmentScores.count >= textLen else { return }
+        var last = max(0, min(lastAttended, textLen - 1))
+        if attendedCounts[last] >= advanceThreshold {
+            last = min(last + 1, textLen - 1)
+        }
+
+        let windowEnd = min(last + lookaheadWindow, textLen - 3)
+        let attended: Int
+        if windowEnd > last {
+            var bestIdx = last
+            var bestScore = alignmentScores[last]
+            for i in (last + 1)..<windowEnd {
+                if alignmentScores[i] > bestScore {
+                    bestScore = alignmentScores[i]
+                    bestIdx = i
+                }
+            }
+            attended = bestIdx
+        } else {
+            attended = textLen - 1
+        }
+
+        lastAttended = max(0, min(attended, textLen - 1))
+        attendedCounts[lastAttended] += 1
+
+        if textLen <= 5 {
+            prior = [Float](repeating: 1.0, count: textLen)
+            return
+        }
+
+        var nextPrior = [Float](repeating: epsilon, count: textLen)
+        nextPrior[max(1, lastAttended - 1)] = 1.0
+        nextPrior[lastAttended] = 1.0
+        for d in 1...lookaheadWindow {
+            nextPrior[min(lastAttended + d, textLen - 1)] = 1.0
+        }
+
+        // Suppress historical attention sinks that were attended >= decayThreshold times
+        for i in 0..<textLen where attendedCounts[i] >= decayThreshold {
+            let fillEnd = min(i + 1, lastAttended)
+            if fillEnd > 0 {
+                for j in 0..<fillEnd { nextPrior[j] = epsilon }
+            }
+        }
+        prior = nextPrior
+    }
+
+    /// Writes additive log-prior bias (`log(prior[i])` for `i < textLen`, `-3e4` for masked pad slots)
+    /// into a `[1, maxTextLen]` Float32 Core ML buffer.
+    public func fillLogPriorBias(into ptr: UnsafeMutablePointer<Float>, maxTextLen: Int) {
+        let limit = min(textLen, maxTextLen)
+        for i in 0..<limit {
+            ptr[i] = logf(max(prior[i], 1e-6))
+        }
+        if limit < maxTextLen {
+            for i in limit..<maxTextLen { ptr[i] = -30_000.0 }
+        }
+    }
+}
+
+// MARK: - Exact NeMo Frame-Stacked EOS Helper (`argmax_or_multinomial_any`)
+
+public enum MagpieEOSDetector {
+    /// Checks stacked codebooks (8 per frame lane) across LocalTransformer multinomial sample,
+    /// LocalTransformer greedy argmax, AND main decoder head (`logits`/`var_2129`) greedy argmax.
+    /// Returns the first frame lane (`0..<frameStackingFactor`) that contains `audioEOSId` (2017),
+    /// or `nil` if no EOS was detected (or `stepFramesEmitted + lane < minFrames`).
+    public static func firstEOSLane(
+        sampled: [Int32],
+        greedyLT: [Int32],
+        greedyMain: [Int32]?,
+        frameStackingFactor: Int,
+        codebooksPerFrame: Int = 8,
+        audioEOSId: Int32 = 2017,
+        framesEmittedSoFar: Int,
+        minFrames: Int = 4
+    ) -> Int? {
+        for lane in 0..<max(1, frameStackingFactor) {
+            if framesEmittedSoFar + lane < minFrames { continue }
+            let start = lane * codebooksPerFrame
+            let end = min(sampled.count, start + codebooksPerFrame)
+            for idx in start..<end {
+                if sampled[idx] == audioEOSId || greedyLT[idx] == audioEOSId {
+                    return lane
+                }
+                if let gm = greedyMain, idx < gm.count, gm[idx] == audioEOSId {
+                    return lane
+                }
+            }
+        }
+        return nil
+    }
+}
+
+// MARK: - Spanish Phoneme Tokenizer (Exact NeMo v2607 & v2512 Parity + Regional Accent Overrides)
+
+public struct MagpieSpanishTokenizer: Sendable {
+    public let spanishOffset: Int32
+    public let eosTokenId: Int32
+    public let padTokenId: Int32
     private let token2Id: [String: Int32]
     private let phonemeDict: [String: [String]]
 
-    init(modelDir: URL) throws {
+    public init(
+        token2Id: [String: Int32],
+        phonemeDict: [String: [String]],
+        spanishOffset: Int32 = 480,
+        eosTokenId: Int32 = 3358
+    ) {
+        self.token2Id = token2Id
+        self.phonemeDict = phonemeDict
+        self.spanishOffset = spanishOffset
+        self.eosTokenId = eosTokenId
+        self.padTokenId = spanishOffset + (token2Id["<pad>"] ?? 101)
+    }
+
+    public init(modelDir: URL, spanishOffset: Int32, eosTokenId: Int32) throws {
         let tok2IdURL = modelDir.appendingPathComponent("tokenizer/spanish_phoneme_token2id.json")
         let dictURL = modelDir.appendingPathComponent("tokenizer/spanish_phoneme_phoneme_dict.json")
         let t2iData = try Data(contentsOf: tok2IdURL)
-        self.token2Id = try JSONDecoder().decode([String: Int32].self, from: t2iData)
+        let decodedT2I = try JSONDecoder().decode([String: Int32].self, from: t2iData)
 
+        var decodedDict: [String: [String]] = [:]
         if let dData = try? Data(contentsOf: dictURL) {
             if let direct = try? JSONDecoder().decode([String: [String]].self, from: dData) {
-                self.phonemeDict = direct
+                decodedDict = direct
             } else if let raw = try? JSONSerialization.jsonObject(with: dData) as? [String: Any] {
-                var parsed: [String: [String]] = [:]
-                parsed.reserveCapacity(raw.count)
+                decodedDict.reserveCapacity(raw.count)
+                let esLocale = Locale(identifier: "es_ES")
                 for (k, v) in raw {
                     if let arr = v as? [String] {
-                        parsed[k.uppercased(with: Locale(identifier: "es_ES"))] = arr
+                        decodedDict[k.uppercased(with: esLocale)] = arr
                     } else if let nested = v as? [[String]], let first = nested.first {
-                        parsed[k.uppercased(with: Locale(identifier: "es_ES"))] = first
+                        decodedDict[k.uppercased(with: esLocale)] = first
                     }
                 }
-                self.phonemeDict = parsed
-            } else {
-                self.phonemeDict = [:]
             }
-        } else {
-            self.phonemeDict = [:]
         }
+        self.init(
+            token2Id: decodedT2I,
+            phonemeDict: decodedDict,
+            spanishOffset: spanishOffset,
+            eosTokenId: eosTokenId
+        )
     }
 
-    /// Tokenizes Spanish prose into Magpie AggregatedTTSTokenizer IDs matching NeMo's
-    /// `chunk_and_tokenize_text_by_sentence` (NO text_bos_id; leading/trailing space + trailing eos_token_id=2361):
-    /// - `.castilian` (`es-ES`): keeps distinción `/θ/` and `/ʎ/`
-    /// - `.latinAmerican` (`es-419`): maps `/θ/` -> `/s/` (seseo) and `/ʎ/` -> `/ʝ/` (yeísmo)
-    /// - `.rioplatense` (`es-AR`): maps `/θ/` -> `/s/` (seseo) and `/ʎ/`, `/ʝ/` -> `/ʃ/` (sheísmo)
-    /// Also respects explicit inline `| ... |` IPA spans!
-    func tokenize(text: String, accent: SpanishRegionalAccent) -> [Int32] {
+    /// Tokenizes Spanish prose into Magpie AggregatedTTSTokenizer IDs matching NVIDIA NeMo
+    /// (`nvidia/magpie_tts_multilingual_demo` + `NeMo-Speech.cpp/src/tts/tokenizer/tokenizer_impl.cpp`):
+    /// - Appends terminal `.` when missing (eliminates open-ended trailing hallucinations on bare words!)
+    /// - Uses `es_ES_nv230301.dict` phonemes with regional phonology (`es-ES` / `es-419` / `es-AR`)
+    /// - Uses exact NeMo `IpaG2p` uppercase grapheme fallback (`grapheme_case = "upper"`) for OOV words
+    /// - Pads ultra-short sequences with `<pad>` (`MIN_TOKENS_EXCLUDING_FIRST_AND_EOS = 4`)
+    /// - Supports explicit inline `| ... |` IPA overrides!
+    public func tokenize(text: String, accent: SpanishRegionalAccent) -> [Int32] {
+        var prepared = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !prepared.isEmpty else { return [eosTokenId] }
+
+        // Match NVIDIA's official demo (`app.py:132-133`): always close utterances with terminal punctuation
+        // so Magpie emits a clean final contour + crisp EOS instead of hallucinating trailing syllables.
+        let hasInlineIPA = prepared.contains("|")
+        if !hasInlineIPA, let last = prepared.last, ![".", "?", "!", "…"].contains(last) {
+            prepared.append(".")
+        }
+
         var ids: [Int32] = []
         ids.reserveCapacity(128)
-        let spaceId = (token2Id[" "] ?? 100) + Int32(spanishOffset)
+        let spaceId = (token2Id[" "] ?? 100) + spanishOffset
         let esLocale = Locale(identifier: "es_ES")
-        ids.append(spaceId) // Spanish tokenizer uses pad_with_space = true (matches tokenizer_references.json)
+        ids.append(spaceId) // Spanish tokenizer uses pad_with_space = true
 
-        // Split on inline | ... | IPA overrides
-        let segments = text.components(separatedBy: "|")
+        let segments = prepared.components(separatedBy: "|")
         for (segIdx, seg) in segments.enumerated() {
             if segIdx % 2 == 1 {
-                // Direct IPA symbols separated by whitespace
                 for sym in seg.split(separator: " ") {
                     let s = sym == "g" ? "ɡ" : String(sym)
                     if let localId = token2Id[s] {
-                        ids.append(localId + Int32(spanishOffset))
+                        ids.append(localId + spanishOffset)
                     }
                 }
                 continue
             }
 
-            // Standard Spanish text -> word-by-word lookup + G2P fallback + regional phonological filter
             let words = seg.split(whereSeparator: { $0.isWhitespace })
             for (wIdx, rawWord) in words.enumerated() {
                 let wordStr = String(rawWord)
@@ -375,29 +607,31 @@ struct MagpieSpanishTokenizer: Sendable {
                 let core = String(wordStr.dropFirst(leadingPunct.count).dropLast(trailingPunct.count))
 
                 for ch in leadingPunct {
-                    if let lid = token2Id[String(ch)] { ids.append(lid + Int32(spanishOffset)) }
+                    if let lid = token2Id[String(ch)] { ids.append(lid + spanishOffset) }
                 }
 
                 if !core.isEmpty {
-                    let phones: [String]
                     let upperKey = core.uppercased(with: esLocale)
                     if let dictPhones = phonemeDict[upperKey] {
-                        phones = applyRegionalPhonology(dictPhones, accent: accent)
+                        let phones = applyRegionalPhonology(dictPhones, accent: accent)
+                        for ph in phones {
+                            if let lid = token2Id[ph] {
+                                ids.append(lid + spanishOffset)
+                            }
+                        }
                     } else {
-                        // OOV fallback: normalize ASCII 'g' -> IPA 'ɡ' so every phoneme maps cleanly in spanish_phoneme_token2id
-                        let ipa = SpanishLemmatizer.wordToIPA(core, accent: accent)
-                            .replacingOccurrences(of: "g", with: "ɡ")
-                        phones = ipa.map { String($0) }
-                    }
-                    for ph in phones {
-                        if let lid = token2Id[ph] {
-                            ids.append(lid + Int32(spanishOffset))
+                        // Exact NeMo IpaG2p OOV fallback (`grapheme_case: "upper"`): emit uppercase Spanish
+                        // graphemes (D, Í, A, S / B, R, I, L, L, A / Y) which the model was trained on directly!
+                        for ch in upperKey {
+                            if let lid = token2Id[String(ch)] {
+                                ids.append(lid + spanishOffset)
+                            }
                         }
                     }
                 }
 
                 for ch in trailingPunct {
-                    if let lid = token2Id[String(ch)] { ids.append(lid + Int32(spanishOffset)) }
+                    if let lid = token2Id[String(ch)] { ids.append(lid + spanishOffset) }
                 }
 
                 if wIdx + 1 < words.count {
@@ -407,6 +641,13 @@ struct MagpieSpanishTokenizer: Sendable {
         }
         ids.append(spaceId)
         ids.append(eosTokenId)
+
+        // Exact NeMo-Speech.cpp `pad_short_text_chunk_before_eos` (MIN_TOKENS_EXCLUDING_FIRST_AND_EOS = 4)
+        let innerCount = ids.count - 2
+        if innerCount < 4 {
+            let padCount = 4 - innerCount
+            ids.insert(contentsOf: repeatElement(padTokenId, count: padCount), at: 1)
+        }
         return Array(ids.prefix(256))
     }
 
@@ -483,21 +724,22 @@ public actor MagpieV2607Engine {
     private static let maxTextLen: Int = 256
     private static let maxSeqLen: Int = 512
 
-    private static let kOutKeys = [
+    // Legacy v2512 anonymous Core ML output keys (kept for seamless backward compatibility)
+    private static let legacyKOutKeys = [
         "new_k_1", "new_k_3", "new_k_5", "new_k_7",
         "new_k_9", "new_k_11", "new_k_13", "new_k_15",
         "new_k_17", "new_k_19", "new_k_21", "new_k",
     ]
-    private static let vOutKeys = [
+    private static let legacyVOutKeys = [
         "new_v_1", "new_v_3", "new_v_5", "new_v_7",
         "new_v_9", "new_v_11", "new_v_13", "new_v_15",
         "new_v_17", "new_v_19", "new_v_21", "new_v",
     ]
-    private static let posOutKeys = [
+    private static let legacyPosOutKeys = [
         "var_169", "var_339", "var_509", "var_679", "var_849", "var_1019",
         "var_1189", "var_1359", "var_1529", "var_1699", "var_1869", "var_2039",
     ]
-    private static let prefillKVKeys = [
+    private static let legacyPrefillKVKeys = [
         "var_208", "var_374", "var_540", "var_706", "var_872", "var_1038",
         "var_1204", "var_1370", "var_1536", "var_1702", "var_1868", "var_1958",
     ]
@@ -507,12 +749,27 @@ public actor MagpieV2607Engine {
     private var decoderStep: MLModel?
     private var nanoCodec: MLModel?
     private var nanoCodecFrames: Int = 24
-    private var frameStackingFactor: Int = 1
+
+    // Checkpoint-derived runtime configuration (auto-detected from constants.json!)
+    public private(set) var checkpointVersion: String = "v2512"
+    public private(set) var frameStackingFactor: Int = 1
+    private var stackedCodebooks: Int = 8
+    private var contextLength: Int = 110
+    private var useV2607SpeakerOrder: Bool = false
+    private var supportsAttentionPrior: Bool = false
+    private var usesCleanV2607PrefillOutputs: Bool = false
+    private var usesSinglePositionInput: Bool = false
+    private var stepHiddenOutputKey: String = "input"
+    private var stepLogitsOutputKey: String? = "var_2129"
+    private var priorEpsilon: Float = 0.1
+    private var priorLookahead: Int = 6
+    private var priorAdvanceThreshold: Int = 8
+    private var priorDecayThreshold: Int = 10
 
     private var tokenizer: MagpieSpanishTokenizer?
     private var localTransformer: MagpieLocalTransformerWeights?
-    private var speakerEmbeddings: [[Float]] = []       // 5 x (110 * 768)
-    private var audioEmbeddings: [[Float]] = []         // 8 x (2024 * 768)
+    private var speakerEmbeddings: [[Float]] = []       // 5 x (T_ctx * 768)
+    private var audioEmbeddings: [[Float]] = []         // stackedCodebooks x (2024 * 768)
 
     // Pre-cached unconditional CFG prefill KV state (computed once at load -> saves 50% of prefill!)
     private var cachedUncondK: [MLMultiArray]?
@@ -532,9 +789,9 @@ public actor MagpieV2607Engine {
         let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
         self.audioCacheDir = caches.appendingPathComponent("CadenciaAudioCache", isDirectory: true)
         try? FileManager.default.createDirectory(at: self.audioCacheDir, withIntermediateDirectories: true)
-        // Purge legacy pre-v2 cached WAV files so upgraded engine audio is always freshly generated
+        // Purge legacy pre-v3 cached WAV clips so upgraded v2607 / clean-EOS audio is always fresh!
         if let files = try? FileManager.default.contentsOfDirectory(at: self.audioCacheDir, includingPropertiesForKeys: nil) {
-            for f in files where !f.lastPathComponent.hasPrefix("v2_") {
+            for f in files where !f.lastPathComponent.hasPrefix("v3_") {
                 try? FileManager.default.removeItem(at: f)
             }
         }
@@ -544,26 +801,103 @@ public actor MagpieV2607Engine {
         self.onAudioLevelUpdate = handler
     }
 
-    /// Loads all 4 compiled Magpie Core ML models concurrently with optimal Apple Silicon compute placement
-    /// (verified via FluidInference/mobius SWIFT_PORT_FINDINGS.md & PERF.md:
-    ///  text_encoder & decoder_prefill -> ANE, decoder_step -> GPU+CPU avoiding per-step ANE scatter recompile,
-    ///  NanoCodec v3 -> CPU avoiding FP16 audio drift), plus caches unconditional prefill KV tensors once.
-    public func loadModels(from modelDir: URL) async throws {
+    /// Unloads currently loaded Core ML models (used when upgrading from legacy v2512 to genuine v2607).
+    public func unload() {
+        stopPlayback()
+        textEncoder = nil
+        decoderPrefill = nil
+        decoderStep = nil
+        nanoCodec = nil
+        tokenizer = nil
+        localTransformer = nil
+        speakerEmbeddings = []
+        audioEmbeddings = []
+        cachedUncondK = nil
+        cachedUncondV = nil
+        isLoaded = false
+    }
+
+    /// Loads all 4 compiled Magpie Core ML models with optimal Apple Silicon compute placement:
+    /// - `text_encoder` & `decoder_prefill` -> `.cpuAndNeuralEngine` (ANE, ~12-18ms)
+    /// - `decoder_step` -> `.cpuAndGPU` (Metal GPU — avoids `ANECCompile() FAILED` runtime fallback!)
+    /// - `nanocodec_decoder_v3` -> `.cpuOnly` (full FP32 CPU — eliminates FP16 vocoder noise!)
+    /// Auto-detects genuine NVIDIA Magpie v2607 (`frame_stacking_factor = 2`, 217-frame prefill,
+    /// 2-layer 12-head 768-dim LT, `spanish_offset = 480`, `apply_attention_prior = true`) as well as
+    /// legacy v2512 checkpoints seamlessly.
+    public func loadModels(from modelDir: URL, forceReload: Bool = false) async throws {
+        if forceReload { unload() }
         if isLoaded { return }
 
-        // Parse constants.json to auto-detect frame_stacking_factor (1 or v2607 factor 2)
+        // Parse constants.json for exact checkpoint profile (v2607 vs legacy v2512)
+        var fsf = 1
+        var stacked = 8
+        var tCtx = 110
+        var spOffset: Int32 = 96
+        var eosId: Int32 = 2361
+        var ltLayers = 1
+        var ltHeads = 1
+        var ltHidden = 256
+        var ltHasInProj = true
+        var versionTag = "v2512"
+        var v2607Speakers = false
+        var pEps: Float = 0.1
+        var pLook = 6
+        var pAdv = 8
+        var pDec = 10
+
         let constURL = modelDir.appendingPathComponent("constants/constants.json")
         if let cData = try? Data(contentsOf: constURL),
-           let cJson = try? JSONSerialization.jsonObject(with: cData) as? [String: Any],
-           let fsf = cJson["frame_stacking_factor"] as? Int {
-            self.frameStackingFactor = max(1, fsf)
+           let cJson = try? JSONSerialization.jsonObject(with: cData) as? [String: Any] {
+            if let v = cJson["version"] as? String { versionTag = v }
+            if let f = cJson["frame_stacking_factor"] as? Int { fsf = max(1, f) }
+            if let sc = cJson["stacked_audio_codebooks"] as? Int {
+                stacked = max(8, sc)
+            } else {
+                stacked = 8 * fsf
+            }
+            if let tc = cJson["baked_context_length"] as? Int { tCtx = max(1, tc) }
+            if let off = cJson["spanish_phoneme_offset"] as? Int { spOffset = Int32(off) }
+            if let sp = cJson["special_tokens"] as? [String: Any], let tid = sp["text_eos_id"] as? Int {
+                eosId = Int32(tid)
+            }
+            if let spkNames = cJson["speaker_names"] as? [String], spkNames.first == "Aria" {
+                v2607Speakers = true
+            }
+            if let lt = cJson["local_transformer"] as? [String: Any] {
+                if let nl = lt["n_layers"] as? Int { ltLayers = max(1, nl) }
+                if let nh = lt["n_heads"] as? Int { ltHeads = max(1, nh) }
+                if let hd = lt["hidden_dim"] as? Int { ltHidden = max(64, hd) }
+                if let hp = lt["has_in_proj"] as? Bool { ltHasInProj = hp }
+            }
+            if let inf = cJson["inference"] as? [String: Any] {
+                if let e = inf["attention_prior_epsilon"] as? Double { pEps = Float(e) }
+                if let lw = inf["attention_prior_lookahead_window"] as? Int { pLook = lw }
+                if let at = inf["attention_prior_advance_threshold"] as? Int { pAdv = at }
+                if let dt = inf["attention_prior_decay_threshold"] as? Int { pDec = dt }
+            }
+        }
+
+        // Also inspect speaker_info.json if present for T_ctx & speaker ordering
+        let spkInfoURL = modelDir.appendingPathComponent("constants/speaker_info.json")
+        if let sData = try? Data(contentsOf: spkInfoURL),
+           let sJson = try? JSONSerialization.jsonObject(with: sData) as? [String: Any] {
+            if let tc = sJson["T"] as? Int { tCtx = max(1, tc) }
+            if let names = sJson["names"] as? [String: String], names["0"] == "Aria" {
+                v2607Speakers = true
+            }
         }
 
         let aneConfig = MLModelConfiguration()
-        aneConfig.computeUnits = .cpuAndNeuralEngine // Phase D verified: ANE gives clean EOS + 2× speedup on text_encoder, prefill & decoder_step!
+        aneConfig.computeUnits = .cpuAndNeuralEngine
+
+        // FluidInference SWIFT_PORT_FINDINGS.md verified: decoder_step triggers `ANECCompile() FAILED`
+        // under real incrementing positions and falls back slowly to CPU; `.cpuAndGPU` stays fast on Metal GPU!
+        let stepConfig = MLModelConfiguration()
+        stepConfig.computeUnits = .cpuAndGPU
+        stepConfig.allowLowPrecisionAccumulationOnGPU = true
 
         let codecConfig = MLModelConfiguration()
-        codecConfig.computeUnits = .cpuOnly // Phase F verified: FP32 NanoCodec v3 on CPU avoids fp16 vocoder noise completely
+        codecConfig.computeUnits = .cpuOnly // Full FP32 CPU eliminates FP16 vocoder noise
 
         let textEncURL = modelDir.appendingPathComponent("text_encoder.mlmodelc")
         let prefillURL = modelDir.appendingPathComponent("decoder_prefill.mlmodelc")
@@ -572,36 +906,62 @@ public actor MagpieV2607Engine {
         let v1URL = modelDir.appendingPathComponent("nanocodec_decoder.mlmodelc")
         let codecURL = FileManager.default.fileExists(atPath: v3URL.path) ? v3URL : v1URL
 
-        // Load CPU NanoCodec concurrently while compiling ANE models one-by-one to prevent iOS `aned` contention!
         async let loadedCodec = MLModel.load(contentsOf: codecURL, configuration: codecConfig)
-
+        async let loadedStep = MLModel.load(contentsOf: decStepURL, configuration: stepConfig)
         let te = try await MLModel.load(contentsOf: textEncURL, configuration: aneConfig)
         let pf = try await MLModel.load(contentsOf: prefillURL, configuration: aneConfig)
-        let ds: MLModel
-        do {
-            ds = try await MLModel.load(contentsOf: decStepURL, configuration: aneConfig)
-        } catch {
-            let gpuFallback = MLModelConfiguration()
-            gpuFallback.computeUnits = .cpuAndGPU
-            ds = try await MLModel.load(contentsOf: decStepURL, configuration: gpuFallback)
-        }
+        let ds = try await loadedStep
+        let nc = try await loadedCodec
+
+        // Auto-detect exact Core ML input/output interfaces from modelDescription
+        let cleanPrefill = pf.modelDescription.outputDescriptionsByName["k0"] != nil
+        let hasPriorInput = ds.modelDescription.inputDescriptionsByName["attn_prior_bias"] != nil
+            && ds.modelDescription.outputDescriptionsByName["alignment_scores"] != nil
+        let singlePos = ds.modelDescription.inputDescriptionsByName["position"] != nil
+        let hiddenKey = ds.modelDescription.outputDescriptionsByName["decoder_hidden"] != nil ? "decoder_hidden" : "input"
+        let logitsKey: String? =
+            ds.modelDescription.outputDescriptionsByName["logits"] != nil ? "logits" :
+            (ds.modelDescription.outputDescriptionsByName["var_2129"] != nil ? "var_2129" : nil)
 
         // Load tokenizer + local transformer + speaker/audio embeddings
-        let tok = try MagpieSpanishTokenizer(modelDir: modelDir)
-        let lt = try MagpieLocalTransformerWeights.load(from: modelDir)
+        let tok = try MagpieSpanishTokenizer(modelDir: modelDir, spanishOffset: spOffset, eosTokenId: eosId)
+        let lt = try MagpieLocalTransformerWeights.load(
+            from: modelDir,
+            nLayers: ltLayers,
+            nHeads: ltHeads,
+            hiddenDim: ltHidden,
+            stackedCodebooks: stacked,
+            hasInProj: ltHasInProj
+        )
 
         var spks: [[Float]] = []
         spks.reserveCapacity(5)
         for s in 0..<5 {
-            spks.append(try NpyLoader.loadFloat32(from: modelDir.appendingPathComponent("constants/speaker_\(s).npy")).data)
+            let loaded = try NpyLoader.loadFloat32(from: modelDir.appendingPathComponent("constants/speaker_\(s).npy"))
+            spks.append(loaded.data)
+            if loaded.shape.count == 2 { tCtx = loaded.shape[0] }
         }
         var aEmbs: [[Float]] = []
-        aEmbs.reserveCapacity(8)
-        for cb in 0..<8 {
+        aEmbs.reserveCapacity(stacked)
+        for cb in 0..<stacked {
             aEmbs.append(try NpyLoader.loadFloat32(from: modelDir.appendingPathComponent("constants/audio_embedding_\(cb).npy")).data)
         }
 
-        let nc = try await loadedCodec
+        self.checkpointVersion = versionTag
+        self.frameStackingFactor = fsf
+        self.stackedCodebooks = stacked
+        self.contextLength = tCtx
+        self.useV2607SpeakerOrder = v2607Speakers
+        self.supportsAttentionPrior = hasPriorInput
+        self.usesCleanV2607PrefillOutputs = cleanPrefill
+        self.usesSinglePositionInput = singlePos
+        self.stepHiddenOutputKey = hiddenKey
+        self.stepLogitsOutputKey = logitsKey
+        self.priorEpsilon = pEps
+        self.priorLookahead = pLook
+        self.priorAdvanceThreshold = pAdv
+        self.priorDecayThreshold = pDec
+
         self.textEncoder = te
         self.decoderPrefill = pf
         self.decoderStep = ds
@@ -616,7 +976,6 @@ public actor MagpieV2607Engine {
         self.speakerEmbeddings = spks
         self.audioEmbeddings = aEmbs
 
-        // Precompute unconditional CFG prefill KV state once!
         try await precomputeUnconditionalPrefill()
         self.isLoaded = true
     }
@@ -644,8 +1003,16 @@ public actor MagpieV2607Engine {
         return arr
     }
 
+    private func makeUncondPriorBiasArray(length: Int) throws -> MLMultiArray {
+        let arr = try MLMultiArray(shape: [1, NSNumber(value: length)], dataType: .float32)
+        let ptr = arr.dataPointer.bindMemory(to: Float.self, capacity: length)
+        ptr[0] = 0.0
+        for i in 1..<length { ptr[i] = -30_000.0 }
+        return arr
+    }
+
     /// Stride-aware 3D tensor conversion (e.g. `[1, 256, 768]` Float32 -> Float16).
-    /// Handles ANE IOSurface-padded `MLMultiArray` outputs cleanly without row skew!
+    /// Handles ANE IOSurface-padded `MLMultiArray` outputs cleanly without row skew.
     private func convertEncoderOutput3D(_ src: MLMultiArray, to targetType: MLMultiArrayDataType) throws -> MLMultiArray {
         let d0 = src.shape[0].intValue
         let d1 = src.shape[1].intValue
@@ -669,9 +1036,7 @@ public actor MagpieV2607Engine {
                 for j in 0..<d1 {
                     let sBase = i * s0 + j * s1
                     let dBase = i * ds0 + j * ds1
-                    for k in 0..<d2 {
-                        dp[dBase + k * ds2] = Float16(sp[sBase + k * s2])
-                    }
+                    for k in 0..<d2 { dp[dBase + k * ds2] = Float16(sp[sBase + k * s2]) }
                 }
             }
         case (.float16, .float32):
@@ -681,9 +1046,7 @@ public actor MagpieV2607Engine {
                 for j in 0..<d1 {
                     let sBase = i * s0 + j * s1
                     let dBase = i * ds0 + j * ds1
-                    for k in 0..<d2 {
-                        dp[dBase + k * ds2] = Float(sp[sBase + k * s2])
-                    }
+                    for k in 0..<d2 { dp[dBase + k * ds2] = Float(sp[sBase + k * s2]) }
                 }
             }
         case (.float16, .float16):
@@ -725,7 +1088,7 @@ public actor MagpieV2607Engine {
         let encType = inputDataType(for: prefill, featureName: "encoder_output", defaultType: .float16)
         let maskType = inputDataType(for: prefill, featureName: "encoder_mask", defaultType: .float32)
 
-        let zeroCtx = try MLMultiArray(shape: [1, 110, 768], dataType: embedType)
+        let zeroCtx = try MLMultiArray(shape: [1, NSNumber(value: contextLength), 768], dataType: embedType)
         let zeroEnc = try MLMultiArray(shape: [1, 256, 768], dataType: encType)
         memset(zeroCtx.dataPointer, 0, zeroCtx.count * (embedType == .float16 ? 2 : 4))
         memset(zeroEnc.dataPointer, 0, zeroEnc.count * (encType == .float16 ? 2 : 4))
@@ -737,13 +1100,12 @@ public actor MagpieV2607Engine {
             "encoder_mask": MLFeatureValue(multiArray: uncondMask),
         ])
         let out = try await prefill.prediction(from: provider)
-        let (ks, vs) = try splitPrefillKV(out)
+        let (ks, vs) = try extractPrefillKV(out)
         self.cachedUncondK = ks
         self.cachedUncondV = vs
     }
 
     /// Synthesizes a full Spanish passage using sentence-level pipelining + zero-copy disk caching.
-    /// First sentence audio is cached and ready quickly; subsequent replays take 0ms!
     public func synthesizePassage(
         sentences: [String],
         voice: MagpieVoice,
@@ -765,7 +1127,6 @@ public actor MagpieV2607Engine {
                 timeOffset: timeCursor
             )
             allSamples.append(contentsOf: clip.samples)
-            // Natural 140ms inter-sentence pause
             let pauseCount = Int(Self.sampleRate * 0.14)
             allSamples.append(contentsOf: [Float](repeating: 0, count: pauseCount))
 
@@ -789,7 +1150,7 @@ public actor MagpieV2607Engine {
         )
     }
 
-    /// Synthesizes a single Spanish sentence (or short word/phrase) using Magpie Core ML + disk cache.
+    /// Synthesizes a single Spanish sentence (or isolated word/phrase) using Magpie Core ML + disk cache.
     public func synthesizeSentence(
         text: String,
         voice: MagpieVoice,
@@ -832,12 +1193,10 @@ public actor MagpieV2607Engine {
         let tokenIds = tok.tokenize(text: trimmed, accent: accent)
         let tLen = min(tokenIds.count, Self.maxTextLen)
 
-        // 1. Run text_encoder on ANE (text_mask is Float32 per Core ML modelDescription!)
+        // 1. Run text_encoder on ANE
         let tokensArr = try MLMultiArray(shape: [1, NSNumber(value: Self.maxTextLen)], dataType: .int32)
         let tPtr = tokensArr.dataPointer.bindMemory(to: Int32.self, capacity: Self.maxTextLen)
-        for i in 0..<Self.maxTextLen {
-            tPtr[i] = i < tLen ? tokenIds[i] : 0
-        }
+        for i in 0..<Self.maxTextLen { tPtr[i] = i < tLen ? tokenIds[i] : 0 }
         let textMaskType = inputDataType(for: textEnc, featureName: "text_mask", defaultType: .float32)
         let textMaskArr = try makeMaskArray(length: Self.maxTextLen, validCount: tLen, dataType: textMaskType)
 
@@ -849,7 +1208,6 @@ public actor MagpieV2607Engine {
             throw NSError(domain: "MagpieV2607Engine", code: 500, userInfo: [NSLocalizedDescriptionKey: "Missing encoder_output"])
         }
 
-        // Convert encoder_output (Float32 -> Float16) & match exact mask dtype expected by decoder_prefill / decoder_step
         let prefillEmbedKey = prefillEmbedInputName(for: prefill)
         let prefillEmbedType = inputDataType(for: prefill, featureName: prefillEmbedKey, defaultType: .float16)
         let prefillEncType = inputDataType(for: prefill, featureName: "encoder_output", defaultType: .float16)
@@ -860,16 +1218,18 @@ public actor MagpieV2607Engine {
             ? textMaskArr
             : try makeMaskArray(length: Self.maxTextLen, validCount: tLen, dataType: prefillMaskType)
 
-        // 2. Run conditional decoder_prefill (1 batched ANE call vs 110 sequential calls -> 3.8× speedup!)
-        let spkIdx = min(voice.speakerIndex, speakerEmbeddings.count - 1)
-        let spkArr = try MLMultiArray(shape: [1, 110, 768], dataType: prefillEmbedType)
+        // 2. Run conditional decoder_prefill (217 frames in v2607; 110 frames in v2512)
+        let rawIdx = useV2607SpeakerOrder ? voice.v2607SpeakerIndex : voice.speakerIndex
+        let spkIdx = min(rawIdx, speakerEmbeddings.count - 1)
+        let spkArr = try MLMultiArray(shape: [1, NSNumber(value: contextLength), 768], dataType: prefillEmbedType)
         let spkSrc = speakerEmbeddings[spkIdx]
+        let elemCount = min(spkSrc.count, contextLength * 768)
         if prefillEmbedType == .float16 {
-            let spkDst = spkArr.dataPointer.bindMemory(to: Float16.self, capacity: 110 * 768)
-            for i in 0..<min(spkSrc.count, 110 * 768) { spkDst[i] = Float16(spkSrc[i]) }
+            let spkDst = spkArr.dataPointer.bindMemory(to: Float16.self, capacity: contextLength * 768)
+            for i in 0..<elemCount { spkDst[i] = Float16(spkSrc[i]) }
         } else {
-            let spkDst = spkArr.dataPointer.bindMemory(to: Float.self, capacity: 110 * 768)
-            for i in 0..<min(spkSrc.count, 110 * 768) { spkDst[i] = spkSrc[i] }
+            let spkDst = spkArr.dataPointer.bindMemory(to: Float.self, capacity: contextLength * 768)
+            for i in 0..<elemCount { spkDst[i] = spkSrc[i] }
         }
 
         let prefillOut = try await prefill.prediction(from: MLDictionaryFeatureProvider(dictionary: [
@@ -877,11 +1237,11 @@ public actor MagpieV2607Engine {
             "encoder_output": MLFeatureValue(multiArray: encoderOutputPrefill),
             "encoder_mask": MLFeatureValue(multiArray: prefillMaskArr),
         ]))
-        var (condK, condV) = try splitPrefillKV(prefillOut)
+        var (condK, condV) = try extractPrefillKV(prefillOut)
         var uncondK = try cloneKVList4D(cachedUncondK ?? condK)
         var uncondV = try cloneKVList4D(cachedUncondV ?? condV)
 
-        // Prepare decoder_step encoder tensors matching decoder_step's exact modelDescription dtypes
+        // Prepare decoder_step tensors
         let stepEncType = inputDataType(for: decStep, featureName: "encoder_output", defaultType: .float16)
         let stepMaskType = inputDataType(for: decStep, featureName: "encoder_mask", defaultType: .float32)
         let encoderOutputStep = (stepEncType == prefillEncType)
@@ -895,65 +1255,135 @@ public actor MagpieV2607Engine {
         memset(zeroEnc.dataPointer, 0, zeroEnc.count * (stepEncType == .float16 ? 2 : 4))
         let uncondMask = try makeMaskArray(length: Self.maxTextLen, validCount: 1, dataType: stepMaskType)
 
-        // 3. Autoregressive frame generation loop (matching generate_coreml.py exact per-layer position propagation)
-        let maxSteps = min(400, max(36, tLen * 6))
+        // Attention prior buffers (v2607)
+        var priorState = MagpieAttentionPriorState(
+            textLen: tLen,
+            epsilon: priorEpsilon,
+            lookaheadWindow: priorLookahead,
+            advanceThreshold: priorAdvanceThreshold,
+            decayThreshold: priorDecayThreshold
+        )
+        let condPriorBiasArr = try MLMultiArray(shape: [1, NSNumber(value: Self.maxTextLen)], dataType: .float32)
+        priorState.fillLogPriorBias(into: condPriorBiasArr.dataPointer.assumingMemoryBound(to: Float.self), maxTextLen: Self.maxTextLen)
+        let uncondPriorBiasArr = try makeUncondPriorBiasArray(length: Self.maxTextLen)
+
+        // 3. Autoregressive frame-stacked generation loop with NeMo attention prior + argmax_or_multinomial_any EOS
+        let maxAvailablePositions = max(16, Self.maxSeqLen - contextLength - 1)
+        let maxDecoderSteps = min(maxAvailablePositions, max(24, (tLen * 6 + frameStackingFactor - 1) / frameStackingFactor))
         let minFrames = 4
-        var currentCodes = [Int32](repeating: 2016, count: 8) // audio_bos_id = 2016
+        let cfgScale: Float = 2.5
+        let temperature: Float = 0.6
+        let topK: Int = supportsAttentionPrior ? 80 : 48 // Tighter top-k suppresses fp16 tail drift on legacy v2512
+
+        var currentCodes = [Int32](repeating: 2016, count: stackedCodebooks) // audio_bos_id = 2016
         var generatedFrames: [[Int32]] = []
-        generatedFrames.reserveCapacity(maxSteps)
+        generatedFrames.reserveCapacity(maxDecoderSteps * frameStackingFactor)
 
         let initPos = try MLMultiArray(shape: [1], dataType: .float16)
-        initPos.dataPointer.assumingMemoryBound(to: Float16.self)[0] = Float16(110.0)
+        initPos.dataPointer.assumingMemoryBound(to: Float16.self)[0] = Float16(Float(contextLength))
         var condPos = [MLMultiArray](repeating: initPos, count: Self.nLayers)
         var uncondPos = [MLMultiArray](repeating: initPos, count: Self.nLayers)
 
-        for step in 0..<maxSteps {
+        for step in 0..<maxDecoderSteps {
             let audioEmbArr = try embedAudioCodesFP16(codes: currentCodes)
 
-            let (condHidden, nextCK, nextCV, nextCPos) = try runDecoderStep(
+            let condStepPos: [MLMultiArray]
+            let uncondStepPos: [MLMultiArray]
+            if usesSinglePositionInput {
+                let pArr = try MLMultiArray(shape: [1], dataType: .float16)
+                pArr.dataPointer.assumingMemoryBound(to: Float16.self)[0] = Float16(Float(contextLength + step))
+                condStepPos = [pArr]
+                uncondStepPos = [pArr]
+            } else {
+                condStepPos = condPos
+                uncondStepPos = uncondPos
+            }
+
+            let condRes = try runDecoderStep(
                 model: decStep,
                 audioEmbed: audioEmbArr,
                 encoderOutput: encoderOutputStep,
                 encoderMask: stepMaskArr,
+                attnPriorBias: supportsAttentionPrior ? condPriorBiasArr : nil,
                 cacheK: condK,
                 cacheV: condV,
-                positions: condPos
+                positions: condStepPos
             )
-            condK = nextCK
-            condV = nextCV
-            condPos = nextCPos
+            condK = condRes.newK
+            condV = condRes.newV
+            if !usesSinglePositionInput { condPos = condRes.newPos }
 
-            let (uncondHidden, nextUK, nextUV, nextUPos) = try runDecoderStep(
+            let uncondRes = try runDecoderStep(
                 model: decStep,
                 audioEmbed: audioEmbArr,
                 encoderOutput: zeroEnc,
                 encoderMask: uncondMask,
+                attnPriorBias: supportsAttentionPrior ? uncondPriorBiasArr : nil,
                 cacheK: uncondK,
                 cacheV: uncondV,
-                positions: uncondPos
+                positions: uncondStepPos
             )
-            uncondK = nextUK
-            uncondV = nextUV
-            uncondPos = nextUPos
+            uncondK = uncondRes.newK
+            uncondV = uncondRes.newV
+            if !usesSinglePositionInput { uncondPos = uncondRes.newPos }
 
-            let nextCodes = lt.sampleCodebooks(
-                condHidden: condHidden,
-                uncondHidden: uncondHidden,
+            // Update monotonic cross-attention prior for next AR step (v2607)
+            if supportsAttentionPrior, let align = condRes.alignmentScores {
+                priorState.update(alignmentScores: align)
+                priorState.fillLogPriorBias(
+                    into: condPriorBiasArr.dataPointer.assumingMemoryBound(to: Float.self),
+                    maxTextLen: Self.maxTextLen
+                )
+            }
+
+            let framesSoFar = generatedFrames.count
+            let forbidEOS = framesSoFar < minFrames
+
+            // Compute exact NeMo CFG-blended decoder head greedy argmax (`logits` / `var_2129`)
+            let greedyMain = computeMainHeadGreedyArgmax(
+                condLogits: condRes.logits,
+                uncondLogits: uncondRes.logits,
+                cfgScale: cfgScale,
+                forbidEOS: forbidEOS
+            )
+
+            // Sample all stacked codebooks (16 in v2607 = 2 frames; 8 in v2512 = 1 frame) via KV-cached AMX LT
+            let (sampledCodes, greedyLT) = lt.sampleCodebooks(
+                condHidden: condRes.hidden,
+                uncondHidden: uncondRes.hidden,
                 audioEmbeddings: audioEmbeddings,
-                temperature: 0.6,
-                topK: 80,
-                cfgScale: 2.5,
-                forbidEOS: step < minFrames
+                temperature: temperature,
+                topK: topK,
+                cfgScale: cfgScale,
+                forbidEOS: forbidEOS
             )
 
-            if step >= minFrames && nextCodes.contains(2017) { // audio_eos_id = 2017
+            // Exact NeMo `eos_detection_method = "argmax_or_multinomial_any"` across all stacked frame lanes!
+            if let eosLane = MagpieEOSDetector.firstEOSLane(
+                sampled: sampledCodes,
+                greedyLT: greedyLT,
+                greedyMain: greedyMain,
+                frameStackingFactor: frameStackingFactor,
+                codebooksPerFrame: 8,
+                audioEOSId: 2017,
+                framesEmittedSoFar: framesSoFar,
+                minFrames: minFrames
+            ) {
+                for lane in 0..<eosLane {
+                    let base = lane * 8
+                    generatedFrames.append(Array(sampledCodes[base..<(base + 8)]))
+                }
                 break
             }
-            generatedFrames.append(nextCodes)
-            currentCodes = nextCodes
+
+            for lane in 0..<frameStackingFactor {
+                let base = lane * 8
+                generatedFrames.append(Array(sampledCodes[base..<(base + 8)]))
+            }
+            currentCodes = sampledCodes
         }
 
-        // 4. Decode 8-codebook tokens -> 22.05kHz PCM via Chunked NanoCodec v3 (T_in=24, stride=8, overlap=16)
+        // 4. Decode 8-codebook frames -> 22.05kHz PCM via Full-FP32 CPU Chunked NanoCodec v3
         let samples = try decodeNanoCodec(model: codec, frames: generatedFrames)
 
         // Peak-normalize to -1dBFS for rich, crystal-clear tutoring audio
@@ -965,7 +1395,6 @@ public actor MagpieV2607Engine {
             vDSP_vsmul(normalized, 1, &gain, &normalized, 1, vDSP_Length(normalized.count))
         }
 
-        // Cache to disk asynchronously (0ms on every future replay!)
         try? saveWAV(samples: normalized, sampleRate: Self.sampleRate, to: cacheFile)
 
         let elapsedMs = Date().timeIntervalSince(t0) * 1000.0
@@ -984,6 +1413,63 @@ public actor MagpieV2607Engine {
         )
     }
 
+    private func computeMainHeadGreedyArgmax(
+        condLogits: MLMultiArray?,
+        uncondLogits: MLMultiArray?,
+        cfgScale: Float,
+        forbidEOS: Bool
+    ) -> [Int32]? {
+        guard let cArr = condLogits, let uArr = uncondLogits else { return nil }
+        let vocab = 2024
+        let totalExpected = stackedCodebooks * vocab
+        guard cArr.count >= totalExpected, uArr.count >= totalExpected else { return nil }
+
+        let oneMinus = 1.0 - cfgScale
+        let cStride = cArr.strides.last?.intValue ?? 1
+        let uStride = uArr.strides.last?.intValue ?? 1
+        let forbiddenSet: Set<Int> = forbidEOS
+            ? [2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023]
+            : [2016, 2018, 2019, 2020, 2021, 2022, 2023]
+
+        var result = [Int32](repeating: 0, count: stackedCodebooks)
+        if cArr.dataType == .float16 && uArr.dataType == .float16 {
+            let cp = cArr.dataPointer.assumingMemoryBound(to: Float16.self)
+            let up = uArr.dataPointer.assumingMemoryBound(to: Float16.self)
+            for cb in 0..<stackedCodebooks {
+                let base = cb * vocab
+                var bestIdx = 0
+                var bestVal = -Float.greatestFiniteMagnitude
+                for tok in 0..<vocab where !forbiddenSet.contains(tok) {
+                    let idx = base + tok
+                    let v = cfgScale * Float(cp[idx * cStride]) + oneMinus * Float(up[idx * uStride])
+                    if v > bestVal {
+                        bestVal = v
+                        bestIdx = tok
+                    }
+                }
+                result[cb] = Int32(bestIdx)
+            }
+        } else {
+            let cp = cArr.dataPointer.assumingMemoryBound(to: Float.self)
+            let up = uArr.dataPointer.assumingMemoryBound(to: Float.self)
+            for cb in 0..<stackedCodebooks {
+                let base = cb * vocab
+                var bestIdx = 0
+                var bestVal = -Float.greatestFiniteMagnitude
+                for tok in 0..<vocab where !forbiddenSet.contains(tok) {
+                    let idx = base + tok
+                    let v = cfgScale * cp[idx * cStride] + oneMinus * up[idx * uStride]
+                    if v > bestVal {
+                        bestVal = v
+                        bestIdx = tok
+                    }
+                }
+                result[cb] = Int32(bestIdx)
+            }
+        }
+        return result
+    }
+
     // MARK: - Real-Time Pitch-Preserving Playback (Direct 1.0× PCM or AVAudioUnitTimePitch when rate-scaled)
 
     public func play(clip: SynthesizedAudioClip, targetWPM: Int, baselineNativeWPM: Double = 120.0) async throws {
@@ -995,7 +1481,6 @@ public actor MagpieV2607Engine {
         }
 
         #if os(iOS)
-        // Use .playback + .spokenAudio so iPhone plays full-fidelity speaker audio (NOT .playAndRecord VoIP DSP!)
         let session = AVAudioSession.sharedInstance()
         try session.setCategory(.playback, mode: .spokenAudio, options: [])
         try session.setActive(true)
@@ -1016,8 +1501,6 @@ public actor MagpieV2607Engine {
             }
         }
 
-        // Clamp rate to [0.78, 1.25]. Near 1.0×, connect player DIRECTLY to mainMixerNode without
-        // attaching AVAudioUnitTimePitch (avoids iOS Core Audio silent-bypass bug on 22.05kHz mono!).
         let rate = Float(max(0.78, min(1.25, Double(targetWPM) / baselineNativeWPM)))
         let needsTimePitch = abs(rate - 1.0) >= 0.04
         var attachedTimePitch: AVAudioUnitTimePitch?
@@ -1034,7 +1517,6 @@ public actor MagpieV2607Engine {
             engine.connect(player, to: engine.mainMixerNode, format: format)
         }
 
-        // Tap main mixer at 60Hz for live Metal Resonance Orb audio reactivity!
         let levelCallback = self.onAudioLevelUpdate
         engine.mainMixerNode.installTap(onBus: 0, bufferSize: 1024, format: nil) { pcm, _ in
             guard let data = pcm.floatChannelData?[0], pcm.frameLength > 0 else { return }
@@ -1094,18 +1576,32 @@ public actor MagpieV2607Engine {
         onAudioLevelUpdate?(0.0)
     }
 
-    // MARK: - Stride-Safe Core ML Tensor Helpers (Immune to ANE IOSurface Row Padding!)
+    // MARK: - Stride-Safe Core ML Tensor Helpers
 
-    /// Splits each `[2, 1, 512, 12, 64]` prefill output into contiguous `[1, 512, 12, 64]` K and V caches
-    /// respecting exact Core ML / ANE IOSurface strides (never corrupting KV rows with padding!).
-    private func splitPrefillKV(_ out: MLFeatureProvider) throws -> ([MLMultiArray], [MLMultiArray]) {
+    /// Extracts 12 K and 12 V caches from `decoder_prefill` (supports zero-copy v2607 rank-4 `k0..k11`/`v0..v11`
+    /// as well as legacy v2512 rank-5 `[2, 1, 512, 12, 64]` outputs).
+    private func extractPrefillKV(_ out: MLFeatureProvider) throws -> ([MLMultiArray], [MLMultiArray]) {
         var ks: [MLMultiArray] = []
         var vs: [MLMultiArray] = []
         ks.reserveCapacity(Self.nLayers)
         vs.reserveCapacity(Self.nLayers)
 
+        if usesCleanV2607PrefillOutputs {
+            for i in 0..<Self.nLayers {
+                guard let kArr = out.featureValue(for: "k\(i)")?.multiArrayValue,
+                      let vArr = out.featureValue(for: "v\(i)")?.multiArrayValue
+                else {
+                    throw NSError(domain: "MagpieV2607Engine", code: 501, userInfo: [NSLocalizedDescriptionKey: "Missing v2607 prefill KV layer \(i)"])
+                }
+                ks.append(kArr)
+                vs.append(vArr)
+            }
+            return (ks, vs)
+        }
+
+        // Legacy v2512 5D split
         for i in 0..<Self.nLayers {
-            guard let combined = out.featureValue(for: Self.prefillKVKeys[i])?.multiArrayValue else {
+            guard let combined = out.featureValue(for: Self.legacyPrefillKVKeys[i])?.multiArrayValue else {
                 throw NSError(domain: "MagpieV2607Engine", code: 501, userInfo: [NSLocalizedDescriptionKey: "Missing prefill KV layer \(i)"])
             }
             let kArr = try MLMultiArray(shape: [1, 512, 12, 64], dataType: .float16)
@@ -1117,11 +1613,9 @@ public actor MagpieV2607Engine {
             let s2 = combined.strides[2].intValue
             let s3 = combined.strides[3].intValue
             let s4 = combined.strides[4].intValue
-
             let kd1 = kArr.strides[1].intValue
             let kd2 = kArr.strides[2].intValue
             let kd3 = kArr.strides[3].intValue
-
             let vd1 = vArr.strides[1].intValue
             let vd2 = vArr.strides[2].intValue
             let vd3 = vArr.strides[3].intValue
@@ -1129,11 +1623,9 @@ public actor MagpieV2607Engine {
             let src = combined.dataPointer.assumingMemoryBound(to: Float16.self)
             let kDst = kArr.dataPointer.assumingMemoryBound(to: Float16.self)
             let vDst = vArr.dataPointer.assumingMemoryBound(to: Float16.self)
-
             let fastHeadCopy = (s4 == 1 && kd3 == 1 && vd3 == 1)
             let headBytes = 64 * MemoryLayout<Float16>.stride
 
-            // Copy all 512 time slots stride-safely (guaranteed identical for both contiguous & ANE-padded IOSurface!)
             for t in 0..<512 {
                 let sT = t * s2
                 let kT = t * kd1
@@ -1196,15 +1688,16 @@ public actor MagpieV2607Engine {
     }
 
     private func embedAudioCodesFP16(codes: [Int32]) throws -> MLMultiArray {
+        let n = min(codes.count, audioEmbeddings.count)
         var acc = [Float](repeating: 0, count: 768)
-        for cb in 0..<8 {
+        for cb in 0..<n {
             let idx = max(0, min(2023, Int(codes[cb])))
             let off = idx * 768
             audioEmbeddings[cb].withUnsafeBufferPointer { ptr in
                 vDSP_vadd(acc, 1, ptr.baseAddress!.advanced(by: off), 1, &acc, 1, 768)
             }
         }
-        var scale: Float = 1.0 / 8.0
+        var scale: Float = 1.0 / Float(max(1, n))
         vDSP_vsmul(acc, 1, &scale, &acc, 1, 768)
 
         let arr = try MLMultiArray(shape: [1, 1, 768], dataType: .float16)
@@ -1214,31 +1707,52 @@ public actor MagpieV2607Engine {
         return arr
     }
 
+    private struct DecoderStepResult {
+        let hidden: [Float]
+        let logits: MLMultiArray?
+        let alignmentScores: [Float]?
+        let newK: [MLMultiArray]
+        let newV: [MLMultiArray]
+        let newPos: [MLMultiArray]
+    }
+
     private func runDecoderStep(
         model: MLModel,
         audioEmbed: MLMultiArray,
         encoderOutput: MLMultiArray,
         encoderMask: MLMultiArray,
+        attnPriorBias: MLMultiArray?,
         cacheK: [MLMultiArray],
         cacheV: [MLMultiArray],
         positions: [MLMultiArray]
-    ) throws -> (hidden: [Float], newK: [MLMultiArray], newV: [MLMultiArray], newPos: [MLMultiArray]) {
+    ) throws -> DecoderStepResult {
         var dict: [String: MLFeatureValue] = [
             "audio_embed": MLFeatureValue(multiArray: audioEmbed),
             "encoder_output": MLFeatureValue(multiArray: encoderOutput),
             "encoder_mask": MLFeatureValue(multiArray: encoderMask),
         ]
-
-        for i in 0..<Self.nLayers {
-            dict["cache_k\(i)"] = MLFeatureValue(multiArray: cacheK[i])
-            dict["cache_v\(i)"] = MLFeatureValue(multiArray: cacheV[i])
-            dict["position\(i)"] = MLFeatureValue(multiArray: positions[i])
+        if let bias = attnPriorBias {
+            dict["attn_prior_bias"] = MLFeatureValue(multiArray: bias)
+        }
+        if usesSinglePositionInput {
+            dict["position"] = MLFeatureValue(multiArray: positions[0])
+            for i in 0..<Self.nLayers {
+                dict["cache_k\(i)"] = MLFeatureValue(multiArray: cacheK[i])
+                dict["cache_v\(i)"] = MLFeatureValue(multiArray: cacheV[i])
+            }
+        } else {
+            for i in 0..<Self.nLayers {
+                dict["cache_k\(i)"] = MLFeatureValue(multiArray: cacheK[i])
+                dict["cache_v\(i)"] = MLFeatureValue(multiArray: cacheV[i])
+                dict["position\(i)"] = MLFeatureValue(multiArray: positions[i])
+            }
         }
 
         let out = try model.prediction(from: MLDictionaryFeatureProvider(dictionary: dict))
-        guard let hidArr = out.featureValue(for: "input")?.multiArrayValue else {
+        guard let hidArr = out.featureValue(for: stepHiddenOutputKey)?.multiArrayValue else {
             throw NSError(domain: "MagpieV2607Engine", code: 502, userInfo: [NSLocalizedDescriptionKey: "Missing decoder hidden state"])
         }
+
         var hidden = [Float](repeating: 0, count: 768)
         let hStride = hidArr.strides.last?.intValue ?? 1
         if hidArr.dataType == .float16 {
@@ -1249,23 +1763,54 @@ public actor MagpieV2607Engine {
             for i in 0..<768 { hidden[i] = src[i * hStride] }
         }
 
+        let logitsArr = stepLogitsOutputKey.flatMap { out.featureValue(for: $0)?.multiArrayValue }
+
+        var alignVec: [Float]? = nil
+        if let alignArr = out.featureValue(for: "alignment_scores")?.multiArrayValue {
+            var vec = [Float](repeating: 0, count: Self.maxTextLen)
+            let aStride = alignArr.strides.last?.intValue ?? 1
+            if alignArr.dataType == .float16 {
+                let src = alignArr.dataPointer.assumingMemoryBound(to: Float16.self)
+                for i in 0..<Self.maxTextLen { vec[i] = Float(src[i * aStride]) }
+            } else {
+                let src = alignArr.dataPointer.assumingMemoryBound(to: Float.self)
+                for i in 0..<Self.maxTextLen { vec[i] = src[i * aStride] }
+            }
+            alignVec = vec
+        }
+
         var nextK: [MLMultiArray] = []
         var nextV: [MLMultiArray] = []
         var nextPos: [MLMultiArray] = []
         nextK.reserveCapacity(Self.nLayers)
         nextV.reserveCapacity(Self.nLayers)
-        nextPos.reserveCapacity(Self.nLayers)
-        for i in 0..<Self.nLayers {
-            nextK.append(out.featureValue(for: Self.kOutKeys[i])!.multiArrayValue!)
-            nextV.append(out.featureValue(for: Self.vOutKeys[i])!.multiArrayValue!)
-            nextPos.append(out.featureValue(for: Self.posOutKeys[i])!.multiArrayValue!)
+        if usesSinglePositionInput {
+            for i in 0..<Self.nLayers {
+                nextK.append(out.featureValue(for: "new_k\(i)")!.multiArrayValue!)
+                nextV.append(out.featureValue(for: "new_v\(i)")!.multiArrayValue!)
+            }
+        } else {
+            nextPos.reserveCapacity(Self.nLayers)
+            for i in 0..<Self.nLayers {
+                nextK.append(out.featureValue(for: Self.legacyKOutKeys[i])!.multiArrayValue!)
+                nextV.append(out.featureValue(for: Self.legacyVOutKeys[i])!.multiArrayValue!)
+                nextPos.append(out.featureValue(for: Self.legacyPosOutKeys[i])!.multiArrayValue!)
+            }
         }
-        return (hidden, nextK, nextV, nextPos)
+        return DecoderStepResult(
+            hidden: hidden,
+            logits: logitsArr,
+            alignmentScores: alignVec,
+            newK: nextK,
+            newV: nextV,
+            newPos: nextPos
+        )
     }
 
-    /// Auto-dispatches between monolithic (T_in=256) and chunked sliding-window NanoCodec v3 (T_in=24, stride=8, overlap=16).
-    /// Uses **edge-replication padding** (clamping out-of-range indices to `[0, T-1]`) instead of zero-padding,
-    /// eliminating the 700× start/end transient click caused by codebook entry 0 (FluidInference Phase C v2 step 7).
+    /// Chunked sliding-window NanoCodec v3 (T_in=24, stride=8, overlap=16, full FP32 CPU).
+    /// Left context replicates `frames[0]` (eliminates left-edge start transient), while right tail
+    /// zero-pads (matching FluidInference `generate_coreml.py` / `chunked_parity.py` so the final
+    /// voiced phoneme is NEVER smeared or duplicated across lookahead frames!).
     private func decodeNanoCodec(model: MLModel, frames: [[Int32]]) throws -> [Float] {
         let totalFrames = frames.count
         guard totalFrames > 0 else { return [] }
@@ -1277,8 +1822,11 @@ public actor MagpieV2607Engine {
             let cbStride = tokArr.strides[1].intValue
             let tStride = tokArr.strides[2].intValue
             for slot in 0..<tIn {
-                let frameIdx = min(totalFrames - 1, slot)
-                for cb in 0..<8 { ptr[cb * cbStride + slot * tStride] = frames[frameIdx][cb] }
+                if slot < totalFrames {
+                    for cb in 0..<8 { ptr[cb * cbStride + slot * tStride] = frames[slot][cb] }
+                } else {
+                    for cb in 0..<8 { ptr[cb * cbStride + slot * tStride] = 0 }
+                }
             }
             let out = try model.prediction(from: MLDictionaryFeatureProvider(dictionary: ["tokens": MLFeatureValue(multiArray: tokArr)]))
             let audioArr = out.featureValue(for: "audio")!.multiArrayValue!
@@ -1286,7 +1834,6 @@ public actor MagpieV2607Engine {
             return extractAudioFloats(from: audioArr, start: 0, count: expected)
         }
 
-        // Chunked sliding-window NanoCodec v3: T_in=24, stride=8, overlap=16, edge-replicated padding!
         let strideLen = max(1, tIn / 3)
         let overlap = tIn - strideLen
         let keepStart = overlap * Self.samplesPerFrame
@@ -1303,10 +1850,15 @@ public actor MagpieV2607Engine {
         while start < totalFrames {
             let ctxStart = start - overlap
             for slot in 0..<tIn {
-                // Edge-replication padding: replicate frames[0] for left context & frames[T-1] for right tail!
-                let frameIdx = min(totalFrames - 1, max(0, ctxStart + slot))
-                for cb in 0..<8 {
-                    ptr[cb * cbStride + slot * tStride] = frames[frameIdx][cb]
+                let rawIdx = ctxStart + slot
+                if rawIdx < 0 {
+                    // Left edge: replicate frame 0 to avoid initial click transient
+                    for cb in 0..<8 { ptr[cb * cbStride + slot * tStride] = frames[0][cb] }
+                } else if rawIdx < totalFrames {
+                    for cb in 0..<8 { ptr[cb * cbStride + slot * tStride] = frames[rawIdx][cb] }
+                } else {
+                    // Right edge: zero-pad (matches chunked_parity.py, zero trailing phoneme smear!)
+                    for cb in 0..<8 { ptr[cb * cbStride + slot * tStride] = 0 }
                 }
             }
             let out = try model.prediction(from: MLDictionaryFeatureProvider(dictionary: ["tokens": MLFeatureValue(multiArray: tokArr)]))
@@ -1319,7 +1871,7 @@ public actor MagpieV2607Engine {
         }
         let expected = totalFrames * Self.samplesPerFrame
         var trimmed = Array(pcmOut.prefix(expected))
-        // Apply ultra-gentle 6ms cosine fade-in / fade-out at utterance boundaries for click-free silence transitions
+        // Gentle 6ms cosine fade-in / fade-out at utterance boundaries
         let fadeLen = min(132, trimmed.count / 4)
         for i in 0..<fadeLen {
             let g = 0.5 * (1.0 - cosf(.pi * Float(i) / Float(fadeLen)))
@@ -1358,7 +1910,6 @@ public actor MagpieV2607Engine {
     ) -> [WordTimingSpan] {
         let words = text.split(whereSeparator: { $0.isWhitespace }).map(String.init)
         guard !words.isEmpty, duration > 0 else { return [] }
-        // Phoneme-weighted duration distribution (gives smooth 120Hz Karaoke highlight sync)
         let weights = words.map { w -> Double in
             let core = w.filter(\.isLetter)
             let punctPause = (w.hasSuffix(",") || w.hasSuffix(";")) ? 2.5 : ((w.hasSuffix(".") || w.hasSuffix("!") || w.hasSuffix("?")) ? 4.0 : 0.0)
@@ -1376,9 +1927,9 @@ public actor MagpieV2607Engine {
     }
 
     private func cacheURL(for text: String, voice: MagpieVoice, accent: SpanishRegionalAccent) -> URL {
-        let key = "v2_clean_\(voice.rawValue)_\(accent.rawValue)_\(text)"
+        let key = "v3_\(checkpointVersion)_\(voice.rawValue)_\(accent.rawValue)_\(text)"
         let digest = SHA256.hash(data: Data(key.utf8)).prefix(16).map { String(format: "%02x", $0) }.joined()
-        return audioCacheDir.appendingPathComponent("v2_\(digest).wav")
+        return audioCacheDir.appendingPathComponent("v3_\(digest).wav")
     }
 
     private func saveWAV(samples: [Float], sampleRate: Double, to url: URL) throws {

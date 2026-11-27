@@ -309,4 +309,100 @@ final class CadenciaCoreTests: XCTestCase {
         let extracted = try String(contentsOf: outDir.appendingPathComponent("ZipaCRLarge300M_FP16.mlmodelc/test.txt"), encoding: .utf8)
         XCTAssertEqual(extracted, "cadencia_zipa_fp16_ok")
     }
+
+    // MARK: - 8. NVIDIA Magpie v2607 Spanish Tokenizer, Attention Prior & argmax_or_multinomial_any EOS
+
+    func testMagpieV2607TokenizerAttentionPriorAndEOSDetector() {
+        let token2Id: [String: Int32] = [
+            ".": 7, " ": 100, "<pad>": 101,
+            "D": 15, "Í": 69, "A": 12, "S": 30, "Y": 36,
+            "p": 53, "ˈ": 91, "o": 52, "ɾ": 85, "e": 43, "k": 48,
+            "ʝ": 90, "a": 40, "d": 42, "ð": 77, "θ": 97, "s": 55, "ʎ": 88, "ʃ": 86,
+        ]
+        let dict: [String: [String]] = [
+            "POR": ["p", "ˈ", "o", "ɾ"],
+            "PERO": ["p", "ˈ", "e", "ɾ", "o"],
+            "YA": ["ʝ", "ˈ", "a"],
+            "DADO": ["d", "ˈ", "a", "ð", "o"],
+            "QUE": ["k", "ˈ", "e"],
+            "CALLE": ["k", "ˈ", "a", "ʎ", "e"],
+        ]
+
+        // v2607 Spanish offset=480, eos=3358: bare word "por" must auto-append "." and terminate with 3358
+        let v2607Tok = MagpieSpanishTokenizer(token2Id: token2Id, phonemeDict: dict, spanishOffset: 480, eosTokenId: 3358)
+        let porIds = v2607Tok.tokenize(text: "por", accent: .castilian)
+        XCTAssertEqual(porIds.first, 480 + 100, "Leading space must use v2607 offset 480")
+        XCTAssertEqual(porIds.last, 3358, "Must terminate with v2607 EOS 3358")
+        XCTAssertTrue(porIds.contains(480 + 7), "Bare word must auto-append terminal period '.' to prevent trailing hallucination")
+        XCTAssertTrue(porIds.contains(480 + 85), "Must emit Spanish tap /ɾ/ from es_ES dictionary")
+
+        // OOV word "días" must use NeMo IpaG2p uppercase grapheme fallback (D, Í, A, S)
+        let diasIds = v2607Tok.tokenize(text: "días", accent: .castilian)
+        XCTAssertTrue(diasIds.contains(480 + 15) && diasIds.contains(480 + 69) && diasIds.contains(480 + 12) && diasIds.contains(480 + 30))
+
+        // Ultra-short OOV word "y" must be padded to >= 4 inner tokens before EOS
+        let yIds = v2607Tok.tokenize(text: "y", accent: .castilian)
+        XCTAssertGreaterThanOrEqual(yIds.count - 2, 4)
+
+        // Regional accent overrides: LatAm yeísmo (ʎ -> ʝ) and Rioplatense sheísmo (ʎ -> ʃ)
+        let calleLatam = v2607Tok.tokenize(text: "calle.", accent: .latinAmerican)
+        let calleRio = v2607Tok.tokenize(text: "calle.", accent: .rioplatense)
+        XCTAssertTrue(calleLatam.contains(480 + 90))
+        XCTAssertTrue(calleRio.contains(480 + 86))
+
+        // Legacy v2512 offset=96, eos=2361 compatibility
+        let v2512Tok = MagpieSpanishTokenizer(token2Id: token2Id, phonemeDict: dict, spanishOffset: 96, eosTokenId: 2361)
+        let queLegacy = v2512Tok.tokenize(text: "que", accent: .castilian)
+        XCTAssertEqual(queLegacy.first, 196)
+        XCTAssertEqual(queLegacy.last, 2361)
+
+        // Monotonic attention prior advances cleanly and suppresses past attention sinks
+        var prior = MagpieAttentionPriorState(textLen: 12, epsilon: 0.1, lookaheadWindow: 6, advanceThreshold: 8, decayThreshold: 10)
+        var scores = [Float](repeating: 0.01, count: 12)
+        scores[4] = 0.9
+        prior.update(alignmentScores: scores)
+        XCTAssertEqual(prior.lastAttended, 4)
+        XCTAssertEqual(prior.prior[3], 1.0, accuracy: 1e-5)
+        XCTAssertEqual(prior.prior[4], 1.0, accuracy: 1e-5)
+        XCTAssertEqual(prior.prior[10], 1.0, accuracy: 1e-5)
+        XCTAssertEqual(prior.prior[0], 0.1, accuracy: 1e-5)
+
+        var biasBuf = [Float](repeating: 0, count: 16)
+        biasBuf.withUnsafeMutableBufferPointer { ptr in
+            prior.fillLogPriorBias(into: ptr.baseAddress!, maxTextLen: 16)
+        }
+        XCTAssertEqual(biasBuf[4], 0.0, accuracy: 1e-5)
+        XCTAssertEqual(biasBuf[0], logf(0.1), accuracy: 1e-4)
+        XCTAssertEqual(biasBuf[12], -30_000.0, accuracy: 1e-3)
+
+        // Exact NeMo argmax_or_multinomial_any EOS detector on 2x stacked frames (16 slots)
+        let nonEOS = [Int32](repeating: 42, count: 16)
+        var mainEOSLane1 = nonEOS
+        mainEOSLane1[10] = 2017 // EOS in frame lane 1 predicted by main decoder head even when multinomial missed it!
+        XCTAssertEqual(
+            MagpieEOSDetector.firstEOSLane(
+                sampled: nonEOS,
+                greedyLT: nonEOS,
+                greedyMain: mainEOSLane1,
+                frameStackingFactor: 2,
+                framesEmittedSoFar: 6,
+                minFrames: 4
+            ),
+            1,
+            "Must stop at lane 1 (emitting lane 0) when main head argmax hits EOS!"
+        )
+        // Respects minFrames guard
+        var ltEOSLane0 = nonEOS
+        ltEOSLane0[0] = 2017
+        XCTAssertNil(
+            MagpieEOSDetector.firstEOSLane(
+                sampled: ltEOSLane0,
+                greedyLT: ltEOSLane0,
+                greedyMain: ltEOSLane0,
+                frameStackingFactor: 2,
+                framesEmittedSoFar: 0,
+                minFrames: 4
+            )
+        )
+    }
 }

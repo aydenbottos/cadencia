@@ -260,13 +260,29 @@ public struct HardwareSettingsView: View {
                 }
                 Spacer()
                 if prog?.isReady == true {
-                    let badge = (prog?.statusMessage.hasPrefix("Built-in") == true) ? "BUILT-IN · ANE" : "ANE READY"
-                    Label(badge, systemImage: "checkmark.circle.fill")
-                        .font(CadenciaFont.mono(10, weight: .bold))
-                        .foregroundStyle(CadenciaPalette.mediterraneanJade)
-                        .padding(.horizontal, 9)
-                        .padding(.vertical, 5)
-                        .background(CadenciaPalette.mediterraneanJade.opacity(0.16), in: Capsule())
+                    if kind == .magpieTTS && appState.installedMagpieCheckpointVersion != "v2607" {
+                        Button(action: onInstall) {
+                            Label("Upgrade to v2607", systemImage: "arrow.down.circle.fill")
+                                .font(CadenciaFont.mono(10, weight: .bold))
+                                .foregroundStyle(CadenciaPalette.obsidian)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                                .background(CadenciaPalette.saffronGold, in: Capsule())
+                        }
+                        .disabled(isDownloading)
+                    } else {
+                        let badge: String = {
+                            if prog?.statusMessage.hasPrefix("Built-in") == true { return "BUILT-IN · GPU" }
+                            if kind == .magpieTTS && appState.installedMagpieCheckpointVersion == "v2607" { return "v2607 READY" }
+                            return "ANE READY"
+                        }()
+                        Label(badge, systemImage: "checkmark.circle.fill")
+                            .font(CadenciaFont.mono(10, weight: .bold))
+                            .foregroundStyle(CadenciaPalette.mediterraneanJade)
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 5)
+                            .background(CadenciaPalette.mediterraneanJade.opacity(0.16), in: Capsule())
+                    }
                 } else {
                     Button(action: onInstall) {
                         Text(isDownloading ? "\(Int((prog?.fractionCompleted ?? 0) * 100))%" : "Install (~\(kind.estimatedSizeMB)MB)")
@@ -346,9 +362,11 @@ public struct HardwareSettingsView: View {
                                 lastBenchmarkClip = clip
                                 let ms = Date().timeIntervalSince(t0) * 1000.0
                                 let rtf = (ms / 1000.0) / max(0.01, clip.durationSeconds)
+                                let ver = await appState.magpieEngine.checkpointVersion
+                                let fsf = await appState.magpieEngine.frameStackingFactor
                                 ttsSummary = String(
-                                    format: "Magpie v2607 (FP16 AR + FP32 NanoCodec): %.0f ms for %.1fs audio (RTF %.2f×)",
-                                    ms, clip.durationSeconds, rtf
+                                    format: "Magpie %@ (%d× stack · FP16 AR + FP32 NanoCodec): %.0f ms for %.1fs audio (RTF %.2f×)",
+                                    ver, fsf, ms, clip.durationSeconds, rtf
                                 )
                             } catch {
                                 ttsSummary = "Magpie v2607 error: \(error.localizedDescription)"

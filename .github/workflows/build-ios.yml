@@ -110,9 +110,74 @@ jobs:
           retention-days: 3
           compression-level: 0
 
+  build-magpie-v2607-coreml:
+    name: Precompile Genuine NVIDIA Magpie v2607 (.mlmodelc) for iPhone
+    runs-on: macos-26
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Restore cached precompiled Magpie v2607 Core ML bundle
+        id: cache-magpie
+        uses: actions/cache@v4
+        with:
+          path: models/coreml/magpie_v2607
+          key: magpie-v2607-coreml-mlmodelc-${{ hashFiles('tools/convert_magpie_v2607_coreml.py') }}
+
+      - name: Install uv (for pinned Python 3.12 Core ML toolchain)
+        if: steps.cache-magpie.outputs.cache-hit != 'true'
+        uses: astral-sh/setup-uv@v6
+
+      - name: Convert & compile genuine NVIDIA Magpie v2607 on Apple Silicon (cache miss only)
+        if: steps.cache-magpie.outputs.cache-hit != 'true'
+        run: |
+          uv venv --python 3.12 .venv-ci-magpie
+          uv pip install --python .venv-ci-magpie/bin/python torch==2.7.0 coremltools==9.0 "numpy<2"
+          .venv-ci-magpie/bin/python tools/convert_magpie_v2607_coreml.py --out models/coreml/magpie_v2607
+
+          for m in text_encoder decoder_prefill decoder_step; do
+            xcrun coremlcompiler compile \
+              "models/coreml/magpie_v2607/${m}.mlpackage" \
+              "models/coreml/magpie_v2607/"
+            rm -rf "models/coreml/magpie_v2607/${m}.mlpackage"
+          done
+          rm -f models/coreml/magpie_tts_multilingual_357m.v2607.f16.gguf
+          rm -rf .venv-ci-magpie
+
+          # Bundle full-FP32 NanoCodec v3 .mlmodelc so iPhone downloads one self-contained v2607 package
+          mkdir -p models/coreml/magpie_v2607/nanocodec_decoder_v3.mlmodelc/weights \
+                   models/coreml/magpie_v2607/nanocodec_decoder_v3.mlmodelc/analytics
+          for sub in coremldata.bin metadata.json model.mil weights/weight.bin analytics/coremldata.bin; do
+            curl -fsSL \
+              "https://huggingface.co/FluidInference/magpie-tts-multilingual-357m-coreml/resolve/main/nanocodec_decoder_v3.mlmodelc/${sub}" \
+              -o "models/coreml/magpie_v2607/nanocodec_decoder_v3.mlmodelc/${sub}"
+          done
+          du -sh models/coreml/magpie_v2607/*
+
+      - name: Package & publish Magpie v2607 Cloud Release asset (zero-computer iPhone install)
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p build/magpie-release
+          (cd models/coreml/magpie_v2607 && zip -0 -rq ../../../build/magpie-release/MagpieV2607_CoreML.zip constants tokenizer text_encoder.mlmodelc decoder_prefill.mlmodelc decoder_step.mlmodelc nanocodec_decoder_v3.mlmodelc)
+          ls -lh build/magpie-release/MagpieV2607_CoreML.zip
+          if gh release view models-magpie-v2607 >/dev/null 2>&1; then
+            gh release upload models-magpie-v2607 \
+              build/magpie-release/MagpieV2607_CoreML.zip \
+              models/coreml/magpie_v2607/constants/constants.json \
+              --clobber
+          else
+            gh release create models-magpie-v2607 \
+              build/magpie-release/MagpieV2607_CoreML.zip \
+              models/coreml/magpie_v2607/constants/constants.json \
+              --title "NVIDIA Magpie v2607 Core ML (2× Frame-Stacked GRPO + Attention Prior)" \
+              --notes "Precompiled Apple Silicon Core ML bundle converted directly from nvidia/magpie_tts_multilingual_357m v2607 (frame_stacking_factor=2, 2-layer 12-head 768-dim LocalTransformer, 217-frame speaker context, monotonic cross-attention prior, FP32 NanoCodec v3)."
+          fi
+
   build-unsigned-ipa:
     name: Build Unsigned iOS arm64 .ipa (iPhone 18 Pro Max)
-    needs: [swift-tests, build-zipa-coreml]
+    needs: [swift-tests, build-zipa-coreml, build-magpie-v2607-coreml]
     runs-on: macos-26
     steps:
       - name: Checkout repository
@@ -124,11 +189,14 @@ jobs:
           name: zipa-cr-large-fp16-mlmodelc
           path: models/coreml
 
-      - name: Inject cloud ZIPA Release URL into Config/Info.plist
+      - name: Inject cloud Model Release URLs into Config/Info.plist
         run: |
-          RELEASE_URL="https://github.com/${{ github.repository }}/releases/download/models-zipa-fp16/ZipaCRLarge300M_FP16.mlmodelc.zip"
-          /usr/libexec/PlistBuddy -c "Set :CadenciaZipaReleaseURL $RELEASE_URL" Config/Info.plist
+          ZIPA_URL="https://github.com/${{ github.repository }}/releases/download/models-zipa-fp16/ZipaCRLarge300M_FP16.mlmodelc.zip"
+          MAGPIE_URL="https://github.com/${{ github.repository }}/releases/download/models-magpie-v2607/MagpieV2607_CoreML.zip"
+          /usr/libexec/PlistBuddy -c "Set :CadenciaZipaReleaseURL $ZIPA_URL" Config/Info.plist
+          /usr/libexec/PlistBuddy -c "Set :CadenciaMagpieV2607ReleaseURL $MAGPIE_URL" Config/Info.plist
           /usr/libexec/PlistBuddy -c "Print :CadenciaZipaReleaseURL" Config/Info.plist
+          /usr/libexec/PlistBuddy -c "Print :CadenciaMagpieV2607ReleaseURL" Config/Info.plist
 
       - name: Install XcodeGen
         run: |

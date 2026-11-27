@@ -50,5 +50,7 @@
     <true/>
     <key>CadenciaZipaReleaseURL</key>
     <string></string>
+    <key>CadenciaMagpieV2607ReleaseURL</key>
+    <string></string>
 </dict>
 </plist>
