@@ -92,7 +92,7 @@ print("Patched ptts-ffi successfully.")
 PY
 
 cd "$WORK_DIR"
-export RUSTFLAGS=""
+export RUSTFLAGS="-C embed-bitcode=no"
 unset CARGO_ENCODED_RUSTFLAGS || true
 
 TARGETS=(aarch64-apple-ios aarch64-apple-darwin)
