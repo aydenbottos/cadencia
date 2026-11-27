@@ -197,8 +197,11 @@ pub fn export_bundle(
     let ctx = vlen + max_tokens + max_frames + 16;
     let prefill_len = max_tokens;
 
-    let flow_lm = fl::build(&wt, &dims, ctx, prefill_len, time_norm, gelu(f.gelu), flow)?;
-    write_pkg(out_dir, &fl::package_name(ctx), flow_lm)?;
+    let step_flow = fl::build(&wt, &dims, ctx, 1, time_norm, gelu(f.gelu), flow)?;
+    write_pkg(out_dir, &fl::package_name(ctx, 1), step_flow)?;
+
+    let prefill_flow = fl::build(&wt, &dims, ctx, prefill_len, time_norm, gelu(f.gelu), flow)?;
+    write_pkg(out_dir, &fl::package_name(ctx, prefill_len), prefill_flow)?;
 
     let mimi_built = mimi::build(&wt, &mimi_dims, mimi_dims.cache_len(window), gelu(m.gelu))?;
     write_pkg(out_dir, &mimi_dims.package_name(window), mimi_built)?;
@@ -270,7 +273,6 @@ pub fn export_bundle(
         "built": built,
         "ctx": ctx,
         "prefill_len": prefill_len,
-        "s2s": serde_json::Value::Null,
         "max_frames": max_frames,
         "mimi": mimi_dims.to_json(),
         "mimi_window": window,
