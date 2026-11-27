@@ -1,0 +1,105 @@
+{
+  "pseudowords": [
+    "brantelar", "cospido", "frenura", "marpelar", "trosal", "vendaro", "clomido", "sartelo",
+    "prentar", "golvado", "bremor", "dastivo", "lormar", "calpón", "merdura", "trancero",
+    "sorpido", "flondar", "palmeo", "grustal", "bontear", "celmado", "dronel", "faspida",
+    "glorino", "jartar", "kermoso", "lantivo", "morsel", "nalpado", "orvelo", "pastrón",
+    "queldar", "rambido", "selnura", "tampor", "urbelar", "vospino", "zalmera", "altrado",
+    "belgura", "carvelo", "despón", "enclaro", "foltiva", "garbón", "hornelo", "imbrado",
+    "jolvido", "lastrón", "mencivo", "norbel", "oplado", "perzura", "quimbón", "rospaldo",
+    "roldar", "salmido", "telpón", "umbelar", "valpido", "zornal", "abrelar", "bermón",
+    "cildado", "dorpela", "eslivo", "farzón", "gromido", "hampela", "intror", "jurdado",
+    "lompra", "marzelo", "nestorín", "orcaldo", "pildura", "quersón", "riltado", "sombela",
+    "torpina", "ulmaro", "verpón", "zaltivo", "acromar", "bispado", "crontel", "dulvura",
+    "entrapo", "flimado", "gorzela", "hendor", "islano", "jornel", "lampido", "morbela",
+    "nergal", "oprimo", "plestón", "quorba", "rengado", "silpora", "trubelo", "unvido",
+    "vortela", "zambor", "alpidar", "brostón", "cenvura", "dremado", "espilón", "frandor",
+    "gelpido", "hurvela", "impolto", "jalmura", "lervón", "mispado", "noltura", "orpedo"
+  ],
+  "elicited_imitation_task": [
+    {"id":1,"syllables":7,"cefr":"A1","spanish":"Quiero cortarme el pelo.","english":"I want to get my hair cut."},
+    {"id":2,"syllables":8,"cefr":"A1","spanish":"El libro está en la mesa.","english":"The book is on the table."},
+    {"id":3,"syllables":8,"cefr":"A1","spanish":"El carro lo tiene Pedro.","english":"Pedro has the car."},
+    {"id":4,"syllables":9,"cefr":"A1","spanish":"Él se ducha cada mañana.","english":"He showers every morning."},
+    {"id":5,"syllables":9,"cefr":"A1","spanish":"¿Qué dice usted que va a hacer hoy?","english":"What did you say you are going to do today?"},
+    {"id":6,"syllables":10,"cefr":"A2","spanish":"Dudo que sepa manejar muy bien.","english":"I doubt that he knows how to drive very well."},
+    {"id":7,"syllables":10,"cefr":"A2","spanish":"Las calles de esta ciudad son muy anchas.","english":"The streets of this city are very wide."},
+    {"id":8,"syllables":10,"cefr":"A2","spanish":"Puede que llueva mañana todo el día.","english":"It might rain all day tomorrow."},
+    {"id":9,"syllables":11,"cefr":"A2","spanish":"Las casas son muy bonitas pero caras.","english":"The houses are very pretty but expensive."},
+    {"id":10,"syllables":11,"cefr":"A2","spanish":"Me gustan las películas que acaban bien.","english":"I like movies that end well."},
+    {"id":11,"syllables":11,"cefr":"A2","spanish":"El chico con el que salgo es español.","english":"The guy I go out with is Spanish."},
+    {"id":12,"syllables":12,"cefr":"B1","spanish":"Después de cenar me fui a dormir tranquilo.","english":"After dinner I went to sleep peacefully."},
+    {"id":13,"syllables":12,"cefr":"B1","spanish":"Quiero una casa en la que vivan mis animales.","english":"I want a house where my animals can live."},
+    {"id":14,"syllables":12,"cefr":"B1","spanish":"A nosotros nos fascinan las fiestas grandiosas.","english":"We are fascinated by grand parties."},
+    {"id":15,"syllables":13,"cefr":"B1","spanish":"Ella solo bebe cerveza y no come nada.","english":"She only drinks beer and does not eat anything."},
+    {"id":16,"syllables":13,"cefr":"B1","spanish":"Me gustaría que el precio de las casas bajara.","english":"I would like the price of houses to go down."},
+    {"id":17,"syllables":13,"cefr":"B1","spanish":"Cruza a la derecha y después sigue todo recto.","english":"Turn right and then go straight ahead."},
+    {"id":18,"syllables":14,"cefr":"B1","spanish":"Ella ha terminado de pintar su apartamento.","english":"She has finished painting her apartment."},
+    {"id":19,"syllables":14,"cefr":"B1","spanish":"Me gustaría que empezara a hacer más calor pronto.","english":"I would like it to start getting warmer soon."},
+    {"id":20,"syllables":14,"cefr":"B2","spanish":"El niño al que se le murió el gato está muy triste.","english":"The boy whose cat died is very sad."},
+    {"id":21,"syllables":14,"cefr":"B2","spanish":"Una amiga mía cuida a los niños de mi vecino.","english":"A friend of mine looks after my neighbor's children."},
+    {"id":22,"syllables":15,"cefr":"B2","spanish":"El gato que era negro fue perseguido por el perro.","english":"The cat that was black was chased by the dog."},
+    {"id":23,"syllables":15,"cefr":"B2","spanish":"Antes de poder salir él tiene que limpiar su cuarto.","english":"Before being able to leave he has to clean his room."},
+    {"id":24,"syllables":15,"cefr":"B2","spanish":"La cantidad de personas que fuman ha disminuido.","english":"The number of people who smoke has decreased."},
+    {"id":25,"syllables":15,"cefr":"B2","spanish":"Después de llegar a casa del trabajo tomé la cena.","english":"After getting home from work I had dinner."},
+    {"id":26,"syllables":16,"cefr":"B2","spanish":"El ladrón al que atrapó la policía era famoso.","english":"The thief whom the police caught was famous."},
+    {"id":27,"syllables":16,"cefr":"B2","spanish":"Le pedí a un amigo que me ayudara con la tarea.","english":"I asked a friend to help me with the homework."},
+    {"id":28,"syllables":16,"cefr":"B2","spanish":"El examen no fue tan difícil como me habían dicho.","english":"The exam was not as difficult as they had told me."},
+    {"id":29,"syllables":17,"cefr":"B2","spanish":"Serías tan amable de darme el libro que está en la mesa.","english":"Would you be so kind as to give me the book on the table?"},
+    {"id":30,"syllables":17,"cefr":"B2","spanish":"Hay mucha gente que no toma nada para el desayuno.","english":"There are many people who do not have anything for breakfast."}
+  ],
+  "native_speed_listening_tests": [
+    {
+      "id": "native_30_1",
+      "checkpoint_hour": 30,
+      "accent": "es-ES",
+      "speaker": "Sofia",
+      "wpm": 165,
+      "title": "Un cambio de planes en Atocha",
+      "transcript": "Mira, te cuento rápido porque estoy entrando en la estación y casi no tengo cobertura. Al final el tren de las seis y media se ha retrasado cuarenta minutos por una avería en las vías cerca de Zaragoza, así que he decidido cambiar el billete al siguiente directo aunque me cueste doce euros más. Si no pasa nada raro llegaré a casa sobre las nueve y cuarto; no hace falta que prepares cena, compro algo caliente al salir del metro.",
+      "questions": [
+        {"q": "Why did the speaker switch tickets?", "options": ["The 6:30 train was delayed 40 minutes due to a track fault", "They missed the train because of traffic", "The original ticket was for the wrong station", "A storm cancelled all departures"], "correct": 0},
+        {"q": "What does the speaker ask the listener NOT to do?", "options": ["Meet them at the metro", "Cook dinner", "Call them back", "Pay for the ticket"], "correct": 1}
+      ]
+    },
+    {
+      "id": "native_30_2",
+      "checkpoint_hour": 30,
+      "accent": "es-419",
+      "speaker": "Leo",
+      "wpm": 165,
+      "title": "El taller de bicicletas del barrio",
+      "transcript": "El otro día llevé mi bicicleta al taller nuevo que abrieron detrás del mercado porque la cadena hacía un ruido extraño cada vez que subía una cuesta. Pensé que tendrían que cambiar toda la rueda trasera, pero el mecánico la revisó en diez minutos y me dijo que solo necesitaba apretar un tornillo y limpiar los frenos. Además no me quiso cobrar casi nada, así que seguro voy a volver cuando necesite revisar las llantas antes de las lluvias.",
+      "questions": [
+        {"q": "What turned out to be the actual problem with the bike?", "options": ["The rear wheel had to be replaced", "A loose screw and dirty brakes", "A broken chain", "Flat tires"], "correct": 1},
+        {"q": "When does the speaker plan to go back?", "options": ["Next Monday morning", "Before the rainy season to check the tires", "After buying a new bicycle", "Never, because it was too expensive"], "correct": 1}
+      ]
+    },
+    {
+      "id": "native_60_1",
+      "checkpoint_hour": 60,
+      "accent": "es-ES",
+      "speaker": "Aria",
+      "wpm": 180,
+      "title": "Debate vecinal sobre la plaza",
+      "transcript": "En la reunión de ayer por la tarde hubo bastante tensión entre los comerciantes y los vecinos del bloque norte. Los primeros defienden que cerrar la plaza al tráfico reducirá las ventas entre semana, mientras que las familias insisten en que el ruido y el humo impiden abrir las ventanas desde mayo hasta octubre. Al final el ayuntamiento propuso un periodo de prueba de seis meses con acceso restringido solo para reparto por la mañana, y casi todos aceptaron evaluarlo en otoño antes de votar la reforma definitiva.",
+      "questions": [
+        {"q": "What is the main concern of the local shopkeepers?", "options": ["Higher rent prices", "Lower weekday sales if traffic is banned", "Noise from construction", "Lack of street lighting"], "correct": 1},
+        {"q": "What compromise did the city council propose?", "options": ["A six-month trial with morning-only delivery access", "Closing the square only on Sundays", "Building an underground parking garage", "Postponing the vote for two years"], "correct": 0}
+      ]
+    },
+    {
+      "id": "native_60_2",
+      "checkpoint_hour": 60,
+      "accent": "es-419",
+      "speaker": "Jason",
+      "wpm": 180,
+      "title": "Entrevista sobre arquitectura bioclimática",
+      "transcript": "Cuando diseñamos viviendas en zonas muy secas, la gente suele pensar primero en instalar equipos de aire acondicionado más potentes, pero eso dispara el gasto eléctrico y empeora el calor en la calle. Si en cambio orientamos bien las ventanas, usamos muros gruesos de tierra compactada y creamos patios interiores con vegetación y sombra, la temperatura dentro de la casa puede bajar hasta siete grados sin encender una sola máquina. No es una tecnología futurista; en realidad estamos recuperando soluciones que ya funcionaban hace siglos.",
+      "questions": [
+        {"q": "How much can passive design lower indoor temperatures according to the architect?", "options": ["Up to 3 degrees", "Up to 7 degrees", "Up to 12 degrees", "Up to 15 degrees"], "correct": 1},
+        {"q": "How does the speaker characterize these solutions?", "options": ["Experimental futuristic tech", "Recovered centuries-old methods", "Only viable in humid climates", "Too costly for regular homes"], "correct": 1}
+      ]
+    }
+  ]
+}

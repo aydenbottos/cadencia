@@ -1,0 +1,56 @@
+name: Cadencia
+options:
+  bundleIdPrefix: com.aydenbottos
+  deploymentTarget:
+    iOS: "18.0"
+  xcodeVersion: "26.0"
+  createIntermediateGroups: true
+
+packages:
+  CadenciaLocal:
+    path: .
+
+targets:
+  Cadencia:
+    type: application
+    platform: iOS
+    deploymentTarget: "18.0"
+    sources:
+      - path: Sources/CadenciaApp
+    info:
+      path: Config/Info.plist
+    dependencies:
+      - package: CadenciaLocal
+        product: CadenciaCore
+      - package: CadenciaLocal
+        product: CadenciaSpeech
+      - sdk: Metal.framework
+      - sdk: MetalKit.framework
+      - sdk: CoreHaptics.framework
+      - sdk: CoreML.framework
+      - sdk: Accelerate.framework
+      - sdk: AVFoundation.framework
+      - sdk: Security.framework
+      - sdk: NaturalLanguage.framework
+      - sdk: libsqlite3.tbd
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.aydenbottos.cadencia
+        PRODUCT_NAME: Cadencia
+        SWIFT_VERSION: "6.0"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SUPPORTS_MACCATALYST: NO
+        MARKETING_VERSION: "1.0.0"
+        CURRENT_PROJECT_VERSION: "1"
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGN_IDENTITY: ""
+        ENABLE_BITCODE: NO
+        MTL_FAST_MATH: YES
+        SWIFT_OPTIMIZATION_LEVEL: "-O"
+      configs:
+        Debug:
+          SWIFT_OPTIMIZATION_LEVEL: "-Onone"
+        Release:
+          SWIFT_OPTIMIZATION_LEVEL: "-O"
+          SWIFT_COMPILATION_MODE: wholemodule

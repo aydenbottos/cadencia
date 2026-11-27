@@ -1,0 +1,6 @@
+version: 1
+bundleID: com.aydenbottos.cadencia
+product: CadenciaApp
+infoPath: Config/Info.plist
+resources:
+  - Sources/CadenciaCore/Resources/cadencia_seed.sqlite

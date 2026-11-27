@@ -1,0 +1,26 @@
+# Virtual environments & Python caches
+.venv/
+.venv-coreml/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Raw downloaded checkpoints & large model weights (served via LAN or downloaded on-device)
+models/zipa/
+models/coreml/
+tools/cache/
+
+# Swift / Xcode / xtool build artifacts
+.build/
+.swiftpm/
+build/
+DerivedData/
+Cadencia.xcodeproj/
+*.ipa
+*.xcarchive
+*.DS_Store
+
+# Never commit API keys or local SQLite user state
+.env
+.env.*
+cadencia_user.sqlite*

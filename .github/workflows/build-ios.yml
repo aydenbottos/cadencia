@@ -1,0 +1,193 @@
+name: Build Cadencia iOS (.ipa) & Precompile ZIPA Core ML
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: "Build configuration (Release or Debug)"
+        required: false
+        default: "Release"
+        type: choice
+        options:
+          - Release
+          - Debug
+      bundle_zipa_in_ipa:
+        description: "Embed precompiled ZIPA CR Large 300M FP16 (.mlmodelc) directly inside Cadencia.app (zero-download on iPhone)"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  swift-tests:
+    name: Swift Package Unit Tests (CadenciaCore & CadenciaSpeech)
+    runs-on: macos-26
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Select Xcode & verify toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Run SwiftPM tests
+        run: swift test --parallel
+
+  build-zipa-coreml:
+    name: Precompile ZIPA CR Large 300M FP16 (.mlmodelc) for Apple Neural Engine
+    runs-on: macos-26
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Restore cached precompiled ZIPA FP16 .mlmodelc
+        id: cache-zipa
+        uses: actions/cache@v4
+        with:
+          path: |
+            models/coreml/ZipaCRLarge300M_FP16.mlmodelc
+            models/coreml/zipa_tokens.txt
+            models/coreml/zipa_config.json
+          key: zipa-cr-large-300m-fp16-mlmodelc-${{ hashFiles('tools/convert_zipa_coreml.py') }}
+
+      - name: Convert & compile ZIPA CR Large 300M FP16 on Apple Silicon (cache miss only)
+        if: steps.cache-zipa.outputs.cache-hit != 'true'
+        run: |
+          python3 --version
+          python3 -m venv .venv-ci-coreml
+          .venv-ci-coreml/bin/pip install --upgrade pip
+          .venv-ci-coreml/bin/pip install torch==2.7.0 coremltools==9.0 "numpy<2" huggingface_hub
+          .venv-ci-coreml/bin/python tools/convert_zipa_coreml.py --auto-download --skip-onnx
+          xcrun coremlcompiler compile \
+            models/coreml/ZipaCRLarge300M_FP16.mlpackage \
+            models/coreml/
+          rm -rf models/coreml/ZipaCRLarge300M_FP16.mlpackage models/zipa .venv-ci-coreml
+          ls -lh models/coreml/ZipaCRLarge300M_FP16.mlmodelc
+
+      - name: Package & publish ZIPA FP16 Cloud Release asset (for one-tap on-device cloud installs)
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p build/zipa-release
+          (cd models/coreml && zip -0 -rq ../../build/zipa-release/ZipaCRLarge300M_FP16.mlmodelc.zip ZipaCRLarge300M_FP16.mlmodelc zipa_tokens.txt zipa_config.json)
+          ls -lh build/zipa-release/ZipaCRLarge300M_FP16.mlmodelc.zip
+          if gh release view models-zipa-fp16 >/dev/null 2>&1; then
+            gh release upload models-zipa-fp16 \
+              build/zipa-release/ZipaCRLarge300M_FP16.mlmodelc.zip \
+              models/coreml/zipa_tokens.txt \
+              models/coreml/zipa_config.json \
+              --clobber
+          else
+            gh release create models-zipa-fp16 \
+              build/zipa-release/ZipaCRLarge300M_FP16.mlmodelc.zip \
+              models/coreml/zipa_tokens.txt \
+              models/coreml/zipa_config.json \
+              --title "ZIPA CR Large 300M FP16 (Precompiled Core ML ANE)" \
+              --notes "Precompiled Apple Neural Engine FP16 Multifunction Core ML bundle (256/512/1024/1536 static buckets) auto-built from anyspeech/zipa-large-crctc-ns-800k."
+          fi
+
+      - name: Upload compiled ZIPA .mlmodelc for app packaging
+        uses: actions/upload-artifact@v4
+        with:
+          name: zipa-cr-large-fp16-mlmodelc
+          path: |
+            models/coreml/ZipaCRLarge300M_FP16.mlmodelc
+            models/coreml/zipa_tokens.txt
+          retention-days: 3
+          compression-level: 0
+
+  build-unsigned-ipa:
+    name: Build Unsigned iOS arm64 .ipa (iPhone 18 Pro Max)
+    needs: [swift-tests, build-zipa-coreml]
+    runs-on: macos-26
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download precompiled ZIPA CR Large 300M FP16 (.mlmodelc)
+        uses: actions/download-artifact@v4
+        with:
+          name: zipa-cr-large-fp16-mlmodelc
+          path: models/coreml
+
+      - name: Inject cloud ZIPA Release URL into Config/Info.plist
+        run: |
+          RELEASE_URL="https://github.com/${{ github.repository }}/releases/download/models-zipa-fp16/ZipaCRLarge300M_FP16.mlmodelc.zip"
+          /usr/libexec/PlistBuddy -c "Set :CadenciaZipaReleaseURL $RELEASE_URL" Config/Info.plist
+          /usr/libexec/PlistBuddy -c "Print :CadenciaZipaReleaseURL" Config/Info.plist
+
+      - name: Install XcodeGen
+        run: |
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+
+      - name: Generate Cadencia.xcodeproj
+        run: xcodegen generate --spec project.yml
+
+      - name: Resolve Swift Package dependencies (FluidAudio v0.18.4+)
+        run: |
+          xcodebuild -resolvePackageDependencies \
+            -project Cadencia.xcodeproj \
+            -scheme Cadencia \
+            -clonedSourcePackagesDirPath .build/SourcePackages
+
+      - name: Build arm64 iOS application (unsigned for xtool free-account signing)
+        env:
+          BUILD_CONFIG: ${{ inputs.configuration || 'Release' }}
+        run: |
+          xcodebuild build \
+            -project Cadencia.xcodeproj \
+            -scheme Cadencia \
+            -configuration "$BUILD_CONFIG" \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/DerivedData \
+            -clonedSourcePackagesDirPath .build/SourcePackages \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES
+
+      - name: Embed precompiled ZIPA FP16 .mlmodelc & package Cadencia-unsigned.ipa
+        env:
+          BUILD_CONFIG: ${{ inputs.configuration || 'Release' }}
+          BUNDLE_ZIPA: ${{ inputs.bundle_zipa_in_ipa != false }}
+        run: |
+          APP_PATH="build/DerivedData/Build/Products/${BUILD_CONFIG}-iphoneos/Cadencia.app"
+          test -d "$APP_PATH"
+          mkdir -p build/ipa/Payload
+          cp -R "$APP_PATH" build/ipa/Payload/Cadencia.app
+
+          if [ "$BUNDLE_ZIPA" = "true" ]; then
+            echo "Embedding precompiled ZipaCRLarge300M_FP16.mlmodelc directly inside Cadencia.app (zero-download on iPhone)..."
+            cp -R models/coreml/ZipaCRLarge300M_FP16.mlmodelc build/ipa/Payload/Cadencia.app/ZipaCRLarge300M_FP16.mlmodelc
+            cp models/coreml/zipa_tokens.txt build/ipa/Payload/Cadencia.app/zipa_tokens.txt
+          fi
+
+          ls -lh build/ipa/Payload/Cadencia.app
+          # Store mode (-0) avoids re-compressing FP16 weights and speeds up packaging & xtool install!
+          (cd build/ipa && zip -0 -qry ../../Cadencia-unsigned.ipa Payload)
+          ls -lh Cadencia-unsigned.ipa
+
+      - name: Upload Cadencia-unsigned.ipa artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Cadencia-unsigned-ipa
+          path: Cadencia-unsigned.ipa
+          retention-days: 30
+          compression-level: 0
