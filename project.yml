@@ -17,8 +17,6 @@ targets:
     deploymentTarget: "18.0"
     sources:
       - path: Sources/CadenciaApp
-    info:
-      path: Config/Info.plist
     dependencies:
       - package: CadenciaLocal
         product: CadenciaCore
@@ -30,11 +28,15 @@ targets:
       - sdk: CoreML.framework
       - sdk: Accelerate.framework
       - sdk: AVFoundation.framework
+      - sdk: Compression.framework
+      - sdk: QuartzCore.framework
       - sdk: Security.framework
       - sdk: NaturalLanguage.framework
       - sdk: libsqlite3.tbd
     settings:
       base:
+        INFOPLIST_FILE: Config/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
         PRODUCT_BUNDLE_IDENTIFIER: com.aydenbottos.cadencia
         PRODUCT_NAME: Cadencia
         SWIFT_VERSION: "6.0"

@@ -176,6 +176,8 @@ public struct ArticulatoryPhonemeAligner: Sendable {
         if (expected == "β" && observed == "b") || (expected == "b" && observed == "β") { return 0.15 }
         if (expected == "ð" && observed == "d") || (expected == "d" && observed == "ð") { return 0.15 }
         if (expected == "ɣ" && (observed == "ɡ" || observed == "g")) { return 0.15 }
+        // Spanish phonemic trill /r/ vs tap /ɾ/ contrast (e.g. perro vs pero)
+        if (expected == "r" && observed == "ɾ") || (expected == "ɾ" && observed == "r") { return 0.32 }
         // English aspiration on voiceless stops [pʰ, tʰ, kʰ]
         if observed.hasSuffix("ʰ") && String(observed.dropLast()) == expected { return 0.30 }
 

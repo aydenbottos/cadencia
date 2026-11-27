@@ -301,7 +301,7 @@ public struct ResearchAnalyticsEngine: Sendable {
     }
 
     private func normalizedWordOverlap(target: [String], spoken: [String]) -> Double {
-        guard !target.isEmpty else { return 0.0 }
+        guard !target.isEmpty, !spoken.isEmpty else { return 0.0 }
         let m = target.count
         let n = spoken.count
         var dp = Array(repeating: Array(repeating: 0, count: n + 1), count: m + 1)

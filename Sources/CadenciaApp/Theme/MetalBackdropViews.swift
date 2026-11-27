@@ -1,5 +1,6 @@
 import CadenciaCore
 import MetalKit
+import QuartzCore
 import SwiftUI
 
 // MARK: - Runtime-Compiled Metal Library (Guaranteed on BOTH Xcode & Linux xtool Builds!)

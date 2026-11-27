@@ -168,10 +168,11 @@ jobs:
       - name: Embed precompiled ZIPA FP16 .mlmodelc & package Cadencia-unsigned.ipa
         env:
           BUILD_CONFIG: ${{ inputs.configuration || 'Release' }}
-          BUNDLE_ZIPA: ${{ inputs.bundle_zipa_in_ipa != false }}
+          BUNDLE_ZIPA: ${{ github.event_name == 'workflow_dispatch' && inputs.bundle_zipa_in_ipa || github.event_name != 'workflow_dispatch' }}
         run: |
           APP_PATH="build/DerivedData/Build/Products/${BUILD_CONFIG}-iphoneos/Cadencia.app"
           test -d "$APP_PATH"
+          echo "BUILD_CONFIG=$BUILD_CONFIG BUNDLE_ZIPA=$BUNDLE_ZIPA"
           mkdir -p build/ipa/Payload
           cp -R "$APP_PATH" build/ipa/Payload/Cadencia.app
 
