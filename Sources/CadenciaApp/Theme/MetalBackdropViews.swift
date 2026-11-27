@@ -92,6 +92,7 @@ public struct MediterraneanAuroraView: View {
 }
 #endif
 
+@MainActor
 public final class AuroraRenderer: NSObject, MTKViewDelegate {
     private struct Uniforms {
         var time: Float
@@ -208,6 +209,7 @@ public struct ResonanceOrbView: View {
 }
 #endif
 
+@MainActor
 public final class OrbRenderer: NSObject, MTKViewDelegate {
     private struct Uniforms {
         var time: Float
@@ -353,6 +355,7 @@ public struct MemoryConstellationMetalView: View {
 }
 #endif
 
+@MainActor
 public final class ConstellationRenderer: NSObject, MTKViewDelegate {
     private struct Uniforms {
         var time: Float

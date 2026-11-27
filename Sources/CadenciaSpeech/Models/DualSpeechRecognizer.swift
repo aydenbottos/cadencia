@@ -1,5 +1,5 @@
 import Accelerate
-import AVFoundation
+@preconcurrency import AVFoundation
 import CadenciaCore
 import FluidAudio
 import Foundation
@@ -146,13 +146,14 @@ public actor DualSpeechRecognizer {
             guard let converted = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: outFrames) else { return }
 
             var error: NSError?
-            var consumed = false
+            final class OneShotFlag: @unchecked Sendable { var consumed = false }
+            let flag = OneShotFlag()
             converter.convert(to: converted, error: &error) { _, outStatus in
-                if consumed {
+                if flag.consumed {
                     outStatus.pointee = .noDataNow
                     return nil
                 }
-                consumed = true
+                flag.consumed = true
                 outStatus.pointee = .haveData
                 return buffer
             }
@@ -253,13 +254,12 @@ public actor DualSpeechRecognizer {
     /// Runs a live on-device hardware benchmark of Parakeet Ultra INT8 + ZIPA CR Large FP16 on synthetic 3s speech-band audio.
     public func runHardwareBenchmark() async -> (parakeetMs: Double, zipaMs: Double) {
         let count = 16_000 * 3
-        var synth = [Float](repeating: 0, count: count)
-        for i in 0..<count {
+        let samples: [Float] = (0..<count).map { i in
             let t = Float(i) / 16_000.0
-            synth[i] = 0.25 * sinf(2 * .pi * 220 * t) + 0.12 * sinf(2 * .pi * 880 * t)
+            return 0.25 * sinf(2 * .pi * 220 * t) + 0.12 * sinf(2 * .pi * 880 * t)
         }
-        async let p = runParakeetUltra(samples: synth)
-        async let z = runZipaPhonemes(samples: synth)
+        async let p = runParakeetUltra(samples: samples)
+        async let z = runZipaPhonemes(samples: samples)
         let (pr, zr) = await (p, z)
         return (pr.ms, zr.ms)
     }

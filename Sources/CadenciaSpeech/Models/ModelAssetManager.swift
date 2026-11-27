@@ -130,7 +130,7 @@ public actor ModelAssetManager {
 
     public func downloadMagpieAssets(
         repoId: String = ModelAssetManager.magpieHuggingFaceRepo,
-        onProgress: @Sendable (ModelDownloadProgress) -> Void
+        onProgress: @escaping @Sendable (ModelDownloadProgress) -> Void
     ) async throws {
         let destRoot = directory(for: .magpieTTS)
         try FileManager.default.createDirectory(at: destRoot, withIntermediateDirectories: true)
@@ -207,7 +207,7 @@ public actor ModelAssetManager {
     // MARK: - Download Parakeet Ultra 600M INT8 via FluidAudio
 
     public func downloadParakeetUltra(
-        onProgress: @Sendable (ModelDownloadProgress) -> Void
+        onProgress: @escaping @Sendable (ModelDownloadProgress) -> Void
     ) async throws -> AsrModels {
         onProgress(.init(kind: .parakeetUltra, fractionCompleted: 0.05, statusMessage: "Downloading Parakeet Ultra 600M INT8 Core ML…", isReady: false, errorMessage: nil))
         let models = try await AsrModels.downloadAndLoad(
@@ -234,7 +234,7 @@ public actor ModelAssetManager {
     /// or downloads & extracts `ZipaCRLarge300M_FP16.mlmodelc.zip` directly on-device from the
     /// CI-configured GitHub Release CDN (`Info.plist -> CadenciaZipaReleaseURL`).
     public func installZipaFromCloud(
-        onProgress: @Sendable (ModelDownloadProgress) -> Void
+        onProgress: @escaping @Sendable (ModelDownloadProgress) -> Void
     ) async throws -> URL {
         // 1. Instant path: already built into Cadencia.app by GitHub Actions (zero download!)
         if let bundled = Bundle.main.url(forResource: "ZipaCRLarge300M_FP16", withExtension: "mlmodelc") {
