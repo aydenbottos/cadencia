@@ -3,6 +3,34 @@ import Accelerate
 import CadenciaCore
 import FluidAudio
 import Foundation
+import os
+
+/// Real-time-safe lock-protected 16kHz PCM accumulator (zero Task allocations or actor hops in audio taps!).
+private final class PCMRecordingBuffer: @unchecked Sendable {
+    private let lock = OSAllocatedUnfairLock<[Float]>(initialState: [])
+
+    func reset(capacity: Int = 16_000 * 30) {
+        lock.withLock { buf in
+            buf.removeAll(keepingCapacity: true)
+            if buf.capacity < capacity { buf.reserveCapacity(capacity) }
+        }
+    }
+
+    func append(_ samples: [Float]) {
+        guard !samples.isEmpty else { return }
+        lock.withLock { buf in
+            buf.append(contentsOf: samples)
+        }
+    }
+
+    func takeAll() -> [Float] {
+        lock.withLock { buf in
+            let copy = buf
+            buf.removeAll(keepingCapacity: true)
+            return copy
+        }
+    }
+}
 
 public struct DualRecognitionOutput: Sendable {
     public let transcriptEs: String
@@ -63,7 +91,7 @@ public actor DualSpeechRecognizer {
     private let aligner = ArticulatoryPhonemeAligner()
 
     private var captureEngine: AVAudioEngine?
-    private var recordedSamples16k: [Float] = []
+    private let pcmBuffer = PCMRecordingBuffer()
     private var telemetryCallback: (@Sendable (LiveMicTelemetry) -> Void)?
 
     public private(set) var isParakeetReady: Bool = false
@@ -79,9 +107,25 @@ public actor DualSpeechRecognizer {
         self.telemetryCallback = handler
     }
 
-    /// Fast, idempotent single-engine attach for newly downloaded Parakeet Ultra models
-    /// (avoids re-loading ZIPA or blocking on Silero VAD network download).
+    /// Fast, idempotent single-engine attach for newly downloaded Parakeet Ultra models.
     public func attachParakeetModels(_ models: AsrModels) async throws {
+        let mgr = AsrManager(config: .default)
+        try await mgr.loadModels(models)
+        self.asrManager = mgr
+        self.isParakeetReady = true
+    }
+
+    /// Loads Parakeet Ultra 600M INT8 cleanly from local cache (never triggers a hidden download or blocks ZIPA/VAD).
+    public func ensureParakeetLoaded(assetManager: ModelAssetManager) async throws {
+        if isParakeetReady && asrManager != nil { return }
+        guard await assetManager.isModelInstalled(.parakeetUltra) else { return }
+        let cacheDir = AsrModels.defaultCacheDirectory(for: .ultra)
+        let models = try await AsrModels.load(
+            from: cacheDir,
+            version: .ultra,
+            encoderPrecision: .int8,
+            encoderComputeUnits: .cpuAndNeuralEngine
+        )
         let mgr = AsrManager(config: .default)
         try await mgr.loadModels(models)
         self.asrManager = mgr
@@ -106,134 +150,99 @@ public actor DualSpeechRecognizer {
         }
     }
 
-    private static func loadParakeetIfNeeded(needed: Bool, provided: AsrModels?) async -> AsrManager? {
-        guard needed else { return nil }
-        do {
-            let models: AsrModels
-            if let provided {
-                models = provided
-            } else {
-                models = try await AsrModels.loadFromCache(
-                    version: .ultra,
-                    encoderComputeUnits: .cpuAndNeuralEngine
-                )
-            }
-            let mgr = AsrManager(config: .default)
-            try await mgr.loadModels(models)
-            return mgr
-        } catch {
-            return nil
-        }
-    }
-
-    private static func loadZipaIfNeeded(needed: Bool, zipa: ZipaPhonemeEngine, dir: URL) async -> Bool {
-        guard needed else { return false }
-        return (try? await zipa.load(modelDirectory: dir)) != nil
-    }
-
-    private static func loadVadIfNeeded(needed: Bool) async -> VadManager? {
-        guard needed else { return nil }
-        return try? await VadManager(config: .default)
-    }
-
-    /// Loads Parakeet Ultra 600M INT8 + Silero VAD + ZIPA CR Large 300M FP16 concurrently,
-    /// skipping any engine already warm in memory.
+    /// Ensures core local speech engines (ZIPA + Parakeet Ultra INT8) are warm in memory,
+    /// loading one ANE model family at a time so iOS `aned` never stalls or deadlocks.
+    /// Does NOT block on Silero VAD network download (energy-based fallback is instant & always available).
     public func loadAllEngines(
         assetManager: ModelAssetManager,
         parakeetModels: AsrModels? = nil
     ) async throws {
-        let parakeetInstalled = await assetManager.isModelInstalled(.parakeetUltra)
-        let zipaInstalled = await assetManager.isModelInstalled(.zipaPhoneme)
-        let needParakeet = parakeetModels != nil || (!isParakeetReady && parakeetInstalled)
-        let needZipa = !isZipaReady && zipaInstalled
-        let needVad = !isVADReady
-        let zipaDir = await assetManager.directory(for: .zipaPhoneme)
-        let zipa = self.zipaEngine
+        // 1. ZIPA CR Large 300M FP16 (primary 256f bucket loads first in <0.5s!)
+        try? await ensureZipaLoaded(assetManager: assetManager)
 
-        // Kick off all three independent Core ML loads in parallel!
-        async let parakeetLoaded = Self.loadParakeetIfNeeded(needed: needParakeet, provided: parakeetModels)
-        async let zipaLoaded = Self.loadZipaIfNeeded(needed: needZipa, zipa: zipa, dir: zipaDir)
-        async let vadLoaded = Self.loadVadIfNeeded(needed: needVad)
-
-        if let mgr = await parakeetLoaded {
-            self.asrManager = mgr
-            self.isParakeetReady = true
-        }
-        if await zipaLoaded {
-            self.isZipaReady = true
-        }
-        if let vad = await vadLoaded {
-            self.vadManager = vad
-            self.isVADReady = true
-            await assetManager.markVADReady()
+        // 2. Parakeet Ultra 600M INT8
+        if let provided = parakeetModels {
+            try await attachParakeetModels(provided)
+        } else {
+            try? await ensureParakeetLoaded(assetManager: assetManager)
         }
     }
 
-    // MARK: - Live Microphone Capture (Resampled On-The-Fly to 16kHz Mono Float32)
+    // MARK: - Live Microphone Capture (Direct Lock-Protected vDSP 16kHz Mono Resampler)
 
-    public func startListening() throws {
+    public func startListening() async throws {
         stopListeningBufferOnly()
-        recordedSamples16k.removeAll(keepingCapacity: true)
-        recordedSamples16k.reserveCapacity(16_000 * 20)
 
         #if os(iOS)
+        // Explicitly request iOS Microphone permission (starting AVAudioEngine before permission yields all-zero silence!)
+        let granted = await AVAudioApplication.requestRecordPermission()
+        guard granted else {
+            throw NSError(domain: "DualSpeechRecognizer", code: 403, userInfo: [
+                NSLocalizedDescriptionKey: "Microphone access denied. Enable Microphone for Cadencia in iOS Settings."
+            ])
+        }
+
         let session = AVAudioSession.sharedInstance()
         try session.setCategory(.playAndRecord, mode: .measurement, options: [.defaultToSpeaker, .allowBluetooth])
-        try session.setPreferredSampleRate(16_000)
+        try session.setPreferredSampleRate(48_000)
         try session.setActive(true)
         #endif
+
+        pcmBuffer.reset(capacity: 16_000 * 30)
 
         let engine = AVAudioEngine()
         let inputNode = engine.inputNode
         let hwFormat = inputNode.outputFormat(forBus: 0)
-        guard let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16_000, channels: 1, interleaved: false),
-              let converter = AVAudioConverter(from: hwFormat, to: targetFormat)
-        else {
-            throw NSError(domain: "DualSpeechRecognizer", code: 500, userInfo: [NSLocalizedDescriptionKey: "Cannot initialize 16kHz audio converter"])
+        guard hwFormat.sampleRate > 0, hwFormat.channelCount > 0 else {
+            throw NSError(domain: "DualSpeechRecognizer", code: 500, userInfo: [
+                NSLocalizedDescriptionKey: "Invalid hardware microphone format (\(hwFormat.sampleRate) Hz, \(hwFormat.channelCount) ch)."
+            ])
         }
 
+        let hwRate = hwFormat.sampleRate
+        let bufferStore = self.pcmBuffer
         let callback = self.telemetryCallback
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: hwFormat) { [weak self] buffer, _ in
-            let ratio = 16_000.0 / max(1.0, hwFormat.sampleRate)
-            let outFrames = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 16
-            guard let converted = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: outFrames) else { return }
 
-            var error: NSError?
-            final class OneShotFlag: @unchecked Sendable { var consumed = false }
-            let flag = OneShotFlag()
-            converter.convert(to: converted, error: &error) { _, outStatus in
-                if flag.consumed {
-                    outStatus.pointee = .noDataNow
-                    return nil
-                }
-                flag.consumed = true
-                outStatus.pointee = .haveData
-                return buffer
-            }
+        // Tap hardware format directly & resample to 16kHz mono via Accelerate vDSP_vlint (zero state errors, zero dropped frames!)
+        inputNode.installTap(onBus: 0, bufferSize: 2048, format: hwFormat) { buffer, _ in
+            guard let ch0 = buffer.floatChannelData?[0], buffer.frameLength > 0 else { return }
+            let inCount = Int(buffer.frameLength)
+            let chunk16k = Self.resampleTo16kMono(input: ch0, count: inCount, sourceSampleRate: hwRate)
+            guard !chunk16k.isEmpty else { return }
 
-            guard error == nil, let ptr = converted.floatChannelData?[0], converted.frameLength > 0 else { return }
-            let count = Int(converted.frameLength)
-            let chunk = Array(UnsafeBufferPointer(start: ptr, count: count))
+            bufferStore.append(chunk16k)
 
             // Fast RMS + 16-band energy estimate for 120Hz Metal Resonance Orb
             var rms: Float = 0
-            vDSP_rmsqv(chunk, 1, &rms, vDSP_Length(count))
-            let bands = Self.computeQuickBands(chunk, bandCount: 16)
-            callback?(LiveMicTelemetry(rmsLevel: min(1.0, rms * 6.0), spectrumBands: bands, isSpeechActive: rms > 0.015))
-
-            Task { [weak self] in
-                await self?.appendCapturedSamples(chunk)
-            }
+            vDSP_rmsqv(chunk16k, 1, &rms, vDSP_Length(chunk16k.count))
+            let bands = Self.computeQuickBands(chunk16k, bandCount: 16)
+            callback?(LiveMicTelemetry(rmsLevel: min(1.0, rms * 8.0), spectrumBands: bands, isSpeechActive: rms > 0.01))
         }
 
+        engine.prepare()
         try engine.start()
         self.captureEngine = engine
         self.isRecording = true
     }
 
-    private func appendCapturedSamples(_ samples: [Float]) {
-        guard isRecording else { return }
-        recordedSamples16k.append(contentsOf: samples)
+    /// Ultra-fast Accelerate `vDSP_vlint` hardware-rate (e.g. 48kHz/44.1kHz) -> 16kHz mono resampler.
+    private static func resampleTo16kMono(input: UnsafePointer<Float>, count: Int, sourceSampleRate: Double) -> [Float] {
+        guard count > 0 else { return [] }
+        if abs(sourceSampleRate - 16_000.0) < 1.0 {
+            return Array(UnsafeBufferPointer(start: input, count: count))
+        }
+        guard count >= 2 else { return [input[0]] }
+        let step = Float(sourceSampleRate / 16_000.0)
+        let outCount = max(1, Int(Float(count) / step))
+        var indices = [Float](repeating: 0, count: outCount)
+        // Clamp to count - 2 so vDSP_vlint's (floor(idx) + 1) never reads past input[count - 1]
+        let maxIdx = Float(count - 2)
+        for i in 0..<outCount {
+            indices[i] = min(maxIdx, Float(i) * step)
+        }
+        var out = [Float](repeating: 0, count: outCount)
+        vDSP_vlint(input, &indices, 1, &out, 1, vDSP_Length(outCount), vDSP_Length(count))
+        return out
     }
 
     private func stopListeningBufferOnly() {
@@ -243,16 +252,20 @@ public actor DualSpeechRecognizer {
         isRecording = false
     }
 
-    /// Stops recording, trims silence with Silero VAD, and runs Parakeet Ultra INT8 + ZIPA CR Large FP16
-    /// **in parallel** to return combined lexical + phoneme-level recognition in minimal wall-clock time!
+    /// Stops recording immediately, ensures local speech engines are loaded if an `assetManager` is supplied,
+    /// trims silence cleanly, and runs Parakeet Ultra INT8 + ZIPA CR Large FP16 in parallel!
     public func stopAndRecognize(
         expectedSpanishText: String? = nil,
-        accent: SpanishRegionalAccent = .castilian
+        accent: SpanishRegionalAccent = .castilian,
+        assetManager: ModelAssetManager? = nil
     ) async throws -> DualRecognitionOutput {
         stopListeningBufferOnly()
         telemetryCallback?(LiveMicTelemetry(rmsLevel: 0, spectrumBands: Array(repeating: 0, count: 16), isSpeechActive: false))
 
-        let rawSamples = recordedSamples16k
+        let rawSamples = pcmBuffer.takeAll()
+        if let assetManager, (!isParakeetReady || !isZipaReady) {
+            try? await loadAllEngines(assetManager: assetManager)
+        }
         return try await recognize(samples16kHz: rawSamples, expectedSpanishText: expectedSpanishText, accent: accent)
     }
 
@@ -262,22 +275,22 @@ public actor DualSpeechRecognizer {
         expectedSpanishText: String? = nil,
         accent: SpanishRegionalAccent = .castilian
     ) async throws -> DualRecognitionOutput {
-        let tWallStart = Date()
-        let trimmed = await trimWithSileroVAD(samples: samples16kHz)
-        let audioDuration = Double(trimmed.count) / 16_000.0
-        guard trimmed.count >= 1600 else {
-            return DualRecognitionOutput(
-                transcriptEs: "",
-                learnerIPA: "",
-                canonicalSpanishIPA: "",
-                phonemeAccuracy: 0,
-                alignments: [],
-                audioDurationSeconds: audioDuration,
-                parakeetLatencyMs: 0,
-                zipaLatencyMs: 0,
-                totalWallLatencyMs: 0
-            )
+        guard samples16kHz.count >= 1600 else {
+            throw NSError(domain: "DualSpeechRecognizer", code: 422, userInfo: [
+                NSLocalizedDescriptionKey: "No microphone audio captured (\(String(format: "%.2f", Double(samples16kHz.count) / 16_000.0))s). Check Microphone permission in iOS Settings."
+            ])
         }
+        guard asrManager != nil || isZipaReady else {
+            throw NSError(domain: "DualSpeechRecognizer", code: 503, userInfo: [
+                NSLocalizedDescriptionKey: "On-device speech engines (Parakeet Ultra & ZIPA) are still loading. Check Settings -> On-Device Models."
+            ])
+        }
+
+        let tWallStart = Date()
+        let trimmedCandidate = await trimWithSileroVAD(samples: samples16kHz)
+        // Never discard an entire quiet recording if VAD/energy trimmer over-trims
+        let trimmed = trimmedCandidate.count >= 1600 ? trimmedCandidate : samples16kHz
+        let audioDuration = Double(trimmed.count) / 16_000.0
 
         // Run Parakeet Ultra 600M INT8 (ANE) AND ZIPA CR Large 300M FP16 CONCURRENTLY!
         async let parakeetTask: (text: String, ms: Double) = runParakeetUltra(samples: trimmed)

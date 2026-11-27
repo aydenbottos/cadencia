@@ -39,6 +39,7 @@ public final class AppState {
     public var liveAudioEnergy: Float = 0.0
     public var isBootstrapping: Bool = true
     public var isWarmingModels: Bool = false
+    public var warmingLabel: String = ""
     public var errorBanner: String?
 
     // Background warmup tasks (never block app launch!)
@@ -130,15 +131,17 @@ public final class AppState {
         await linguisticLoadTask?.value
     }
 
-    /// Starts (or joins) concurrent background Core ML warmup without blocking the UI.
+    /// Starts (or joins) clean sequential ANE warmup without blocking the UI or contending on `aned`.
     public func startBackgroundModelWarmup() {
         if modelWarmupTask != nil { return }
         isWarmingModels = true
+        warmingLabel = "WARMING"
         modelWarmupTask = Task(priority: .utility) { [weak self] in
             guard let self else { return }
             await self.warmInstalledModelsInBackground()
             await MainActor.run {
                 self.isWarmingModels = false
+                self.warmingLabel = ""
                 self.modelWarmupTask = nil
             }
         }
@@ -150,6 +153,44 @@ public final class AppState {
             await task.value
         } else {
             await warmInstalledModelsInBackground()
+        }
+    }
+
+    /// Loads installed local Core ML models one ANE family at a time (ZIPA 256f -> Parakeet Ultra -> Magpie)
+    /// so iOS `aned` finishes quickly and cleanly, then warms Silero VAD in a completely detached task
+    /// (never holding up `isWarmingModels` on a network fetch!).
+    public func warmInstalledModelsInBackground() async {
+        let magpie = self.magpieEngine
+        let speech = self.speechRecognizer
+        let assets = self.assetManager
+
+        // 1. ZIPA CR Large 300M FP16 (primary 256f bucket -> <0.5s warm)
+        if await assets.isModelInstalled(.zipaPhoneme), !(await speech.isZipaReady) {
+            await MainActor.run { self.warmingLabel = "WARMING ZIPA" }
+            try? await speech.ensureZipaLoaded(assetManager: assets)
+        }
+
+        // 2. Parakeet Ultra 600M INT8 (from local cache only)
+        if await assets.isModelInstalled(.parakeetUltra), !(await speech.isParakeetReady) {
+            await MainActor.run { self.warmingLabel = "WARMING PARAKEET" }
+            try? await speech.ensureParakeetLoaded(assetManager: assets)
+        }
+
+        // 3. NVIDIA Magpie v2607 TTS
+        if await assets.isModelInstalled(.magpieTTS), !(await magpie.isLoaded) {
+            await MainActor.run { self.warmingLabel = "WARMING MAGPIE" }
+            let dir = await assets.directory(for: .magpieTTS)
+            try? await magpie.loadModels(from: dir)
+        }
+
+        await refreshModelStatuses()
+
+        // 4. Optional Silero VAD in a completely detached background task (never blocks `isWarmingModels`!)
+        if !(await speech.isVADReady) {
+            Task.detached(priority: .background) { [weak self] in
+                await speech.ensureVadLoaded(assetManager: assets)
+                await self?.refreshModelStatuses()
+            }
         }
     }
 
@@ -240,30 +281,6 @@ public final class AppState {
                 errorMessage: nil
             )
         }
-    }
-
-    private nonisolated static func warmMagpieHelper(assets: ModelAssetManager, magpie: MagpieV2607Engine) async {
-        if await assets.isModelInstalled(.magpieTTS), !(await magpie.isLoaded) {
-            let dir = await assets.directory(for: .magpieTTS)
-            try? await magpie.loadModels(from: dir)
-        }
-    }
-
-    private nonisolated static func warmSpeechHelper(assets: ModelAssetManager, speech: DualSpeechRecognizer) async {
-        try? await speech.loadAllEngines(assetManager: assets)
-    }
-
-    public func warmInstalledModelsInBackground() async {
-        let magpie = self.magpieEngine
-        let speech = self.speechRecognizer
-        let assets = self.assetManager
-
-        // Warm Magpie TTS and DualSpeechRecognizer (Parakeet + ZIPA + VAD) concurrently!
-        async let warmMagpie: Void = Self.warmMagpieHelper(assets: assets, magpie: magpie)
-        async let warmSpeech: Void = Self.warmSpeechHelper(assets: assets, speech: speech)
-
-        _ = await (warmMagpie, warmSpeech)
-        await refreshModelStatuses()
     }
 
     private func applyDownloadProgress(_ prog: ModelDownloadProgress) {

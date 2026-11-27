@@ -919,7 +919,11 @@ private struct SpanishEITRunnerSheet: View {
             statusLine = "Scoring with Parakeet Ultra INT8 + ZIPA CR Large FP16…"
             defer { isScoring = false }
             do {
-                let rec = try await appState.speechRecognizer.stopAndRecognize(expectedSpanishText: prompt.spanish, accent: .castilian)
+                let rec = try await appState.speechRecognizer.stopAndRecognize(
+                    expectedSpanishText: prompt.spanish,
+                    accent: .castilian,
+                    assetManager: appState.assetManager
+                )
                 let itemScore = appState.analyticsEngine.scoreEITResponse(
                     prompt: prompt,
                     learnerTranscript: rec.transcriptEs,
@@ -1158,10 +1162,10 @@ private struct BaselineSpeakingRecorderSheet: View {
                                 Text("TRANSCRIPT (PARAKEET ULTRA INT8)")
                                     .font(CadenciaFont.mono(10, weight: .bold))
                                     .foregroundStyle(CadenciaPalette.mediterraneanJade)
-                                Text(out.transcriptEs)
+                                Text(out.transcriptEs.isEmpty ? "(No Spanish words recognized — speak closer to the mic)" : out.transcriptEs)
                                     .font(CadenciaFont.proseSerif(16))
                                     .foregroundStyle(CadenciaPalette.ivoryText)
-                                Text("IPA (ZIPA 300M FP16): /\(out.learnerIPA)/")
+                                Text("IPA (ZIPA 300M FP16): /\(out.learnerIPA.isEmpty ? "—" : out.learnerIPA)/")
                                     .font(CadenciaFont.mono(11))
                                     .foregroundStyle(CadenciaPalette.bioluminescentCobalt)
                             }
@@ -1202,11 +1206,14 @@ private struct BaselineSpeakingRecorderSheet: View {
         } else {
             timerTask?.cancel()
             isRecording = false
-            status = "Running Parakeet Ultra INT8 + ZIPA CR Large FP16…"
+            status = "Transcribing baseline via Parakeet Ultra INT8 + ZIPA FP16…"
             do {
-                let res = try await appState.speechRecognizer.stopAndRecognize()
+                let res = try await appState.speechRecognizer.stopAndRecognize(assetManager: appState.assetManager)
                 lastOutput = res
-                status = String(format: "Saved baseline (%.0f ms Parakeet · %.0f ms ZIPA)", res.parakeetLatencyMs, res.zipaLatencyMs)
+                status = String(
+                    format: "Saved %.1fs baseline (%.0f ms Parakeet · %.0f ms ZIPA)",
+                    res.audioDurationSeconds, res.parakeetLatencyMs, res.zipaLatencyMs
+                )
                 if let lid = appState.profile?.learnerId {
                     try? await appState.database.appendEvidence(EvidenceEvent(
                         learnerId: lid, eventType: .spokenUtterance, numericValue: res.phonemeAccuracy,

@@ -571,13 +571,14 @@ public actor MagpieV2607Engine {
         let v1URL = modelDir.appendingPathComponent("nanocodec_decoder.mlmodelc")
         let codecURL = FileManager.default.fileExists(atPath: v3URL.path) ? v3URL : v1URL
 
-        // Load all 4 Core ML models concurrently!
-        async let loadedTextEnc = MLModel.load(contentsOf: textEncURL, configuration: aneConfig)
-        async let loadedPrefill = MLModel.load(contentsOf: prefillURL, configuration: aneConfig)
-        async let loadedDecStep = MLModel.load(contentsOf: decStepURL, configuration: aneConfig)
+        // Load CPU NanoCodec concurrently while compiling ANE models one-by-one to prevent iOS `aned` contention!
         async let loadedCodec = MLModel.load(contentsOf: codecURL, configuration: codecConfig)
 
-        // Load tokenizer + local transformer + speaker/audio embeddings while Core ML compiles in parallel
+        let te = try await MLModel.load(contentsOf: textEncURL, configuration: aneConfig)
+        let pf = try await MLModel.load(contentsOf: prefillURL, configuration: aneConfig)
+        let ds = try await MLModel.load(contentsOf: decStepURL, configuration: aneConfig)
+
+        // Load tokenizer + local transformer + speaker/audio embeddings
         let tok = try MagpieSpanishTokenizer(modelDir: modelDir)
         let lt = try MagpieLocalTransformerWeights.load(from: modelDir)
 
@@ -592,7 +593,7 @@ public actor MagpieV2607Engine {
             aEmbs.append(try NpyLoader.loadFloat32(from: modelDir.appendingPathComponent("constants/audio_embedding_\(cb).npy")).data)
         }
 
-        let (te, pf, ds, nc) = try await (loadedTextEnc, loadedPrefill, loadedDecStep, loadedCodec)
+        let nc = try await loadedCodec
         self.textEncoder = te
         self.decoderPrefill = pf
         self.decoderStep = ds

@@ -658,7 +658,8 @@ public final class SessionController {
             // Runs Parakeet Ultra 600M INT8 AND ZIPA CR Large 300M FP16 CONCURRENTLY on Core ML!
             let recognition = try await appState.speechRecognizer.stopAndRecognize(
                 expectedSpanishText: nil,
-                accent: accent
+                accent: accent,
+                assetManager: appState.assetManager
             )
             guard !recognition.transcriptEs.isEmpty else {
                 orbMode = .idle

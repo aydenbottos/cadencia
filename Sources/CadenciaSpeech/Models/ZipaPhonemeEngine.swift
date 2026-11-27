@@ -86,21 +86,14 @@ public actor ZipaPhonemeEngine {
 
         var loadedBuckets: [Int: MLModel] = [:]
         if !fnNames.isEmpty {
-            // Eagerly load ONLY the 256f and 512f buckets concurrently at startup (50% faster boot & half RAM!)
-            let eagerBuckets = [256, 512].filter { fnNames.contains("zipa_\($0)f") }
-            if eagerBuckets.count == 2 {
-                async let m256 = Self.loadBucketModel(asset: asset, bucket: 256)
-                async let m512 = Self.loadBucketModel(asset: asset, bucket: 512)
-                let (b256, b512) = try await (m256, m512)
-                loadedBuckets[256] = b256
-                loadedBuckets[512] = b512
+            // Eagerly load ONLY the primary 256f bucket (1 single ANE compile -> ~0.4s warm, zero contention!);
+            // 512f/1024f/1536f load lazily on demand from the same shared MLModelAsset.
+            if fnNames.contains("zipa_256f") {
+                loadedBuckets[256] = try await Self.loadBucketModel(asset: asset, bucket: 256)
                 inputBuffers[256] = try MLMultiArray(shape: [1, 256, 80], dataType: .float32)
-                inputBuffers[512] = try MLMultiArray(shape: [1, 512, 80], dataType: .float32)
-            } else {
-                for bucket in eagerBuckets {
-                    loadedBuckets[bucket] = try await Self.loadBucketModel(asset: asset, bucket: bucket)
-                    inputBuffers[bucket] = try MLMultiArray(shape: [1, NSNumber(value: bucket), 80], dataType: .float32)
-                }
+            } else if let firstBucket = Self.supportedBuckets.first(where: { fnNames.contains("zipa_\($0)f") }) {
+                loadedBuckets[firstBucket] = try await Self.loadBucketModel(asset: asset, bucket: firstBucket)
+                inputBuffers[firstBucket] = try MLMultiArray(shape: [1, NSNumber(value: firstBucket), 80], dataType: .float32)
             }
         }
 

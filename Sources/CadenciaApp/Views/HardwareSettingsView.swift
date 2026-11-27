@@ -181,7 +181,7 @@ public struct HardwareSettingsView: View {
                 if appState.isWarmingModels {
                     HStack(spacing: 5) {
                         ProgressView().scaleEffect(0.7)
-                        Text("WARMING")
+                        Text(appState.warmingLabel.isEmpty ? "WARMING" : appState.warmingLabel)
                             .font(CadenciaFont.mono(9, weight: .bold))
                             .foregroundStyle(CadenciaPalette.saffronGold)
                     }
