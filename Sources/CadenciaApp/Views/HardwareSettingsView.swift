@@ -301,6 +301,10 @@ public struct HardwareSettingsView: View {
                 Text(err)
                     .font(CadenciaFont.mono(10))
                     .foregroundStyle(CadenciaPalette.crimsonAlert)
+            } else if let note = appState.engineRuntimeNote[kind] {
+                Text(note)
+                    .font(CadenciaFont.mono(10))
+                    .foregroundStyle(note.hasPrefix("Load error") ? CadenciaPalette.crimsonAlert : CadenciaPalette.mediterraneanJade.opacity(0.9))
             }
         }
     }
@@ -387,7 +391,11 @@ public struct HardwareSettingsView: View {
                     Task {
                         isPlayingBenchmarkSample = true
                         defer { isPlayingBenchmarkSample = false }
-                        try? await appState.magpieEngine.play(clip: clip, targetWPM: 120)
+                        do {
+                            try await appState.magpieEngine.play(clip: clip, targetWPM: 120)
+                        } catch {
+                            benchmarkOutput = (benchmarkOutput ?? "") + "\nPlayback error: \(error.localizedDescription)"
+                        }
                     }
                 } label: {
                     Label(isPlayingBenchmarkSample ? "Playing Native 1.0× Sample…" : "Play Native 1.0× Magpie Sample", systemImage: isPlayingBenchmarkSample ? "speaker.wave.3.fill" : "play.circle.fill")

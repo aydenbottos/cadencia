@@ -521,10 +521,11 @@ public actor MagpieV2607Engine {
     private let audioCacheDir: URL
     public private(set) var isLoaded: Bool = false
 
-    // Real-time AVAudioEngine playback with pitch-preserving TimePitch (70–140 WPM)
+    // Real-time AVAudioEngine playback (direct player -> mixer at 1.0x; TimePitch attached only when rate-scaling)
     private var audioEngine: AVAudioEngine?
     private var playerNode: AVAudioPlayerNode?
     private var timePitchNode: AVAudioUnitTimePitch?
+    private var activePlaybackFinish: (@Sendable () -> Void)?
     private var onAudioLevelUpdate: (@Sendable (Float) -> Void)?
 
     public init() {
@@ -576,7 +577,14 @@ public actor MagpieV2607Engine {
 
         let te = try await MLModel.load(contentsOf: textEncURL, configuration: aneConfig)
         let pf = try await MLModel.load(contentsOf: prefillURL, configuration: aneConfig)
-        let ds = try await MLModel.load(contentsOf: decStepURL, configuration: aneConfig)
+        let ds: MLModel
+        do {
+            ds = try await MLModel.load(contentsOf: decStepURL, configuration: aneConfig)
+        } catch {
+            let gpuFallback = MLModelConfiguration()
+            gpuFallback.computeUnits = .cpuAndGPU
+            ds = try await MLModel.load(contentsOf: decStepURL, configuration: gpuFallback)
+        }
 
         // Load tokenizer + local transformer + speaker/audio embeddings
         let tok = try MagpieSpanishTokenizer(modelDir: modelDir)
@@ -976,10 +984,16 @@ public actor MagpieV2607Engine {
         )
     }
 
-    // MARK: - Real-Time Pitch-Preserving Playback (Natural 120 WPM baseline; bypassed at 1.0× for pure PCM)
+    // MARK: - Real-Time Pitch-Preserving Playback (Direct 1.0× PCM or AVAudioUnitTimePitch when rate-scaled)
 
     public func play(clip: SynthesizedAudioClip, targetWPM: Int, baselineNativeWPM: Double = 120.0) async throws {
         stopPlayback()
+        guard !clip.samples.isEmpty else {
+            throw NSError(domain: "MagpieV2607Engine", code: 504, userInfo: [
+                NSLocalizedDescriptionKey: "Synthesized clip contains 0 audio samples."
+            ])
+        }
+
         #if os(iOS)
         // Use .playback + .spokenAudio so iPhone plays full-fidelity speaker audio (NOT .playAndRecord VoIP DSP!)
         let session = AVAudioSession.sharedInstance()
@@ -989,17 +1003,7 @@ public actor MagpieV2607Engine {
 
         let engine = AVAudioEngine()
         let player = AVAudioPlayerNode()
-        let timePitch = AVAudioUnitTimePitch()
-
-        // Clamp rate to [0.78, 1.25] so phase-vocoder time-stretching never introduces robotic artifacts,
-        // and bypass AVAudioUnitTimePitch completely when near native 1.0× speed!
-        let rate = Float(max(0.78, min(1.25, Double(targetWPM) / baselineNativeWPM)))
-        timePitch.rate = rate
-        timePitch.pitch = 0.0
-        timePitch.bypass = abs(rate - 1.0) < 0.04
-
         engine.attach(player)
-        engine.attach(timePitch)
 
         guard let format = AVAudioFormat(standardFormatWithSampleRate: clip.sampleRate, channels: 1),
               let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(clip.samples.count))
@@ -1012,8 +1016,23 @@ public actor MagpieV2607Engine {
             }
         }
 
-        engine.connect(player, to: timePitch, format: format)
-        engine.connect(timePitch, to: engine.mainMixerNode, format: format)
+        // Clamp rate to [0.78, 1.25]. Near 1.0×, connect player DIRECTLY to mainMixerNode without
+        // attaching AVAudioUnitTimePitch (avoids iOS Core Audio silent-bypass bug on 22.05kHz mono!).
+        let rate = Float(max(0.78, min(1.25, Double(targetWPM) / baselineNativeWPM)))
+        let needsTimePitch = abs(rate - 1.0) >= 0.04
+        var attachedTimePitch: AVAudioUnitTimePitch?
+
+        if needsTimePitch {
+            let tp = AVAudioUnitTimePitch()
+            tp.rate = rate
+            tp.pitch = 0.0
+            engine.attach(tp)
+            engine.connect(player, to: tp, format: format)
+            engine.connect(tp, to: engine.mainMixerNode, format: format)
+            attachedTimePitch = tp
+        } else {
+            engine.connect(player, to: engine.mainMixerNode, format: format)
+        }
 
         // Tap main mixer at 60Hz for live Metal Resonance Orb audio reactivity!
         let levelCallback = self.onAudioLevelUpdate
@@ -1024,33 +1043,54 @@ public actor MagpieV2607Engine {
             levelCallback?(min(1.0, rms * 4.5))
         }
 
+        engine.prepare()
         try engine.start()
         self.audioEngine = engine
         self.playerNode = player
-        self.timePitchNode = timePitch
+        self.timePitchNode = attachedTimePitch
+
+        final class OnceFlag: @unchecked Sendable {
+            private let lock = NSLock()
+            private var fired = false
+            func fire(_ body: () -> Void) {
+                lock.lock()
+                defer { lock.unlock() }
+                guard !fired else { return }
+                fired = true
+                body()
+            }
+        }
 
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-            player.scheduleBuffer(buffer, at: nil, options: []) {
-                cont.resume()
+            let once = OnceFlag()
+            let finish: @Sendable () -> Void = {
+                once.fire { cont.resume() }
+            }
+            self.activePlaybackFinish = finish
+            player.scheduleBuffer(buffer, at: nil, options: [], completionCallbackType: .dataPlayedBack) { _ in
+                finish()
             }
             player.play()
         }
+        self.activePlaybackFinish = nil
         onAudioLevelUpdate?(0.0)
     }
 
     public func updatePlaybackRate(targetWPM: Int, baselineNativeWPM: Double = 120.0) {
         let rate = Float(max(0.78, min(1.25, Double(targetWPM) / baselineNativeWPM)))
         timePitchNode?.rate = rate
-        timePitchNode?.bypass = abs(rate - 1.0) < 0.04
     }
 
     public func stopPlayback() {
+        let finish = activePlaybackFinish
+        activePlaybackFinish = nil
         playerNode?.stop()
         audioEngine?.mainMixerNode.removeTap(onBus: 0)
         audioEngine?.stop()
         audioEngine = nil
         playerNode = nil
         timePitchNode = nil
+        finish?()
         onAudioLevelUpdate?(0.0)
     }
 

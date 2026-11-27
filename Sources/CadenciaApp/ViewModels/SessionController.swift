@@ -364,6 +364,7 @@ public final class SessionController {
     }
 
     private func synthesizeAndOptionallyPlay(passage: GeneratedPassage, autoPlay: Bool) async {
+        try? await appState.ensureMagpieLoaded()
         guard await appState.magpieEngine.isLoaded else { return }
         do {
             let clip = try await appState.magpieEngine.synthesizePassage(

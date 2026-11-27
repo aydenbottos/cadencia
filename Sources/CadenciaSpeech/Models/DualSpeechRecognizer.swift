@@ -42,6 +42,7 @@ public struct DualRecognitionOutput: Sendable {
     public let parakeetLatencyMs: Double
     public let zipaLatencyMs: Double
     public let totalWallLatencyMs: Double
+    public let diagnostics: String?
 
     public init(
         transcriptEs: String,
@@ -52,7 +53,8 @@ public struct DualRecognitionOutput: Sendable {
         audioDurationSeconds: Double,
         parakeetLatencyMs: Double,
         zipaLatencyMs: Double,
-        totalWallLatencyMs: Double
+        totalWallLatencyMs: Double,
+        diagnostics: String? = nil
     ) {
         self.transcriptEs = transcriptEs
         self.learnerIPA = learnerIPA
@@ -63,6 +65,7 @@ public struct DualRecognitionOutput: Sendable {
         self.parakeetLatencyMs = parakeetLatencyMs
         self.zipaLatencyMs = zipaLatencyMs
         self.totalWallLatencyMs = totalWallLatencyMs
+        self.diagnostics = diagnostics
     }
 }
 
@@ -150,22 +153,21 @@ public actor DualSpeechRecognizer {
         }
     }
 
-    /// Ensures core local speech engines (ZIPA + Parakeet Ultra INT8) are warm in memory,
-    /// loading one ANE model family at a time so iOS `aned` never stalls or deadlocks.
-    /// Does NOT block on Silero VAD network download (energy-based fallback is instant & always available).
+    /// Ensures core local speech engines (Parakeet Ultra INT8 on ANE + ZIPA CR Large FP16 on Metal GPU)
+    /// are warm in memory, loading Parakeet first so ANE & GPU never contend.
     public func loadAllEngines(
         assetManager: ModelAssetManager,
         parakeetModels: AsrModels? = nil
     ) async throws {
-        // 1. ZIPA CR Large 300M FP16 (primary 256f bucket loads first in <0.5s!)
-        try? await ensureZipaLoaded(assetManager: assetManager)
-
-        // 2. Parakeet Ultra 600M INT8
+        // 1. Parakeet Ultra 600M INT8 (ANE)
         if let provided = parakeetModels {
             try await attachParakeetModels(provided)
         } else {
             try? await ensureParakeetLoaded(assetManager: assetManager)
         }
+
+        // 2. ZIPA CR Large 300M FP16 (Metal GPU)
+        try? await ensureZipaLoaded(assetManager: assetManager)
     }
 
     // MARK: - Live Microphone Capture (Direct Lock-Protected vDSP 16kHz Mono Resampler)
@@ -292,11 +294,16 @@ public actor DualSpeechRecognizer {
         let trimmed = trimmedCandidate.count >= 1600 ? trimmedCandidate : samples16kHz
         let audioDuration = Double(trimmed.count) / 16_000.0
 
-        // Run Parakeet Ultra 600M INT8 (ANE) AND ZIPA CR Large 300M FP16 CONCURRENTLY!
-        async let parakeetTask: (text: String, ms: Double) = runParakeetUltra(samples: trimmed)
-        async let zipaTask: (ipa: String, ms: Double) = runZipaPhonemes(samples: trimmed)
+        // Run Parakeet Ultra 600M INT8 (ANE) AND ZIPA CR Large 300M FP16 (Metal GPU) CONCURRENTLY!
+        async let parakeetTask = runParakeetUltra(samples: trimmed)
+        async let zipaTask = runZipaPhonemes(samples: trimmed)
 
         let (parakeetRes, zipaRes) = await (parakeetTask, zipaTask)
+
+        var diagParts: [String] = []
+        if let pe = parakeetRes.error { diagParts.append("Parakeet: \(pe)") }
+        if let ze = zipaRes.error { diagParts.append("ZIPA: \(ze)") }
+        let diagnostics = diagParts.isEmpty ? nil : diagParts.joined(separator: " | ")
 
         // Compute canonical expected Spanish IPA (either from known target prompt or Parakeet's recognized Spanish words)
         let referenceText = (expectedSpanishText?.isEmpty == false ? expectedSpanishText! : parakeetRes.text)
@@ -313,7 +320,8 @@ public actor DualSpeechRecognizer {
             audioDurationSeconds: audioDuration,
             parakeetLatencyMs: parakeetRes.ms,
             zipaLatencyMs: zipaRes.ms,
-            totalWallLatencyMs: totalWallMs
+            totalWallLatencyMs: totalWallMs,
+            diagnostics: diagnostics
         )
     }
 
@@ -332,25 +340,25 @@ public actor DualSpeechRecognizer {
 
     // MARK: - Private Engine Calls
 
-    private func runParakeetUltra(samples: [Float]) async -> (text: String, ms: Double) {
-        guard let mgr = asrManager else { return ("", 0) }
+    private func runParakeetUltra(samples: [Float]) async -> (text: String, ms: Double, error: String?) {
+        guard let mgr = asrManager else { return ("", 0, "not loaded") }
         let t0 = Date()
         do {
             var state = TdtDecoderState.make(decoderLayers: await mgr.decoderLayerCount)
             let result = try await mgr.transcribe(samples, decoderState: &state, language: .spanish)
-            return (result.text.trimmingCharacters(in: .whitespacesAndNewlines), Date().timeIntervalSince(t0) * 1000.0)
+            return (result.text.trimmingCharacters(in: .whitespacesAndNewlines), Date().timeIntervalSince(t0) * 1000.0, nil)
         } catch {
-            return ("", Date().timeIntervalSince(t0) * 1000.0)
+            return ("", Date().timeIntervalSince(t0) * 1000.0, error.localizedDescription)
         }
     }
 
-    private func runZipaPhonemes(samples: [Float]) async -> (ipa: String, ms: Double) {
-        guard isZipaReady else { return ("", 0) }
+    private func runZipaPhonemes(samples: [Float]) async -> (ipa: String, ms: Double, error: String?) {
+        guard isZipaReady else { return ("", 0, "not loaded") }
         do {
             let res = try await zipaEngine.recognizePhonemes(samples16kHz: samples)
-            return (res.ipaString, res.totalLatencyMs)
+            return (res.ipaString, res.totalLatencyMs, nil)
         } catch {
-            return ("", 0)
+            return ("", 0, error.localizedDescription)
         }
     }
 

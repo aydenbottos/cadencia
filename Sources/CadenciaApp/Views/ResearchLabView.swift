@@ -895,9 +895,10 @@ private struct SpanishEITRunnerSheet: View {
         isPlaying = true
         statusLine = "Playing sentence via Magpie v2607…"
         defer { isPlaying = false; hasPlayedCurrent = true }
+        try? await appState.ensureMagpieLoaded()
         if await appState.magpieEngine.isLoaded,
            let clip = try? await appState.magpieEngine.synthesizeSentence(text: prompt.spanish, voice: .sofia, accent: .castilian) {
-            try? await appState.magpieEngine.play(clip: clip, targetWPM: 130)
+            try? await appState.magpieEngine.play(clip: clip, targetWPM: 120)
             statusLine = "Now tap Repeat Aloud and say the exact sentence."
         } else {
             statusLine = "Magpie not installed — read once & repeat: «\(prompt.spanish)»"
@@ -1168,6 +1169,11 @@ private struct BaselineSpeakingRecorderSheet: View {
                                 Text("IPA (ZIPA 300M FP16): /\(out.learnerIPA.isEmpty ? "—" : out.learnerIPA)/")
                                     .font(CadenciaFont.mono(11))
                                     .foregroundStyle(CadenciaPalette.bioluminescentCobalt)
+                                if let diag = out.diagnostics {
+                                    Text(diag)
+                                        .font(CadenciaFont.mono(10))
+                                        .foregroundStyle(CadenciaPalette.crimsonAlert)
+                                }
                             }
                             .padding(14)
                             .frame(maxWidth: .infinity, alignment: .leading)

@@ -99,7 +99,8 @@ public actor ZipaPhonemeEngine {
 
         if loadedBuckets.isEmpty {
             let cfg = MLModelConfiguration()
-            cfg.computeUnits = .all
+            cfg.computeUnits = .cpuAndGPU
+            cfg.allowLowPrecisionAccumulationOnGPU = true
             self.fallbackSingleModel = try await MLModel.load(contentsOf: compiledURL, configuration: cfg)
         } else {
             self.bucketModels = loadedBuckets
@@ -110,7 +111,10 @@ public actor ZipaPhonemeEngine {
 
     private static func loadBucketModel(asset: MLModelAsset, bucket: Int) async throws -> MLModel {
         let cfg = MLModelConfiguration()
-        cfg.computeUnits = .all // Allows ANE + GPU concurrent with Parakeet on ANE
+        // 7,344-op Zipformer compiles in <1s on Metal FP16 GPU (avoiding multi-minute ANECCompile stalls!)
+        // AND executes truly in parallel on GPU while Parakeet Ultra 600M INT8 runs on ANE!
+        cfg.computeUnits = .cpuAndGPU
+        cfg.allowLowPrecisionAccumulationOnGPU = true
         cfg.functionName = "zipa_\(bucket)f"
         return try await MLModel.load(asset: asset, configuration: cfg)
     }

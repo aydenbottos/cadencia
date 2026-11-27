@@ -36,6 +36,7 @@ public final class AppState {
     // Hardware & Model readiness
     public var hasOpenAIKey: Bool = false
     public var modelStatus: [ManagedModelKind: ModelDownloadProgress] = [:]
+    public var engineRuntimeNote: [ManagedModelKind: String] = [:]
     public var liveAudioEnergy: Float = 0.0
     public var isBootstrapping: Bool = true
     public var isWarmingModels: Bool = false
@@ -156,31 +157,77 @@ public final class AppState {
         }
     }
 
-    /// Loads installed local Core ML models one ANE family at a time (ZIPA 256f -> Parakeet Ultra -> Magpie)
-    /// so iOS `aned` finishes quickly and cleanly, then warms Silero VAD in a completely detached task
-    /// (never holding up `isWarmingModels` on a network fetch!).
+    /// On-demand loader for Magpie TTS so playback in Memory Ledger, Research Lab, or Sessions
+    /// never silently skips audio if background warmup hasn't finished yet.
+    public func ensureMagpieLoaded() async throws {
+        if await magpieEngine.isLoaded { return }
+        guard await assetManager.isModelInstalled(.magpieTTS) else {
+            throw NSError(domain: "MagpieV2607Engine", code: 503, userInfo: [
+                NSLocalizedDescriptionKey: "NVIDIA Magpie v2607 is not installed yet. Install it in Settings."
+            ])
+        }
+        let dir = await assetManager.directory(for: .magpieTTS)
+        let t0 = Date()
+        try await magpieEngine.loadModels(from: dir)
+        let ms = Int(Date().timeIntervalSince(t0) * 1000)
+        engineRuntimeNote[.magpieTTS] = "Loaded on ANE + CPU NanoCodec · \(ms) ms"
+    }
+
+    /// Loads installed local Core ML models in fastest-first order (Magpie -> Parakeet ANE -> ZIPA Metal GPU)
+    /// recording exact per-model load latencies or errors in `engineRuntimeNote` (never silently swallowed!),
+    /// then warms optional Silero VAD in a completely detached background task.
     public func warmInstalledModelsInBackground() async {
         let magpie = self.magpieEngine
         let speech = self.speechRecognizer
         let assets = self.assetManager
 
-        // 1. ZIPA CR Large 300M FP16 (primary 256f bucket -> <0.5s warm)
-        if await assets.isModelInstalled(.zipaPhoneme), !(await speech.isZipaReady) {
-            await MainActor.run { self.warmingLabel = "WARMING ZIPA" }
-            try? await speech.ensureZipaLoaded(assetManager: assets)
-        }
-
-        // 2. Parakeet Ultra 600M INT8 (from local cache only)
-        if await assets.isModelInstalled(.parakeetUltra), !(await speech.isParakeetReady) {
-            await MainActor.run { self.warmingLabel = "WARMING PARAKEET" }
-            try? await speech.ensureParakeetLoaded(assetManager: assets)
-        }
-
-        // 3. NVIDIA Magpie v2607 TTS
+        // 1. NVIDIA Magpie v2607 TTS (ANE + CPU FP32 NanoCodec) — first so tutor voice is ready immediately!
         if await assets.isModelInstalled(.magpieTTS), !(await magpie.isLoaded) {
-            await MainActor.run { self.warmingLabel = "WARMING MAGPIE" }
+            await MainActor.run {
+                self.warmingLabel = "WARMING MAGPIE"
+                self.engineRuntimeNote[.magpieTTS] = "Loading on ANE + CPU…"
+            }
             let dir = await assets.directory(for: .magpieTTS)
-            try? await magpie.loadModels(from: dir)
+            let t0 = Date()
+            do {
+                try await magpie.loadModels(from: dir)
+                let ms = Int(Date().timeIntervalSince(t0) * 1000)
+                await MainActor.run { self.engineRuntimeNote[.magpieTTS] = "Loaded on ANE + FP32 NanoCodec · \(ms) ms" }
+            } catch {
+                await MainActor.run { self.engineRuntimeNote[.magpieTTS] = "Load error: \(error.localizedDescription)" }
+            }
+        }
+
+        // 2. Parakeet Ultra 600M INT8 (ANE)
+        if await assets.isModelInstalled(.parakeetUltra), !(await speech.isParakeetReady) {
+            await MainActor.run {
+                self.warmingLabel = "WARMING PARAKEET"
+                self.engineRuntimeNote[.parakeetUltra] = "Loading INT8 on ANE…"
+            }
+            let t0 = Date()
+            do {
+                try await speech.ensureParakeetLoaded(assetManager: assets)
+                let ms = Int(Date().timeIntervalSince(t0) * 1000)
+                await MainActor.run { self.engineRuntimeNote[.parakeetUltra] = "Loaded INT8 on ANE · \(ms) ms" }
+            } catch {
+                await MainActor.run { self.engineRuntimeNote[.parakeetUltra] = "Load error: \(error.localizedDescription)" }
+            }
+        }
+
+        // 3. ZIPA CR Large 300M FP16 (Metal GPU — avoids 7,344-op ANE compiler stalls & runs parallel with Parakeet!)
+        if await assets.isModelInstalled(.zipaPhoneme), !(await speech.isZipaReady) {
+            await MainActor.run {
+                self.warmingLabel = "WARMING ZIPA"
+                self.engineRuntimeNote[.zipaPhoneme] = "Loading FP16 on Metal GPU…"
+            }
+            let t0 = Date()
+            do {
+                try await speech.ensureZipaLoaded(assetManager: assets)
+                let ms = Int(Date().timeIntervalSince(t0) * 1000)
+                await MainActor.run { self.engineRuntimeNote[.zipaPhoneme] = "Loaded FP16 on Metal GPU · \(ms) ms" }
+            } catch {
+                await MainActor.run { self.engineRuntimeNote[.zipaPhoneme] = "Load error: \(error.localizedDescription)" }
+            }
         }
 
         await refreshModelStatuses()

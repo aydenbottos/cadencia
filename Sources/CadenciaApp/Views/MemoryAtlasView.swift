@@ -350,9 +350,9 @@ private struct ItemForgettingDetailSheet: View {
                             Spacer()
                             Button {
                                 Task {
-                                    guard await appState.magpieEngine.isLoaded else { return }
                                     isSpeaking = true
                                     defer { isSpeaking = false }
+                                    try? await appState.ensureMagpieLoaded()
                                     if let clip = try? await appState.magpieEngine.synthesizeSentence(
                                         text: item.spanish, voice: .sofia, accent: .castilian
                                     ) {
