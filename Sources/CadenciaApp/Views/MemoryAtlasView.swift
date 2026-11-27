@@ -130,7 +130,7 @@ public struct MemoryAtlasView: View {
                     }
                     .padding(.horizontal, 12)
                     .padding(.vertical, 7)
-                    .cadenciaGlassPill()
+                    .cadenciaGlassPill(interactive: false)
                 }
                 .padding(14)
             }
@@ -194,11 +194,14 @@ public struct MemoryAtlasView: View {
                             .padding(.top, 40)
                     } else {
                         ForEach(results.prefix(250)) { item in
-                            itemRow(item)
-                                .onTapGesture {
-                                    selectedItem = item
-                                    HapticDirector.shared.playGlossTap()
-                                }
+                            Button {
+                                selectedItem = item
+                                HapticDirector.shared.playGlossTap()
+                            } label: {
+                                itemRow(item)
+                                    .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                            }
+                            .buttonStyle(.plain)
                         }
                         if results.count > 250 {
                             Text("Showing first 250 of \(results.count) matching items — refine search to inspect any item.")
@@ -209,7 +212,7 @@ public struct MemoryAtlasView: View {
                     }
                 }
                 .padding(.horizontal, 16)
-                .padding(.bottom, 110)
+                .padding(.bottom, 24)
             }
         }
         .sheet(item: $selectedItem) { item in

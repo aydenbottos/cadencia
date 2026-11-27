@@ -77,7 +77,27 @@ public actor CadenciaDatabase {
 
     // MARK: - Schema & Append-Only Triggers
 
+    private static let currentSchemaVersion: Int32 = 1
+
+    private static func readUserVersion(db: OpaquePointer) -> Int32 {
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "PRAGMA user_version;", -1, &stmt, nil) == SQLITE_OK,
+              let stmt
+        else { return 0 }
+        defer { sqlite3_finalize(stmt) }
+        return sqlite3_step(stmt) == SQLITE_ROW ? sqlite3_column_int(stmt, 0) : 0
+    }
+
     private static func bootstrapSchema(db: OpaquePointer) throws {
+        // Fast path on every launch after first initialization (<0.1ms):
+        // schema, WAL mode, indexes, and append-only triggers already exist on disk.
+        if readUserVersion(db: db) >= currentSchemaVersion {
+            var errMsg: UnsafeMutablePointer<CChar>?
+            _ = sqlite3_exec(db, "PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL;", nil, nil, &errMsg)
+            if let errMsg { sqlite3_free(errMsg) }
+            return
+        }
+
         let sql = """
         PRAGMA journal_mode = WAL;
         PRAGMA foreign_keys = ON;
@@ -258,6 +278,8 @@ public actor CadenciaDatabase {
         BEGIN
             SELECT RAISE(ABORT, 'evidence_events is strictly append-only: DELETE forbidden');
         END;
+
+        PRAGMA user_version = 1;
         """
         var errMsg: UnsafeMutablePointer<CChar>?
         if sqlite3_exec(db, sql, nil, nil, &errMsg) != SQLITE_OK {

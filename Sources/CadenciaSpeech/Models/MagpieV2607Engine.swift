@@ -307,6 +307,7 @@ struct MagpieLocalTransformerWeights: Sendable {
 
 struct MagpieSpanishTokenizer: Sendable {
     private let spanishOffset = 96
+    private let bosTokenId: Int32 = 2360
     private let eosTokenId: Int32 = 2361
     private let token2Id: [String: Int32]
     private let phonemeDict: [String: [String]]
@@ -317,18 +318,23 @@ struct MagpieSpanishTokenizer: Sendable {
         let t2iData = try Data(contentsOf: tok2IdURL)
         self.token2Id = try JSONDecoder().decode([String: Int32].self, from: t2iData)
 
-        if let dData = try? Data(contentsOf: dictURL),
-           let raw = try? JSONSerialization.jsonObject(with: dData) as? [String: Any] {
-            var parsed: [String: [String]] = [:]
-            parsed.reserveCapacity(raw.count)
-            for (k, v) in raw {
-                if let arr = v as? [String] {
-                    parsed[k.uppercased()] = arr
-                } else if let nested = v as? [[String]], let first = nested.first {
-                    parsed[k.uppercased()] = first
+        if let dData = try? Data(contentsOf: dictURL) {
+            if let direct = try? JSONDecoder().decode([String: [String]].self, from: dData) {
+                self.phonemeDict = direct
+            } else if let raw = try? JSONSerialization.jsonObject(with: dData) as? [String: Any] {
+                var parsed: [String: [String]] = [:]
+                parsed.reserveCapacity(raw.count)
+                for (k, v) in raw {
+                    if let arr = v as? [String] {
+                        parsed[k.uppercased()] = arr
+                    } else if let nested = v as? [[String]], let first = nested.first {
+                        parsed[k.uppercased()] = first
+                    }
                 }
+                self.phonemeDict = parsed
+            } else {
+                self.phonemeDict = [:]
             }
-            self.phonemeDict = parsed
         } else {
             self.phonemeDict = [:]
         }
@@ -341,7 +347,9 @@ struct MagpieSpanishTokenizer: Sendable {
     /// Also respects explicit inline `| ... |` IPA spans!
     func tokenize(text: String, accent: SpanishRegionalAccent) -> [Int32] {
         var ids: [Int32] = []
+        ids.reserveCapacity(128)
         let spaceId = (token2Id[" "] ?? 100) + Int32(spanishOffset)
+        ids.append(bosTokenId)
         ids.append(spaceId) // Spanish tokenizer uses pad_with_space = true
 
         // Split on inline | ... | IPA overrides
@@ -525,10 +533,13 @@ public actor MagpieV2607Engine {
         self.onAudioLevelUpdate = handler
     }
 
-    /// Loads all 4 compiled Magpie Core ML models with optimal Apple Silicon compute placement
-    /// (verified via FluidInference/mobius PERF.md: text_encoder/prefill/decoder_step -> ANE on iOS 26+,
-    /// NanoCodec v3 -> CPU+ANE), plus caches unconditional prefill KV tensors once.
+    /// Loads all 4 compiled Magpie Core ML models concurrently with optimal Apple Silicon compute placement
+    /// (verified via FluidInference/mobius SWIFT_PORT_FINDINGS.md & PERF.md:
+    ///  text_encoder & decoder_prefill -> ANE, decoder_step -> GPU+CPU avoiding per-step ANE scatter recompile,
+    ///  NanoCodec v3 -> CPU avoiding FP16 audio drift), plus caches unconditional prefill KV tensors once.
     public func loadModels(from modelDir: URL) async throws {
+        if isLoaded { return }
+
         // Parse constants.json to auto-detect frame_stacking_factor (1 or v2607 factor 2)
         let constURL = modelDir.appendingPathComponent("constants/constants.json")
         if let cData = try? Data(contentsOf: constURL),
@@ -540,61 +551,118 @@ public actor MagpieV2607Engine {
         let aneConfig = MLModelConfiguration()
         aneConfig.computeUnits = .cpuAndNeuralEngine
 
-        let allConfig = MLModelConfiguration()
-        allConfig.computeUnits = .all
+        let gpuConfig = MLModelConfiguration()
+        gpuConfig.computeUnits = .cpuAndGPU // SWIFT_PORT_FINDINGS: avoids ANECCompile() failure on incrementing KV scatter
 
-        self.textEncoder = try MLModel(contentsOf: modelDir.appendingPathComponent("text_encoder.mlmodelc"), configuration: aneConfig)
-        self.decoderPrefill = try MLModel(contentsOf: modelDir.appendingPathComponent("decoder_prefill.mlmodelc"), configuration: aneConfig)
-        self.decoderStep = try MLModel(contentsOf: modelDir.appendingPathComponent("decoder_step.mlmodelc"), configuration: allConfig)
+        let codecConfig = MLModelConfiguration()
+        codecConfig.computeUnits = .cpuOnly // PERF.md: NanoCodec v3 runs cleanly without fp16 audio drift
 
+        let textEncURL = modelDir.appendingPathComponent("text_encoder.mlmodelc")
+        let prefillURL = modelDir.appendingPathComponent("decoder_prefill.mlmodelc")
+        let decStepURL = modelDir.appendingPathComponent("decoder_step.mlmodelc")
         let v3URL = modelDir.appendingPathComponent("nanocodec_decoder_v3.mlmodelc")
         let v1URL = modelDir.appendingPathComponent("nanocodec_decoder.mlmodelc")
         let codecURL = FileManager.default.fileExists(atPath: v3URL.path) ? v3URL : v1URL
-        let codecConfig = MLModelConfiguration()
-        codecConfig.computeUnits = .cpuOnly // PERF.md: NanoCodec v3 runs cleanly without fp16 audio drift
-        let loadedCodec = try MLModel(contentsOf: codecURL, configuration: codecConfig)
-        self.nanoCodec = loadedCodec
-        if let shape = loadedCodec.modelDescription.inputDescriptionsByName["tokens"]?.multiArrayConstraint?.shape,
+
+        // Load all 4 Core ML models concurrently!
+        async let loadedTextEnc = MLModel.load(contentsOf: textEncURL, configuration: aneConfig)
+        async let loadedPrefill = MLModel.load(contentsOf: prefillURL, configuration: aneConfig)
+        async let loadedDecStep = MLModel.load(contentsOf: decStepURL, configuration: gpuConfig)
+        async let loadedCodec = MLModel.load(contentsOf: codecURL, configuration: codecConfig)
+
+        // Load tokenizer + local transformer + speaker/audio embeddings while Core ML compiles in parallel
+        let tok = try MagpieSpanishTokenizer(modelDir: modelDir)
+        let lt = try MagpieLocalTransformerWeights.load(from: modelDir)
+
+        var spks: [[Float]] = []
+        spks.reserveCapacity(5)
+        for s in 0..<5 {
+            spks.append(try NpyLoader.loadFloat32(from: modelDir.appendingPathComponent("constants/speaker_\(s).npy")).data)
+        }
+        var aEmbs: [[Float]] = []
+        aEmbs.reserveCapacity(8)
+        for cb in 0..<8 {
+            aEmbs.append(try NpyLoader.loadFloat32(from: modelDir.appendingPathComponent("constants/audio_embedding_\(cb).npy")).data)
+        }
+
+        let (te, pf, ds, nc) = try await (loadedTextEnc, loadedPrefill, loadedDecStep, loadedCodec)
+        self.textEncoder = te
+        self.decoderPrefill = pf
+        self.decoderStep = ds
+        self.nanoCodec = nc
+        if let shape = nc.modelDescription.inputDescriptionsByName["tokens"]?.multiArrayConstraint?.shape,
            let last = shape.last?.intValue {
             self.nanoCodecFrames = last
         }
 
-        self.tokenizer = try MagpieSpanishTokenizer(modelDir: modelDir)
-        self.localTransformer = try MagpieLocalTransformerWeights.load(from: modelDir)
-
-        var spks: [[Float]] = []
-        for s in 0..<5 {
-            spks.append(try NpyLoader.loadFloat32(from: modelDir.appendingPathComponent("constants/speaker_\(s).npy")).data)
-        }
+        self.tokenizer = tok
+        self.localTransformer = lt
         self.speakerEmbeddings = spks
-
-        var aEmbs: [[Float]] = []
-        for cb in 0..<8 {
-            aEmbs.append(try NpyLoader.loadFloat32(from: modelDir.appendingPathComponent("constants/audio_embedding_\(cb).npy")).data)
-        }
         self.audioEmbeddings = aEmbs
 
         // Precompute unconditional CFG prefill KV state once!
-        try precomputeUnconditionalPrefill()
+        try await precomputeUnconditionalPrefill()
         self.isLoaded = true
     }
 
-    private func precomputeUnconditionalPrefill() throws {
+    private func prefillEmbedInputName(for model: MLModel) -> String {
+        if model.modelDescription.inputDescriptionsByName["audio_embed"] != nil {
+            return "audio_embed"
+        }
+        return "input"
+    }
+
+    private func inputDataType(for model: MLModel, featureName: String, defaultType: MLMultiArrayDataType) -> MLMultiArrayDataType {
+        model.modelDescription.inputDescriptionsByName[featureName]?.multiArrayConstraint?.dataType ?? defaultType
+    }
+
+    private func makeMaskArray(length: Int, validCount: Int, dataType: MLMultiArrayDataType) throws -> MLMultiArray {
+        let arr = try MLMultiArray(shape: [1, NSNumber(value: length)], dataType: dataType)
+        if dataType == .float32 {
+            let ptr = arr.dataPointer.bindMemory(to: Float.self, capacity: length)
+            for i in 0..<length { ptr[i] = i < validCount ? 1.0 : 0.0 }
+        } else {
+            let ptr = arr.dataPointer.bindMemory(to: Float16.self, capacity: length)
+            for i in 0..<length { ptr[i] = i < validCount ? 1.0 : 0.0 }
+        }
+        return arr
+    }
+
+    private func convertMultiArray(_ src: MLMultiArray, to targetType: MLMultiArrayDataType) throws -> MLMultiArray {
+        if src.dataType == targetType { return src }
+        let dst = try MLMultiArray(shape: src.shape, dataType: targetType)
+        let count = src.count
+        if src.dataType == .float32 && targetType == .float16 {
+            let s = src.dataPointer.bindMemory(to: Float.self, capacity: count)
+            let d = dst.dataPointer.bindMemory(to: Float16.self, capacity: count)
+            for i in 0..<count { d[i] = Float16(s[i]) }
+        } else if src.dataType == .float16 && targetType == .float32 {
+            let s = src.dataPointer.bindMemory(to: Float16.self, capacity: count)
+            let d = dst.dataPointer.bindMemory(to: Float.self, capacity: count)
+            for i in 0..<count { d[i] = Float(s[i]) }
+        }
+        return dst
+    }
+
+    private func precomputeUnconditionalPrefill() async throws {
         guard let prefill = decoderPrefill else { return }
-        let zeroCtx = try MLMultiArray(shape: [1, 110, 768], dataType: .float16)
-        let zeroEnc = try MLMultiArray(shape: [1, 256, 768], dataType: .float16)
-        let uncondMask = try MLMultiArray(shape: [1, 256], dataType: .float16)
-        memset(zeroCtx.dataPointer, 0, zeroCtx.count * MemoryLayout<Float16>.stride)
-        memset(zeroEnc.dataPointer, 0, zeroEnc.count * MemoryLayout<Float16>.stride)
-        memset(uncondMask.dataPointer, 0, uncondMask.count * MemoryLayout<Float16>.stride)
-        uncondMask[0] = 1.0
+        let embedKey = prefillEmbedInputName(for: prefill)
+        let embedType = inputDataType(for: prefill, featureName: embedKey, defaultType: .float16)
+        let encType = inputDataType(for: prefill, featureName: "encoder_output", defaultType: .float16)
+        let maskType = inputDataType(for: prefill, featureName: "encoder_mask", defaultType: .float32)
+
+        let zeroCtx = try MLMultiArray(shape: [1, 110, 768], dataType: embedType)
+        let zeroEnc = try MLMultiArray(shape: [1, 256, 768], dataType: encType)
+        memset(zeroCtx.dataPointer, 0, zeroCtx.count * (embedType == .float16 ? 2 : 4))
+        memset(zeroEnc.dataPointer, 0, zeroEnc.count * (encType == .float16 ? 2 : 4))
+        let uncondMask = try makeMaskArray(length: Self.maxTextLen, validCount: 1, dataType: maskType)
 
         let provider = try MLDictionaryFeatureProvider(dictionary: [
-            "input": MLFeatureValue(multiArray: zeroCtx),
+            embedKey: MLFeatureValue(multiArray: zeroCtx),
             "encoder_output": MLFeatureValue(multiArray: zeroEnc),
             "encoder_mask": MLFeatureValue(multiArray: uncondMask),
         ])
-        let out = try prefill.prediction(from: provider)
+        let out = try await prefill.prediction(from: provider)
         let (ks, vs) = try splitPrefillKV(out)
         self.cachedUncondK = ks
         self.cachedUncondV = vs
@@ -690,51 +758,66 @@ public actor MagpieV2607Engine {
         let tokenIds = tok.tokenize(text: trimmed, accent: accent)
         let tLen = min(tokenIds.count, Self.maxTextLen)
 
-        // 1. Run text_encoder on ANE
+        // 1. Run text_encoder on ANE (text_mask is Float32 per Core ML modelDescription!)
         let tokensArr = try MLMultiArray(shape: [1, NSNumber(value: Self.maxTextLen)], dataType: .int32)
-        let maskArr = try MLMultiArray(shape: [1, NSNumber(value: Self.maxTextLen)], dataType: .float16)
-        let maskBoolArr = try MLMultiArray(shape: [1, NSNumber(value: Self.maxTextLen)], dataType: .float16)
         let tPtr = tokensArr.dataPointer.bindMemory(to: Int32.self, capacity: Self.maxTextLen)
-        let mPtr = maskArr.dataPointer.bindMemory(to: Float16.self, capacity: Self.maxTextLen)
-        let mbPtr = maskBoolArr.dataPointer.bindMemory(to: Float16.self, capacity: Self.maxTextLen)
         for i in 0..<Self.maxTextLen {
             tPtr[i] = i < tLen ? tokenIds[i] : 0
-            mPtr[i] = i < tLen ? 1.0 : 0.0
-            mbPtr[i] = i < tLen ? 1.0 : 0.0
         }
+        let textMaskType = inputDataType(for: textEnc, featureName: "text_mask", defaultType: .float32)
+        let textMaskArr = try makeMaskArray(length: Self.maxTextLen, validCount: tLen, dataType: textMaskType)
 
         let encOut = try await textEnc.prediction(from: MLDictionaryFeatureProvider(dictionary: [
             "text_tokens": MLFeatureValue(multiArray: tokensArr),
-            "text_mask": MLFeatureValue(multiArray: maskArr),
+            "text_mask": MLFeatureValue(multiArray: textMaskArr),
         ]))
-        guard let encoderOutput = encOut.featureValue(for: "encoder_output")?.multiArrayValue else {
+        guard let rawEncoderOutput = encOut.featureValue(for: "encoder_output")?.multiArrayValue else {
             throw NSError(domain: "MagpieV2607Engine", code: 500, userInfo: [NSLocalizedDescriptionKey: "Missing encoder_output"])
         }
 
+        // Convert encoder_output (Float32 -> Float16) & match exact mask dtype expected by decoder_prefill / decoder_step
+        let prefillEmbedKey = prefillEmbedInputName(for: prefill)
+        let prefillEmbedType = inputDataType(for: prefill, featureName: prefillEmbedKey, defaultType: .float16)
+        let prefillEncType = inputDataType(for: prefill, featureName: "encoder_output", defaultType: .float16)
+        let prefillMaskType = inputDataType(for: prefill, featureName: "encoder_mask", defaultType: .float32)
+
+        let encoderOutputPrefill = try convertMultiArray(rawEncoderOutput, to: prefillEncType)
+        let prefillMaskArr = (prefillMaskType == textMaskType)
+            ? textMaskArr
+            : try makeMaskArray(length: Self.maxTextLen, validCount: tLen, dataType: prefillMaskType)
+
         // 2. Run conditional decoder_prefill (1 batched ANE call vs 110 sequential calls -> 3.8× speedup!)
         let spkIdx = min(voice.speakerIndex, speakerEmbeddings.count - 1)
-        let spkArr = try MLMultiArray(shape: [1, 110, 768], dataType: .float16)
-        let spkDst = spkArr.dataPointer.bindMemory(to: Float16.self, capacity: 110 * 768)
+        let spkArr = try MLMultiArray(shape: [1, 110, 768], dataType: prefillEmbedType)
         let spkSrc = speakerEmbeddings[spkIdx]
-        for i in 0..<min(spkSrc.count, 110 * 768) {
-            spkDst[i] = Float16(spkSrc[i])
+        if prefillEmbedType == .float16 {
+            let spkDst = spkArr.dataPointer.bindMemory(to: Float16.self, capacity: 110 * 768)
+            for i in 0..<min(spkSrc.count, 110 * 768) { spkDst[i] = Float16(spkSrc[i]) }
+        } else {
+            let spkDst = spkArr.dataPointer.bindMemory(to: Float.self, capacity: 110 * 768)
+            for i in 0..<min(spkSrc.count, 110 * 768) { spkDst[i] = spkSrc[i] }
         }
 
         let prefillOut = try await prefill.prediction(from: MLDictionaryFeatureProvider(dictionary: [
-            "input": MLFeatureValue(multiArray: spkArr),
-            "encoder_output": MLFeatureValue(multiArray: encoderOutput),
-            "encoder_mask": MLFeatureValue(multiArray: maskArr),
+            prefillEmbedKey: MLFeatureValue(multiArray: spkArr),
+            "encoder_output": MLFeatureValue(multiArray: encoderOutputPrefill),
+            "encoder_mask": MLFeatureValue(multiArray: prefillMaskArr),
         ]))
         var (condK, condV) = try splitPrefillKV(prefillOut)
         var uncondK = try cloneArrayList(cachedUncondK ?? condK)
         var uncondV = try cloneArrayList(cachedUncondV ?? condV)
 
-        // Prepare unconditional zero encoder output & mask[0]=1
-        let zeroEnc = try MLMultiArray(shape: [1, 256, 768], dataType: .float16)
-        memset(zeroEnc.dataPointer, 0, zeroEnc.count * MemoryLayout<Float16>.stride)
-        let uncondMask = try MLMultiArray(shape: [1, 256], dataType: .float16)
-        memset(uncondMask.dataPointer, 0, uncondMask.count * MemoryLayout<Float16>.stride)
-        uncondMask[0] = 1.0
+        // Prepare decoder_step encoder tensors matching decoder_step's exact modelDescription dtypes
+        let stepEncType = inputDataType(for: decStep, featureName: "encoder_output", defaultType: .float16)
+        let stepMaskType = inputDataType(for: decStep, featureName: "encoder_mask", defaultType: .float32)
+        let encoderOutputStep = try convertMultiArray(rawEncoderOutput, to: stepEncType)
+        let stepMaskArr = (stepMaskType == prefillMaskType)
+            ? prefillMaskArr
+            : try makeMaskArray(length: Self.maxTextLen, validCount: tLen, dataType: stepMaskType)
+
+        let zeroEnc = try MLMultiArray(shape: [1, 256, 768], dataType: stepEncType)
+        memset(zeroEnc.dataPointer, 0, zeroEnc.count * (stepEncType == .float16 ? 2 : 4))
+        let uncondMask = try makeMaskArray(length: Self.maxTextLen, validCount: 1, dataType: stepMaskType)
 
         // 3. Autoregressive frame generation loop
         let maxSteps = min(360, max(32, tLen * 5))
@@ -750,8 +833,8 @@ public actor MagpieV2607Engine {
             let (condHidden, nextCK, nextCV) = try runDecoderStep(
                 model: decStep,
                 audioEmbed: audioEmbArr,
-                encoderOutput: encoderOutput,
-                encoderMask: maskBoolArr,
+                encoderOutput: encoderOutputStep,
+                encoderMask: stepMaskArr,
                 cacheK: condK,
                 cacheV: condV,
                 position: posVal

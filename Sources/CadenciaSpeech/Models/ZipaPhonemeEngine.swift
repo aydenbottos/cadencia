@@ -35,6 +35,8 @@ public actor ZipaPhonemeEngine {
     public static let supportedBuckets: [Int] = [256, 512, 1024, 1536]
 
     private let fbank = KaldiFbankExtractor()
+    private var modelAsset: MLModelAsset?
+    private var availableFunctionNames: Set<String> = []
     private var bucketModels: [Int: MLModel] = [:]
     private var fallbackSingleModel: MLModel?
     private var vocabulary: [Int: String] = [:]
@@ -43,9 +45,12 @@ public actor ZipaPhonemeEngine {
 
     public init() {}
 
-    /// Loads `ZipaCRLarge300M_FP16.mlmodelc` (preferring Multifunction ANE buckets on iOS 18+)
-    /// and `zipa_tokens.txt`, then executes a 1-shot warmup on the 256-frame bucket.
+    /// Loads `ZipaCRLarge300M_FP16.mlmodelc` using fast eager loading of only the primary short-turn buckets
+    /// (`zipa_256f` + `zipa_512f`, covering 0–5.12s utterances) in parallel; longer buckets (`1024f`/`1536f`)
+    /// load lazily on demand from the same shared `MLModelAsset` to keep startup fast and memory low.
     public func load(modelDirectory: URL) async throws {
+        if isLoaded { return }
+
         // Locate tokens.txt
         let tokensURL = modelDirectory.appendingPathComponent("zipa_tokens.txt")
         let resolvedTokens = FileManager.default.fileExists(atPath: tokensURL.path)
@@ -73,19 +78,27 @@ public actor ZipaPhonemeEngine {
             }
         }
 
-        // Load Multifunction ANE buckets sharing ONE FP16 weight file!
+        // Load Multifunction ANE asset sharing ONE FP16 weight file!
         let asset = try MLModelAsset(url: compiledURL)
-        let fnNames = (try? await asset.functionNames) ?? []
+        self.modelAsset = asset
+        let fnNames = Set((try? await asset.functionNames) ?? [])
+        self.availableFunctionNames = fnNames
 
         var loadedBuckets: [Int: MLModel] = [:]
         if !fnNames.isEmpty {
-            for bucket in Self.supportedBuckets {
-                let fn = "zipa_\(bucket)f"
-                if fnNames.contains(fn) {
-                    let cfg = MLModelConfiguration()
-                    cfg.computeUnits = .all // Allows ANE + GPU concurrent with Parakeet on ANE
-                    cfg.functionName = fn
-                    loadedBuckets[bucket] = try await MLModel.load(asset: asset, configuration: cfg)
+            // Eagerly load ONLY the 256f and 512f buckets concurrently at startup (50% faster boot & half RAM!)
+            let eagerBuckets = [256, 512].filter { fnNames.contains("zipa_\($0)f") }
+            if eagerBuckets.count == 2 {
+                async let m256 = Self.loadBucketModel(asset: asset, bucket: 256)
+                async let m512 = Self.loadBucketModel(asset: asset, bucket: 512)
+                let (b256, b512) = try await (m256, m512)
+                loadedBuckets[256] = b256
+                loadedBuckets[512] = b512
+                inputBuffers[256] = try MLMultiArray(shape: [1, 256, 80], dataType: .float32)
+                inputBuffers[512] = try MLMultiArray(shape: [1, 512, 80], dataType: .float32)
+            } else {
+                for bucket in eagerBuckets {
+                    loadedBuckets[bucket] = try await Self.loadBucketModel(asset: asset, bucket: bucket)
                     inputBuffers[bucket] = try MLMultiArray(shape: [1, NSNumber(value: bucket), 80], dataType: .float32)
                 }
             }
@@ -94,24 +107,33 @@ public actor ZipaPhonemeEngine {
         if loadedBuckets.isEmpty {
             let cfg = MLModelConfiguration()
             cfg.computeUnits = .all
-            self.fallbackSingleModel = try MLModel(contentsOf: compiledURL, configuration: cfg)
+            self.fallbackSingleModel = try await MLModel.load(contentsOf: compiledURL, configuration: cfg)
         } else {
             self.bucketModels = loadedBuckets
         }
 
-        // Thermal-safe ANE prewarm on smallest bucket (256 frames = 2.56s) so first turn has 0 cold stall
-        if let warmModel = bucketModels[256] ?? fallbackSingleModel {
-            let dummyX = try MLMultiArray(shape: [1, 256, 80], dataType: .float32)
-            let dummyLen = try MLMultiArray(shape: [1], dataType: .int32)
-            memset(dummyX.dataPointer, 0, dummyX.count * MemoryLayout<Float>.stride)
-            dummyLen.dataPointer.bindMemory(to: Int32.self, capacity: 1)[0] = 64
-            _ = try? await warmModel.prediction(from: MLDictionaryFeatureProvider(dictionary: [
-                "x": MLFeatureValue(multiArray: dummyX),
-                "x_lens": MLFeatureValue(multiArray: dummyLen),
-            ]))
-        }
-
         self.isLoaded = true
+    }
+
+    private static func loadBucketModel(asset: MLModelAsset, bucket: Int) async throws -> MLModel {
+        let cfg = MLModelConfiguration()
+        cfg.computeUnits = .all // Allows ANE + GPU concurrent with Parakeet on ANE
+        cfg.functionName = "zipa_\(bucket)f"
+        return try await MLModel.load(asset: asset, configuration: cfg)
+    }
+
+    private func ensureBucketLoaded(_ bucket: Int) async throws -> MLModel? {
+        if let existing = bucketModels[bucket] { return existing }
+        let fn = "zipa_\(bucket)f"
+        guard let asset = modelAsset, availableFunctionNames.contains(fn) else {
+            return bucketModels.values.first ?? fallbackSingleModel
+        }
+        let loaded = try await Self.loadBucketModel(asset: asset, bucket: bucket)
+        bucketModels[bucket] = loaded
+        if inputBuffers[bucket] == nil {
+            inputBuffers[bucket] = try MLMultiArray(shape: [1, NSNumber(value: bucket), 80], dataType: .float32)
+        }
+        return loaded
     }
 
     /// Recognizes IPA phoneme sequence directly from 16kHz mono Float32 PCM audio.
@@ -135,14 +157,15 @@ public actor ZipaPhonemeEngine {
         var usedBucket = 256
 
         // Process in chunks up to max bucket (1536 frames = 15.36s)
-        let maxBucket = bucketModels.keys.max() ?? 1536
+        let availableBuckets = Self.supportedBuckets.filter { availableFunctionNames.contains("zipa_\($0)f") || bucketModels[$0] != nil }
+        let maxBucket = availableBuckets.max() ?? 1536
         var frameStart = 0
         while frameStart < numFrames {
             let chunkFrames = min(maxBucket, numFrames - frameStart)
-            let bucket = selectBucket(forFrames: chunkFrames)
+            let bucket = selectBucket(forFrames: chunkFrames, available: availableBuckets)
             usedBucket = bucket
 
-            guard let model = bucketModels[bucket] ?? fallbackSingleModel else { break }
+            guard let model = try await ensureBucketLoaded(bucket) ?? fallbackSingleModel else { break }
             let xArr = try inputBuffers[bucket] ?? MLMultiArray(shape: [1, NSNumber(value: bucket), 80], dataType: .float32)
             let dst = xArr.dataPointer.bindMemory(to: Float.self, capacity: bucket * 80)
             memset(dst, 0, bucket * 80 * MemoryLayout<Float>.stride)
@@ -187,11 +210,11 @@ public actor ZipaPhonemeEngine {
         )
     }
 
-    private func selectBucket(forFrames frames: Int) -> Int {
-        for b in Self.supportedBuckets where b >= frames && bucketModels[b] != nil {
+    private func selectBucket(forFrames frames: Int, available: [Int]) -> Int {
+        for b in available where b >= frames {
             return b
         }
-        return bucketModels.keys.max() ?? 1024
+        return available.max() ?? bucketModels.keys.max() ?? 1024
     }
 
     /// Vectorized SIMD CTC greedy decoder (`vDSP_maxvi` per 50Hz frame across 127 IPA classes).

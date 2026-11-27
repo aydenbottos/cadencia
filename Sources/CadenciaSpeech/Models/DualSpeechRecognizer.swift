@@ -79,40 +79,91 @@ public actor DualSpeechRecognizer {
         self.telemetryCallback = handler
     }
 
-    /// Loads Parakeet Ultra 600M INT8 + Silero VAD + ZIPA CR Large 300M FP16 concurrently.
-    public func loadAllEngines(
-        assetManager: ModelAssetManager,
-        parakeetModels: AsrModels? = nil
-    ) async throws {
-        // 1. Parakeet Ultra 600M INT8 Core ML (ANE)
-        if let provided = parakeetModels {
-            let mgr = AsrManager(config: .default)
-            try await mgr.loadModels(provided)
-            self.asrManager = mgr
-            self.isParakeetReady = true
-        } else if await assetManager.isModelInstalled(.parakeetUltra) {
-            let models = try await AsrModels.loadFromCache(
-                version: .ultra,
-                encoderComputeUnits: .cpuAndNeuralEngine
-            )
-            let mgr = AsrManager(config: .default)
-            try await mgr.loadModels(models)
-            self.asrManager = mgr
-            self.isParakeetReady = true
-        }
+    /// Fast, idempotent single-engine attach for newly downloaded Parakeet Ultra models
+    /// (avoids re-loading ZIPA or blocking on Silero VAD network download).
+    public func attachParakeetModels(_ models: AsrModels) async throws {
+        let mgr = AsrManager(config: .default)
+        try await mgr.loadModels(models)
+        self.asrManager = mgr
+        self.isParakeetReady = true
+    }
 
-        // 2. Silero VAD (FluidAudio Core ML)
+    public func ensureZipaLoaded(assetManager: ModelAssetManager) async throws {
+        if isZipaReady { return }
+        let zipaDir = await assetManager.directory(for: .zipaPhoneme)
+        if await assetManager.isModelInstalled(.zipaPhoneme) {
+            try await zipaEngine.load(modelDirectory: zipaDir)
+            self.isZipaReady = true
+        }
+    }
+
+    public func ensureVadLoaded(assetManager: ModelAssetManager) async {
+        if isVADReady { return }
         if let vad = try? await VadManager(config: .default) {
             self.vadManager = vad
             self.isVADReady = true
             await assetManager.markVADReady()
         }
+    }
 
-        // 3. ZIPA CR Large 300M FP16 Multifunction Core ML
+    private static func loadParakeetIfNeeded(needed: Bool, provided: AsrModels?) async -> AsrManager? {
+        guard needed else { return nil }
+        do {
+            let models: AsrModels
+            if let provided {
+                models = provided
+            } else {
+                models = try await AsrModels.loadFromCache(
+                    version: .ultra,
+                    encoderComputeUnits: .cpuAndNeuralEngine
+                )
+            }
+            let mgr = AsrManager(config: .default)
+            try await mgr.loadModels(models)
+            return mgr
+        } catch {
+            return nil
+        }
+    }
+
+    private static func loadZipaIfNeeded(needed: Bool, zipa: ZipaPhonemeEngine, dir: URL) async -> Bool {
+        guard needed else { return false }
+        return (try? await zipa.load(modelDirectory: dir)) != nil
+    }
+
+    private static func loadVadIfNeeded(needed: Bool) async -> VadManager? {
+        guard needed else { return nil }
+        return try? await VadManager(config: .default)
+    }
+
+    /// Loads Parakeet Ultra 600M INT8 + Silero VAD + ZIPA CR Large 300M FP16 concurrently,
+    /// skipping any engine already warm in memory.
+    public func loadAllEngines(
+        assetManager: ModelAssetManager,
+        parakeetModels: AsrModels? = nil
+    ) async throws {
+        let needParakeet = parakeetModels != nil || (!isParakeetReady && (await assetManager.isModelInstalled(.parakeetUltra)))
+        let needZipa = !isZipaReady && (await assetManager.isModelInstalled(.zipaPhoneme))
+        let needVad = !isVADReady
         let zipaDir = await assetManager.directory(for: .zipaPhoneme)
-        if await assetManager.isModelInstalled(.zipaPhoneme) {
-            try await zipaEngine.load(modelDirectory: zipaDir)
+        let zipa = self.zipaEngine
+
+        // Kick off all three independent Core ML loads in parallel!
+        async let parakeetLoaded = Self.loadParakeetIfNeeded(needed: needParakeet, provided: parakeetModels)
+        async let zipaLoaded = Self.loadZipaIfNeeded(needed: needZipa, zipa: zipa, dir: zipaDir)
+        async let vadLoaded = Self.loadVadIfNeeded(needed: needVad)
+
+        if let mgr = await parakeetLoaded {
+            self.asrManager = mgr
+            self.isParakeetReady = true
+        }
+        if await zipaLoaded {
             self.isZipaReady = true
+        }
+        if let vad = await vadLoaded {
+            self.vadManager = vad
+            self.isVADReady = true
+            await assetManager.markVADReady()
         }
     }
 

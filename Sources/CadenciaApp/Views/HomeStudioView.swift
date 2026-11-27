@@ -9,22 +9,17 @@ public struct HomeStudioView: View {
     @Binding var selectedTab: Int
 
     public var body: some View {
-        ZStack {
-            MediterraneanAuroraView(mood: .studio, audioEnergy: appState.liveAudioEnergy)
-                .ignoresSafeArea()
-
-            ScrollView(showsIndicators: false) {
-                VStack(alignment: .leading, spacing: 22) {
-                    studioHeader
-                    todaySessionHeroCard
-                    liveMetricsGrid
-                    constellationPreviewCard
-                    weeklyTrajectoryCard
-                }
-                .padding(.horizontal, 20)
-                .padding(.top, 14)
-                .padding(.bottom, 110)
+        ScrollView(showsIndicators: false) {
+            VStack(alignment: .leading, spacing: 22) {
+                studioHeader
+                todaySessionHeroCard
+                liveMetricsGrid
+                constellationPreviewCard
+                weeklyTrajectoryCard
             }
+            .padding(.horizontal, 20)
+            .padding(.top, 14)
+            .padding(.bottom, 24)
         }
     }
 

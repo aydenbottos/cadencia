@@ -101,6 +101,7 @@ public final class SessionController {
     }
 
     public func beginSession() async {
+        await appState.ensureLinguisticResourcesLoaded()
         // Log immutable sessionStarted event
         try? await appState.database.appendEvidence(EvidenceEvent(
             learnerId: profile.learnerId,

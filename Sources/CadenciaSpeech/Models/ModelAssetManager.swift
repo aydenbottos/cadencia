@@ -209,22 +209,87 @@ public actor ModelAssetManager {
     public func downloadParakeetUltra(
         onProgress: @escaping @Sendable (ModelDownloadProgress) -> Void
     ) async throws -> AsrModels {
-        onProgress(.init(kind: .parakeetUltra, fractionCompleted: 0.05, statusMessage: "Downloading Parakeet Ultra 600M INT8 Core ML…", isReady: false, errorMessage: nil))
-        let models = try await AsrModels.downloadAndLoad(
+        onProgress(.init(
+            kind: .parakeetUltra,
+            fractionCompleted: 0.04,
+            statusMessage: "Connecting to HuggingFace for Parakeet Ultra INT8…",
+            isReady: false,
+            errorMessage: nil
+        ))
+
+        // Phase 1: Download files (FluidAudio ProgressReporter maps repo downloads 0.0 -> 0.5;
+        // normalize cleanly to 0.05 -> 0.75 so progress never stalls at 50%!)
+        let targetDir = try await AsrModels.download(
             version: .ultra,
             encoderPrecision: .int8,
             encoderComputeUnits: .cpuAndNeuralEngine,
             progressHandler: { prog in
+                // FluidAudio emits downloadPhaseWeight = 0.5 during repo downloads -> normalize * 2.0
+                let dlFrac = min(1.0, max(0.0, prog.fractionCompleted <= 0.51 ? prog.fractionCompleted * 2.0 : prog.fractionCompleted))
+                let uiFrac = 0.05 + 0.70 * dlFrac
+                let message: String
+                switch prog.phase {
+                case .listing:
+                    message = "Listing Parakeet Ultra INT8 files…"
+                case .downloading(let done, let total):
+                    if total > 0 {
+                        message = "Downloading Parakeet Ultra INT8 (\(done)/\(total) files · \(Int(dlFrac * 100))%)…"
+                    } else {
+                        message = "Downloading Parakeet Ultra INT8 (\(Int(dlFrac * 100))%)…"
+                    }
+                case .compiling(let name):
+                    message = "Compiling \(name) for Apple Neural Engine…"
+                }
                 onProgress(.init(
                     kind: .parakeetUltra,
-                    fractionCompleted: prog.fractionCompleted,
-                    statusMessage: "Parakeet Ultra INT8: \(Int(prog.fractionCompleted * 100))%",
+                    fractionCompleted: uiFrac,
+                    statusMessage: message,
                     isReady: false,
                     errorMessage: nil
                 ))
             }
         )
-        onProgress(.init(kind: .parakeetUltra, fractionCompleted: 1.0, statusMessage: "Parakeet Ultra 600M INT8 ready on ANE", isReady: true, errorMessage: nil))
+
+        // Phase 2: Explicitly signal download complete and Core ML ANE compilation started!
+        onProgress(.init(
+            kind: .parakeetUltra,
+            fractionCompleted: 0.78,
+            statusMessage: "Download complete · Compiling Parakeet INT8 for Neural Engine…",
+            isReady: false,
+            errorMessage: nil
+        ))
+
+        let models = try await AsrModels.load(
+            from: targetDir,
+            version: .ultra,
+            encoderPrecision: .int8,
+            encoderComputeUnits: .cpuAndNeuralEngine,
+            progressHandler: { prog in
+                let compileMsg: String
+                switch prog.phase {
+                case .compiling(let name):
+                    compileMsg = "Compiling \(name) for Neural Engine…"
+                default:
+                    compileMsg = "Optimizing Parakeet Ultra INT8 on Neural Engine…"
+                }
+                let uiFrac = min(0.96, max(0.80, 0.78 + 0.18 * prog.fractionCompleted))
+                onProgress(.init(
+                    kind: .parakeetUltra,
+                    fractionCompleted: uiFrac,
+                    statusMessage: compileMsg,
+                    isReady: false,
+                    errorMessage: nil
+                ))
+            }
+        )
+
+        onProgress(.init(
+            kind: .parakeetUltra,
+            fractionCompleted: 1.0,
+            statusMessage: "Installed & ready on device",
+            isReady: true,
+            errorMessage: nil
+        ))
         return models
     }
 

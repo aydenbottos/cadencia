@@ -48,7 +48,7 @@ public struct ResearchLabView: View {
             }
             .padding(.horizontal, 18)
             .padding(.top, 16)
-            .padding(.bottom, 120)
+            .padding(.bottom, 24)
         }
         .sheet(item: $activeSheet) { sheet in
             switch sheet {
@@ -1306,6 +1306,7 @@ private struct Stage0BenchTestSheet: View {
     private func runBench() async {
         isRunning = true
         defer { isRunning = false }
+        await appState.ensureLinguisticResourcesLoaded()
 
         let hours = [2, 10, 20, 35, 50]
         let scheduler = SessionScheduler(parameters: .protocolDefaults)

@@ -96,87 +96,109 @@ public struct CadenciaApp: App {
     }
 
     private var bootSplashView: some View {
-        VStack(spacing: 18) {
-            ResonanceOrbView(mode: .thinking, energy: 0.35)
-                .frame(width: 150, height: 150)
+        VStack(spacing: 16) {
+            ZStack {
+                Circle()
+                    .fill(
+                        RadialGradient(
+                            colors: [CadenciaPalette.saffronGold.opacity(0.85), CadenciaPalette.terracotta.opacity(0.45), .clear],
+                            center: .center,
+                            startRadius: 8,
+                            endRadius: 56
+                        )
+                    )
+                    .frame(width: 112, height: 112)
+                Image(systemName: "waveform.and.magnifyingglass")
+                    .font(.system(size: 32, weight: .semibold))
+                    .foregroundStyle(CadenciaPalette.ivoryText)
+            }
             Text("Cadencia")
                 .font(CadenciaFont.displaySerif(38, weight: .bold))
                 .foregroundStyle(CadenciaPalette.ivoryText)
-            Text("Loading 4,900-item linguistic ledger & Core ML engines…")
-                .font(CadenciaFont.mono(12))
-                .foregroundStyle(CadenciaPalette.mutedSilver)
+            ProgressView()
+                .tint(CadenciaPalette.saffronGold)
         }
     }
 
     private var mainTabbedShell: some View {
-        ZStack(alignment: .bottom) {
-            Group {
-                switch selectedTab {
-                case .studio:
-                    HomeStudioView(
-                        appState: appState,
-                        selectedTab: Binding(
-                            get: { selectedTab.rawValue },
-                            set: { selectedTab = CadenciaTab(rawValue: $0) ?? .studio }
-                        )
+        Group {
+            switch selectedTab {
+            case .studio:
+                HomeStudioView(
+                    appState: appState,
+                    selectedTab: Binding(
+                        get: { selectedTab.rawValue },
+                        set: { selectedTab = CadenciaTab(rawValue: $0) ?? .studio }
                     )
-                case .memory:
-                    MemoryAtlasView(appState: appState)
-                case .lab:
-                    ResearchLabView(appState: appState)
-                case .system:
-                    HardwareSettingsView(appState: appState)
-                }
+                )
+            case .memory:
+                MemoryAtlasView(appState: appState)
+            case .lab:
+                ResearchLabView(appState: appState)
+            case .system:
+                HardwareSettingsView(appState: appState)
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        // Reserves dedicated bottom safe area so scrollable lists (especially Memory Ledger)
+        // never overlap or steal touches from the floating glass dock!
+        .safeAreaInset(edge: .bottom, spacing: 0) {
             floatingLiquidGlassTabBar
-                .padding(.horizontal, 18)
-                .padding(.bottom, 10)
+                .padding(.horizontal, 16)
+                .padding(.top, 8)
+                .padding(.bottom, 6)
+                .background(
+                    LinearGradient(
+                        colors: [Color.clear, CadenciaPalette.obsidian.opacity(0.72), CadenciaPalette.obsidian.opacity(0.92)],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                    .ignoresSafeArea(edges: .bottom)
+                    .allowsHitTesting(false)
+                )
         }
     }
 
     private var floatingLiquidGlassTabBar: some View {
-        CadenciaGlassContainer(spacing: 8) {
-            HStack(spacing: 6) {
-                ForEach(CadenciaTab.allCases) { tab in
-                    let active = selectedTab == tab
-                    Button {
-                        withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
-                            selectedTab = tab
-                        }
-                        HapticDirector.shared.playGlossTap()
-                    } label: {
-                        HStack(spacing: 6) {
-                            Image(systemName: tab.icon)
-                                .font(.system(size: 15, weight: .semibold))
-                            if active {
-                                Text(tab.title)
-                                    .font(CadenciaFont.uiCaption(13, weight: .bold))
-                                    .lineLimit(1)
-                            }
-                        }
-                        .foregroundStyle(active ? CadenciaPalette.obsidian : CadenciaPalette.ivoryText.opacity(0.85))
-                        .padding(.horizontal, active ? 16 : 14)
-                        .padding(.vertical, 12)
-                        .background {
-                            if active {
-                                Capsule()
-                                    .fill(
-                                        LinearGradient(
-                                            colors: [CadenciaPalette.saffronGold, CadenciaPalette.terracotta],
-                                            startPoint: .topLeading,
-                                            endPoint: .bottomTrailing
-                                        )
+        HStack(spacing: 4) {
+            ForEach(CadenciaTab.allCases) { tab in
+                let active = selectedTab == tab
+                Button {
+                    withAnimation(.spring(response: 0.28, dampingFraction: 0.85)) {
+                        selectedTab = tab
+                    }
+                    HapticDirector.shared.playGlossTap()
+                } label: {
+                    VStack(spacing: 3) {
+                        Image(systemName: tab.icon)
+                            .font(.system(size: 17, weight: active ? .bold : .semibold))
+                        Text(tab.title)
+                            .font(CadenciaFont.uiCaption(10, weight: active ? .bold : .medium))
+                            .lineLimit(1)
+                    }
+                    .foregroundStyle(active ? CadenciaPalette.obsidian : CadenciaPalette.ivoryText.opacity(0.88))
+                    .frame(maxWidth: .infinity)
+                    .frame(minHeight: 50)
+                    .background {
+                        if active {
+                            Capsule()
+                                .fill(
+                                    LinearGradient(
+                                        colors: [CadenciaPalette.saffronGold, CadenciaPalette.terracotta],
+                                        startPoint: .topLeading,
+                                        endPoint: .bottomTrailing
                                     )
-                            }
+                                )
                         }
                     }
-                    .buttonStyle(.plain)
+                    .contentShape(Capsule())
                 }
+                .buttonStyle(.plain)
             }
-            .padding(6)
-            .cadenciaGlassPill(interactive: true)
         }
+        .padding(5)
+        // Outer dock uses non-interactive Liquid Glass so iOS 26 never intercepts taps meant for the 4 tab buttons!
+        .cadenciaGlassPill(interactive: false)
+        .contentShape(Capsule())
     }
 }

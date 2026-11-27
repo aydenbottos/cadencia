@@ -38,7 +38,12 @@ public final class AppState {
     public var modelStatus: [ManagedModelKind: ModelDownloadProgress] = [:]
     public var liveAudioEnergy: Float = 0.0
     public var isBootstrapping: Bool = true
+    public var isWarmingModels: Bool = false
     public var errorBanner: String?
+
+    // Background warmup tasks (never block app launch!)
+    private var linguisticLoadTask: Task<Void, Never>?
+    private var modelWarmupTask: Task<Void, Never>?
 
     // Active 75-minute session controller (presented full-screen when active)
     public var activeSessionController: SessionController?
@@ -65,28 +70,20 @@ public final class AppState {
         }
     }
 
+    /// Ultra-fast launch path (<150ms after first start): loads only what the home shell needs
+    /// to paint immediately, then hydrates the 64k inflection lemmatizer and warms installed
+    /// Core ML engines concurrently in background `.utility` tasks without blocking the UI.
     public func bootstrap() async {
         isBootstrapping = true
-        defer { isBootstrapping = false }
 
         do {
             async let itemsTask = database.loadAllSyllabusItems(includeHoldout: false)
-            async let holdoutTask = database.loadHoldoutItems()
-            async let inflectionsTask = database.loadInflectionDictionary()
             async let genresTask = database.loadSerialGenres()
             async let profileTask = database.loadActiveProfile()
 
-            let (items, holdouts, inflections, genres, loadedProfile) = try await (
-                itemsTask, holdoutTask, inflectionsTask, genresTask, profileTask
-            )
-
+            let (items, genres, loadedProfile) = try await (itemsTask, genresTask, profileTask)
             self.allSyllabusItems = items
-            self.holdoutItems = holdouts
             self.serialGenres = genres
-            self.lemmatizer = SpanishLemmatizer(
-                inflections: inflections,
-                chunkItems: items.filter { $0.itemType == .chunk }
-            )
             self.profile = loadedProfile
 
             if loadedProfile != nil {
@@ -102,9 +99,57 @@ public final class AppState {
             }
 
             await refreshModelStatuses()
-            await warmInstalledModelsInBackground()
         } catch {
             self.errorBanner = error.localizedDescription
+        }
+
+        // Dismiss splash IMMEDIATELY — never block initial screen on 64k inflections or Core ML ANE compilation!
+        isBootstrapping = false
+
+        // 1. Hydrate 64k Spanish lemmatizer & 400 holdout items silently in background
+        let activeItems = self.allSyllabusItems
+        let db = self.database
+        linguisticLoadTask = Task(priority: .utility) { [weak self] in
+            async let holdoutTask = try? db.loadHoldoutItems()
+            async let inflectionsTask = try? db.loadInflectionDictionary()
+            let (holdouts, inflections) = await (holdoutTask, inflectionsTask)
+            let chunks = activeItems.filter { $0.itemType == .chunk }
+            let builtLemmatizer = SpanishLemmatizer(inflections: inflections ?? [:], chunkItems: chunks)
+            await MainActor.run {
+                self?.holdoutItems = holdouts ?? []
+                self?.lemmatizer = builtLemmatizer
+            }
+        }
+
+        // 2. Warm installed Core ML engines concurrently in background
+        startBackgroundModelWarmup()
+    }
+
+    /// Awaits background loading of the 64k Spanish lemmatizer & hold-out set (called before sessions/bench tests).
+    public func ensureLinguisticResourcesLoaded() async {
+        await linguisticLoadTask?.value
+    }
+
+    /// Starts (or joins) concurrent background Core ML warmup without blocking the UI.
+    public func startBackgroundModelWarmup() {
+        if modelWarmupTask != nil { return }
+        isWarmingModels = true
+        modelWarmupTask = Task(priority: .utility) { [weak self] in
+            guard let self else { return }
+            await self.warmInstalledModelsInBackground()
+            await MainActor.run {
+                self.isWarmingModels = false
+                self.modelWarmupTask = nil
+            }
+        }
+    }
+
+    /// Awaits any in-flight background Core ML warmup (used before Benchmark ANE or voice sessions).
+    public func ensureModelsWarmed() async {
+        if let task = modelWarmupTask {
+            await task.value
+        } else {
+            await warmInstalledModelsInBackground()
         }
     }
 
@@ -197,36 +242,114 @@ public final class AppState {
         }
     }
 
-    public func warmInstalledModelsInBackground() async {
-        if await assetManager.isModelInstalled(.magpieTTS) {
-            let dir = await assetManager.directory(for: .magpieTTS)
-            try? await magpieEngine.loadModels(from: dir)
+    private nonisolated static func warmMagpieHelper(assets: ModelAssetManager, magpie: MagpieV2607Engine) async {
+        if await assets.isModelInstalled(.magpieTTS), !(await magpie.isLoaded) {
+            let dir = await assets.directory(for: .magpieTTS)
+            try? await magpie.loadModels(from: dir)
         }
-        try? await speechRecognizer.loadAllEngines(assetManager: assetManager)
+    }
+
+    private nonisolated static func warmSpeechHelper(assets: ModelAssetManager, speech: DualSpeechRecognizer) async {
+        try? await speech.loadAllEngines(assetManager: assets)
+    }
+
+    public func warmInstalledModelsInBackground() async {
+        let magpie = self.magpieEngine
+        let speech = self.speechRecognizer
+        let assets = self.assetManager
+
+        // Warm Magpie TTS and DualSpeechRecognizer (Parakeet + ZIPA + VAD) concurrently!
+        async let warmMagpie: Void = Self.warmMagpieHelper(assets: assets, magpie: magpie)
+        async let warmSpeech: Void = Self.warmSpeechHelper(assets: assets, speech: speech)
+
+        _ = await (warmMagpie, warmSpeech)
+        await refreshModelStatuses()
+    }
+
+    private func applyDownloadProgress(_ prog: ModelDownloadProgress) {
+        if let existing = modelStatus[prog.kind] {
+            // Guard against out-of-order async callbacks reverting a finished download or moving progress backwards
+            if existing.isReady && !prog.isReady && prog.errorMessage == nil { return }
+            if !prog.isReady && prog.errorMessage == nil && prog.fractionCompleted + 0.001 < existing.fractionCompleted {
+                return
+            }
+        }
+        modelStatus[prog.kind] = prog
     }
 
     public func downloadMagpie() async {
+        modelStatus[.magpieTTS] = ModelDownloadProgress(
+            kind: .magpieTTS, fractionCompleted: 0.01,
+            statusMessage: "Starting NVIDIA Magpie v2607 download…",
+            isReady: false, errorMessage: nil
+        )
         do {
             try await assetManager.downloadMagpieAssets { [weak self] prog in
-                Task { @MainActor in self?.modelStatus[.magpieTTS] = prog }
+                Task { @MainActor in
+                    let clamped = ModelDownloadProgress(
+                        kind: prog.kind,
+                        fractionCompleted: min(0.92, prog.fractionCompleted * 0.92),
+                        statusMessage: prog.isReady ? "Loading Magpie v2607 into Neural Engine…" : prog.statusMessage,
+                        isReady: false,
+                        errorMessage: prog.errorMessage
+                    )
+                    self?.applyDownloadProgress(clamped)
+                }
             }
+            modelStatus[.magpieTTS] = ModelDownloadProgress(
+                kind: .magpieTTS, fractionCompleted: 0.95,
+                statusMessage: "Loading Magpie v2607 into Neural Engine…",
+                isReady: false, errorMessage: nil
+            )
             let dir = await assetManager.directory(for: .magpieTTS)
             try await magpieEngine.loadModels(from: dir)
+            modelStatus[.magpieTTS] = ModelDownloadProgress(
+                kind: .magpieTTS, fractionCompleted: 1.0,
+                statusMessage: "Installed & ready on device",
+                isReady: true, errorMessage: nil
+            )
         } catch {
             modelStatus[.magpieTTS] = ModelDownloadProgress(
-                kind: .magpieTTS, fractionCompleted: 0, statusMessage: "Download failed",
+                kind: .magpieTTS, fractionCompleted: 0, statusMessage: "Download / load failed",
                 isReady: false, errorMessage: error.localizedDescription
             )
         }
     }
 
     public func downloadParakeetUltra() async {
+        modelStatus[.parakeetUltra] = ModelDownloadProgress(
+            kind: .parakeetUltra, fractionCompleted: 0.02,
+            statusMessage: "Starting Parakeet Ultra 600M INT8 download…",
+            isReady: false, errorMessage: nil
+        )
         do {
             let models = try await assetManager.downloadParakeetUltra { [weak self] prog in
-                Task { @MainActor in self?.modelStatus[.parakeetUltra] = prog }
+                Task { @MainActor in
+                    // Keep final ready flag gated until attached to DualSpeechRecognizer
+                    let mapped = prog.isReady
+                        ? ModelDownloadProgress(
+                            kind: .parakeetUltra, fractionCompleted: 0.98,
+                            statusMessage: "Attaching Parakeet Ultra INT8 to speech engine…",
+                            isReady: false, errorMessage: nil
+                        )
+                        : prog
+                    self?.applyDownloadProgress(mapped)
+                }
             }
-            try await speechRecognizer.loadAllEngines(assetManager: assetManager, parakeetModels: models)
-            await refreshModelStatuses()
+            // Fast single-engine attach (~50ms) — never blocks on Silero VAD network download or ZIPA reload!
+            try await speechRecognizer.attachParakeetModels(models)
+            modelStatus[.parakeetUltra] = ModelDownloadProgress(
+                kind: .parakeetUltra, fractionCompleted: 1.0,
+                statusMessage: "Installed & ready on device",
+                isReady: true, errorMessage: nil
+            )
+            // Quietly ensure Silero VAD is warmed in background without blocking Parakeet's UI completion
+            let speech = self.speechRecognizer
+            let assets = self.assetManager
+            Task(priority: .utility) { [weak self] in
+                await speech.ensureVadLoaded(assetManager: assets)
+                await self?.refreshModelStatuses()
+            }
         } catch {
             modelStatus[.parakeetUltra] = ModelDownloadProgress(
                 kind: .parakeetUltra, fractionCompleted: 0, statusMessage: "Download failed",
@@ -236,11 +359,16 @@ public final class AppState {
     }
 
     public func installZipaFromCloud() async {
+        modelStatus[.zipaPhoneme] = ModelDownloadProgress(
+            kind: .zipaPhoneme, fractionCompleted: 0.02,
+            statusMessage: "Checking ZIPA CR Large 300M FP16…",
+            isReady: false, errorMessage: nil
+        )
         do {
             _ = try await assetManager.installZipaFromCloud { [weak self] prog in
-                Task { @MainActor in self?.modelStatus[.zipaPhoneme] = prog }
+                Task { @MainActor in self?.applyDownloadProgress(prog) }
             }
-            try await speechRecognizer.loadAllEngines(assetManager: assetManager)
+            try await speechRecognizer.ensureZipaLoaded(assetManager: assetManager)
             await refreshModelStatuses()
         } catch {
             modelStatus[.zipaPhoneme] = ModelDownloadProgress(

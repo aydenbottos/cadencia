@@ -36,7 +36,7 @@ public struct HardwareSettingsView: View {
             }
             .padding(.horizontal, 18)
             .padding(.top, 16)
-            .padding(.bottom, 120)
+            .padding(.bottom, 24)
         }
         .onAppear {
             if let p = appState.profile {
@@ -176,17 +176,28 @@ public struct HardwareSettingsView: View {
                     .font(CadenciaFont.uiTitle(16, weight: .bold))
                     .foregroundStyle(CadenciaPalette.ivoryText)
                 Spacer()
+                if appState.isWarmingModels {
+                    HStack(spacing: 5) {
+                        ProgressView().scaleEffect(0.7)
+                        Text("WARMING")
+                            .font(CadenciaFont.mono(9, weight: .bold))
+                            .foregroundStyle(CadenciaPalette.saffronGold)
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background(CadenciaPalette.saffronGold.opacity(0.14), in: Capsule())
+                }
                 Button {
                     Task {
                         await appState.refreshModelStatuses()
-                        await appState.warmInstalledModelsInBackground()
+                        appState.startBackgroundModelWarmup()
                     }
                 } label: {
                     Image(systemName: "arrow.clockwise")
                         .font(.system(size: 13, weight: .bold))
                         .foregroundStyle(CadenciaPalette.ivoryText)
                         .padding(8)
-                        .cadenciaGlassPill()
+                        .cadenciaGlassPill(interactive: false)
                 }
             }
 
@@ -268,11 +279,22 @@ public struct HardwareSettingsView: View {
             }
 
             if isDownloading, let prog {
+                let isCompiling = prog.statusMessage.localizedCaseInsensitiveContains("compil")
+                    || prog.statusMessage.localizedCaseInsensitiveContains("loading")
+                    || prog.statusMessage.localizedCaseInsensitiveContains("optimizing")
+                    || prog.statusMessage.localizedCaseInsensitiveContains("attaching")
                 ProgressView(value: prog.fractionCompleted)
-                    .tint(CadenciaPalette.bioluminescentCobalt)
-                Text(prog.statusMessage)
-                    .font(CadenciaFont.mono(10))
-                    .foregroundStyle(CadenciaPalette.mutedSilver)
+                    .tint(isCompiling ? CadenciaPalette.saffronGold : CadenciaPalette.bioluminescentCobalt)
+                HStack(spacing: 6) {
+                    if isCompiling {
+                        ProgressView()
+                            .scaleEffect(0.65)
+                            .tint(CadenciaPalette.saffronGold)
+                    }
+                    Text(prog.statusMessage)
+                        .font(CadenciaFont.mono(10))
+                        .foregroundStyle(isCompiling ? CadenciaPalette.saffronGold : CadenciaPalette.mutedSilver)
+                }
             } else if let err = prog?.errorMessage {
                 Text(err)
                     .font(CadenciaFont.mono(10))
@@ -294,18 +316,35 @@ public struct HardwareSettingsView: View {
                     Task {
                         isBenchmarking = true
                         defer { isBenchmarking = false }
+                        benchmarkOutput = "Warming installed Core ML engines…"
+                        await appState.ensureModelsWarmed()
+
+                        benchmarkOutput = "Running 3.0s concurrent Parakeet Ultra INT8 + ZIPA FP16…"
                         let stt = await appState.speechRecognizer.runHardwareBenchmark()
-                        var ttsSummary = "Magpie not loaded"
-                        if await appState.magpieEngine.isLoaded {
-                            let t0 = Date()
-                            if let clip = try? await appState.magpieEngine.synthesizeSentence(
-                                text: "Buenos días, el cielo de Madrid brilla hoy.",
-                                voice: .sofia,
-                                accent: .castilian
-                            ) {
+
+                        var ttsSummary = "Magpie v2607: not installed"
+                        if await appState.assetManager.isModelInstalled(.magpieTTS) {
+                            do {
+                                if !(await appState.magpieEngine.isLoaded) {
+                                    benchmarkOutput = "Loading NVIDIA Magpie v2607 Core ML models…"
+                                    let dir = await appState.assetManager.directory(for: .magpieTTS)
+                                    try await appState.magpieEngine.loadModels(from: dir)
+                                }
+                                benchmarkOutput = "Synthesizing Spanish benchmark via NVIDIA Magpie v2607…"
+                                let t0 = Date()
+                                let clip = try await appState.magpieEngine.synthesizeSentence(
+                                    text: "Buenos días, el cielo de Madrid brilla hoy.",
+                                    voice: .sofia,
+                                    accent: .castilian
+                                )
                                 let ms = Date().timeIntervalSince(t0) * 1000.0
                                 let rtf = (ms / 1000.0) / max(0.01, clip.durationSeconds)
-                                ttsSummary = String(format: "Magpie v2607: %.0f ms (RTF %.2f×)", ms, rtf)
+                                ttsSummary = String(
+                                    format: "Magpie v2607: %.0f ms for %.1fs audio (RTF %.2f×)",
+                                    ms, clip.durationSeconds, rtf
+                                )
+                            } catch {
+                                ttsSummary = "Magpie v2607 error: \(error.localizedDescription)"
                             }
                         }
                         benchmarkOutput = String(
