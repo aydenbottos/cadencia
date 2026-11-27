@@ -135,8 +135,9 @@ for t in "${TARGETS[@]}"; do
     libtool -static -o "$CLEAN_LIB" "$MERGED_OBJ"
 
     echo "==> Exported global symbols in ${t}:"
-    nm -gU "$CLEAN_LIB"
-    if nm -gU "$CLEAN_LIB" | grep -q "_rust_eh_personality"; then
+    SYMS="$(xcrun nm-classic -gU "$CLEAN_LIB" 2>/dev/null || xcrun nm --no-llvm-bc -gU "$CLEAN_LIB" 2>/dev/null || true)"
+    echo "$SYMS"
+    if echo "$SYMS" | grep -q "_rust_eh_personality"; then
         echo "ERROR: _rust_eh_personality was not localized in ${t}" >&2
         exit 1
     fi
