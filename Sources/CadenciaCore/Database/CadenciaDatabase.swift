@@ -508,7 +508,7 @@ public actor CadenciaDatabase {
                 id: colString(stmt, 0),
                 checkpointHour: Int(sqlite3_column_int64(stmt, 1)),
                 accent: SpanishRegionalAccent(rawValue: colString(stmt, 2)) ?? .castilian,
-                speaker: MagpieVoice(rawValue: colString(stmt, 3)) ?? .sofia,
+                speaker: TutorVoice.fromStoredRawValue(colString(stmt, 3)),
                 wpm: Int(sqlite3_column_int64(stmt, 4)),
                 title: colString(stmt, 5),
                 transcript: colString(stmt, 6),

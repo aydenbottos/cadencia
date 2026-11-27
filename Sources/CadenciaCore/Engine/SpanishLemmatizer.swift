@@ -275,8 +275,8 @@ public final class SpanishLemmatizer: Sendable {
             .replacingOccurrences(of: "ü", with: "u")
     }
 
-    /// Converts Spanish orthography into narrow IPA phones for either:
-    /// - Magpie v2607 inline `| ... |` accent overrides (Rule 8 regional accents), OR
+    /// Converts Spanish orthography into narrow IPA phones for:
+    /// - Regional accent comparison (Rule 8 Castilian / LatAm / Rioplatense IPA), and
     /// - Canonical expected IPA sequence for ZIPA CR Large 300M phoneme alignment!
     public static func spanishToIPA(_ text: String, accent: SpanishRegionalAccent = .castilian) -> String {
         let words = text

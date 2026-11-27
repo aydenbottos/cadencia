@@ -19,7 +19,7 @@ public enum MemoryFilterMode: String, CaseIterable, Identifiable {
 ///  - Pinch & pan GPU-instanced Metal Constellation (all 4,500 active syllabus items colored by mastery state & due pulse)
 ///  - Instant search + filter chips across Lemmas, 200 Chunks, 300 Cervantes A1–B2 Grammar Patterns
 ///  - Item Inspector sheet with live Swift Charts $p = 2^{-\Delta/h}$ forgetting curve, regional IPA,
-///    prior Rule 4 fresh-context sentences, and one-tap Magpie v2607 pronunciation playback!
+///    prior Rule 4 fresh-context sentences, and one-tap Phonon-40m-es native Spanish pronunciation playback!
 public struct MemoryAtlasView: View {
     @Bindable var appState: AppState
 
@@ -334,7 +334,7 @@ private struct ItemForgettingDetailSheet: View {
                 CadenciaPalette.obsidian.ignoresSafeArea()
                 ScrollView {
                     VStack(alignment: .leading, spacing: 20) {
-                        // Title + Magpie Speak Button
+                        // Title + Phonon-40m-es Speak Button
                         HStack(alignment: .top) {
                             VStack(alignment: .leading, spacing: 6) {
                                 Text("\(item.itemType.rawValue.uppercased()) · #\(item.rankIndex) · \(item.cefr.rawValue)")
@@ -352,11 +352,11 @@ private struct ItemForgettingDetailSheet: View {
                                 Task {
                                     isSpeaking = true
                                     defer { isSpeaking = false }
-                                    try? await appState.ensureMagpieLoaded()
-                                    if let clip = try? await appState.magpieEngine.synthesizeSentence(
-                                        text: item.spanish, voice: .sofia, accent: .castilian
+                                    try? await appState.ensurePhononLoaded()
+                                    if let clip = try? await appState.phononEngine.synthesizeSentence(
+                                        text: item.spanish, voice: .celia, accent: .castilian
                                     ) {
-                                        try? await appState.magpieEngine.play(clip: clip, targetWPM: 120)
+                                        try? await appState.audioPlayer.play(clip: clip, targetWPM: 140)
                                     }
                                 }
                             } label: {

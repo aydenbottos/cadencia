@@ -2,8 +2,9 @@ import CadenciaCore
 import CadenciaSpeech
 import SwiftUI
 
-/// System, API Keychain Vault, On-Device Core ML Model Hub, Hardware Latency Benchmark,
-/// Study Protocol Parameters (with Stage 1 Freeze Lock), and Learner Profile Configuration.
+/// System, API & Hugging Face Keychain Vaults, On-Device Core ML Model Hub
+/// (Phonon-40m-es, Kokoro-82M English, Parakeet Ultra INT8, ZIPA FP16),
+/// Hardware Latency Benchmark, Study Protocol Parameters, and Learner Profile Configuration.
 public struct HardwareSettingsView: View {
     @Bindable var appState: AppState
 
@@ -11,10 +12,15 @@ public struct HardwareSettingsView: View {
     @State private var isTestingAPI: Bool = false
     @State private var apiTestResult: String?
 
+    @State private var hfTokenInput: String = ""
+    @State private var hfTokenStatus: String?
+
     @State private var isBenchmarking: Bool = false
     @State private var benchmarkOutput: String?
-    @State private var lastBenchmarkClip: SynthesizedAudioClip?
-    @State private var isPlayingBenchmarkSample: Bool = false
+    @State private var lastSpanishBenchmarkClip: SynthesizedAudioClip?
+    @State private var lastEnglishBenchmarkClip: SynthesizedAudioClip?
+    @State private var isPlayingSpanishSample: Bool = false
+    @State private var isPlayingEnglishSample: Bool = false
 
     @State private var selectedMode: StudyMode = .soloPilot
     @State private var selectedSerialId: String = "madrid_noir"
@@ -31,6 +37,7 @@ public struct HardwareSettingsView: View {
             VStack(spacing: 20) {
                 headerSection
                 openAIKeychainVaultCard
+                huggingFaceTokenVaultCard
                 onDeviceCoreMLHubCard
                 hardwareBenchmarkCard
                 protocolParametersCard
@@ -169,7 +176,102 @@ public struct HardwareSettingsView: View {
         .cadenciaGlassCard(cornerRadius: 24)
     }
 
-    // MARK: - 2. On-Device Neural Engine Model Manager
+    // MARK: - 2. Hugging Face Token Vault (For Gated Gradium Phonon-40m-es On-Device Download)
+
+    private var huggingFaceTokenVaultCard: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Label("Hugging Face Vault (Phonon-40m-es)", systemImage: "lock.shield.fill")
+                    .font(CadenciaFont.uiTitle(16, weight: .bold))
+                    .foregroundStyle(CadenciaPalette.ivoryText)
+                Spacer()
+                Text(appState.hasHuggingFaceToken ? "TOKEN STORED" : "NEEDED FOR PHONON")
+                    .font(CadenciaFont.mono(10, weight: .bold))
+                    .foregroundStyle(appState.hasHuggingFaceToken ? CadenciaPalette.mediterraneanJade : CadenciaPalette.saffronGold)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background((appState.hasHuggingFaceToken ? CadenciaPalette.mediterraneanJade : CadenciaPalette.saffronGold).opacity(0.18), in: Capsule())
+            }
+
+            Text("Gradium Phonon-40m-es is license-gated on Hugging Face. Click Agree on the model card below, then paste your free Hugging Face Read token (`hf_…`) so your iPhone downloads and exports Phonon locally.")
+                .font(CadenciaFont.uiCaption(12))
+                .foregroundStyle(CadenciaPalette.mutedSilver)
+
+            HStack(spacing: 10) {
+                if let modelURL = URL(string: "https://huggingface.co/gradium/phonon-40m-es") {
+                    Link(destination: modelURL) {
+                        Label("1. Accept Phonon License", systemImage: "arrow.up.right.square")
+                            .font(CadenciaFont.mono(11, weight: .semibold))
+                            .foregroundStyle(CadenciaPalette.bioluminescentCobalt)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(CadenciaPalette.bioluminescentCobalt.opacity(0.14), in: Capsule())
+                    }
+                }
+                if let tokenURL = URL(string: "https://huggingface.co/settings/tokens") {
+                    Link(destination: tokenURL) {
+                        Label("2. Get Read Token", systemImage: "key.fill")
+                            .font(CadenciaFont.mono(11, weight: .semibold))
+                            .foregroundStyle(CadenciaPalette.saffronGold)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(CadenciaPalette.saffronGold.opacity(0.14), in: Capsule())
+                    }
+                }
+            }
+
+            SecureField("hf_… (Hugging Face Read Token)", text: $hfTokenInput)
+                .textFieldStyle(.plain)
+                .font(CadenciaFont.mono(13))
+                .foregroundStyle(CadenciaPalette.ivoryText)
+                .padding(12)
+                .background(Color.black.opacity(0.32), in: RoundedRectangle(cornerRadius: 12))
+                .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Color.white.opacity(0.15)))
+
+            HStack(spacing: 10) {
+                Button {
+                    let trimmed = hfTokenInput.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !trimmed.isEmpty else { return }
+                    _ = KeychainVault.saveHuggingFaceToken(trimmed)
+                    appState.hasHuggingFaceToken = true
+                    hfTokenInput = ""
+                    hfTokenStatus = "Saved securely to iOS Keychain. You can now tap Install on Gradium Phonon-40m-es."
+                    HapticDirector.shared.playStrongSuccess()
+                } label: {
+                    Label("Save HF Token", systemImage: "lock.fill")
+                        .font(CadenciaFont.uiCaption(13, weight: .bold))
+                        .foregroundStyle(CadenciaPalette.obsidian)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 10)
+                        .background(CadenciaPalette.bioluminescentCobalt, in: Capsule())
+                }
+
+                if appState.hasHuggingFaceToken {
+                    Spacer()
+                    Button(role: .destructive) {
+                        _ = KeychainVault.deleteHuggingFaceToken()
+                        appState.hasHuggingFaceToken = false
+                        hfTokenStatus = "Hugging Face token removed from Keychain."
+                    } label: {
+                        Image(systemName: "trash")
+                            .foregroundStyle(CadenciaPalette.crimsonAlert)
+                            .padding(10)
+                            .cadenciaGlassPill(tint: CadenciaPalette.crimsonAlert)
+                    }
+                }
+            }
+
+            if let msg = hfTokenStatus {
+                Text(msg)
+                    .font(CadenciaFont.mono(11))
+                    .foregroundStyle(msg.contains("Saved") ? CadenciaPalette.mediterraneanJade : CadenciaPalette.terracotta)
+            }
+        }
+        .padding(18)
+        .cadenciaGlassCard(cornerRadius: 24)
+    }
+
+    // MARK: - 3. On-Device Neural Engine Model Manager
 
     private var onDeviceCoreMLHubCard: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -203,28 +305,35 @@ public struct HardwareSettingsView: View {
                 }
             }
 
-            // NVIDIA Magpie v2607 Core ML
-            modelRow(kind: .magpieTTS) {
-                Task { await appState.downloadMagpie() }
+            // 1. Gradium Phonon-40m-es (Native Spanish Voice)
+            modelRow(kind: .phononSpanish) {
+                Task { await appState.downloadPhononSpanish() }
             }
 
             Divider().overlay(Color.white.opacity(0.1))
 
-            // Parakeet Ultra 600M INT8 Core ML (FluidAudio)
+            // 2. Kokoro-82M (English Conversation Tutor)
+            modelRow(kind: .kokoroEnglish) {
+                Task { await appState.downloadKokoroEnglish() }
+            }
+
+            Divider().overlay(Color.white.opacity(0.1))
+
+            // 3. Parakeet Ultra 600M INT8 Core ML (FluidAudio)
             modelRow(kind: .parakeetUltra) {
                 Task { await appState.downloadParakeetUltra() }
             }
 
             Divider().overlay(Color.white.opacity(0.1))
 
-            // ZIPA CR Large 300M FP16 Multifunction Core ML (built into app bundle or one-tap cloud download)
+            // 4. ZIPA CR Large 300M FP16 Multifunction Core ML
             modelRow(kind: .zipaPhoneme) {
                 Task { await appState.installZipaFromCloud() }
             }
 
             Divider().overlay(Color.white.opacity(0.1))
 
-            // Silero VAD status row
+            // 5. Silero VAD status row
             let vadProg = appState.modelStatus[.sileroVAD]
             HStack {
                 VStack(alignment: .leading, spacing: 3) {
@@ -260,29 +369,18 @@ public struct HardwareSettingsView: View {
                 }
                 Spacer()
                 if prog?.isReady == true {
-                    if kind == .magpieTTS && appState.installedMagpieCheckpointVersion != "v2607" {
-                        Button(action: onInstall) {
-                            Label("Upgrade to v2607", systemImage: "arrow.down.circle.fill")
-                                .font(CadenciaFont.mono(10, weight: .bold))
-                                .foregroundStyle(CadenciaPalette.obsidian)
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 6)
-                                .background(CadenciaPalette.saffronGold, in: Capsule())
-                        }
-                        .disabled(isDownloading)
-                    } else {
-                        let badge: String = {
-                            if prog?.statusMessage.hasPrefix("Built-in") == true { return "BUILT-IN · GPU" }
-                            if kind == .magpieTTS && appState.installedMagpieCheckpointVersion == "v2607" { return "v2607 READY" }
-                            return "ANE READY"
-                        }()
-                        Label(badge, systemImage: "checkmark.circle.fill")
-                            .font(CadenciaFont.mono(10, weight: .bold))
-                            .foregroundStyle(CadenciaPalette.mediterraneanJade)
-                            .padding(.horizontal, 9)
-                            .padding(.vertical, 5)
-                            .background(CadenciaPalette.mediterraneanJade.opacity(0.16), in: Capsule())
-                    }
+                    let badge: String = {
+                        if prog?.statusMessage.hasPrefix("Built-in") == true { return "BUILT-IN · GPU" }
+                        if kind == .phononSpanish { return "ANE READY" }
+                        if kind == .kokoroEnglish { return "FP32 READY" }
+                        return "ANE READY"
+                    }()
+                    Label(badge, systemImage: "checkmark.circle.fill")
+                        .font(CadenciaFont.mono(10, weight: .bold))
+                        .foregroundStyle(CadenciaPalette.mediterraneanJade)
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 5)
+                        .background(CadenciaPalette.mediterraneanJade.opacity(0.16), in: Capsule())
                 } else {
                     Button(action: onInstall) {
                         Text(isDownloading ? "\(Int((prog?.fractionCompleted ?? 0) * 100))%" : "Install (~\(kind.estimatedSizeMB)MB)")
@@ -298,6 +396,7 @@ public struct HardwareSettingsView: View {
 
             if isDownloading, let prog {
                 let isCompiling = prog.statusMessage.localizedCaseInsensitiveContains("compil")
+                    || prog.statusMessage.localizedCaseInsensitiveContains("export")
                     || prog.statusMessage.localizedCaseInsensitiveContains("loading")
                     || prog.statusMessage.localizedCaseInsensitiveContains("optimizing")
                     || prog.statusMessage.localizedCaseInsensitiveContains("attaching")
@@ -325,7 +424,7 @@ public struct HardwareSettingsView: View {
         }
     }
 
-    // MARK: - 3. Live On-Device ANE Hardware Benchmark
+    // MARK: - 4. Live On-Device ANE Hardware Benchmark
 
     private var hardwareBenchmarkCard: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -344,37 +443,54 @@ public struct HardwareSettingsView: View {
                         benchmarkOutput = "Running 3.0s concurrent Parakeet Ultra INT8 + ZIPA FP16…"
                         let stt = await appState.speechRecognizer.runHardwareBenchmark()
 
-                        var ttsSummary = "Magpie v2607: not installed"
-                        if await appState.assetManager.isModelInstalled(.magpieTTS) {
+                        var phononSummary = "Phonon-40m-es (ES): not installed"
+                        if await appState.assetManager.isModelInstalled(.phononSpanish) {
                             do {
-                                if !(await appState.magpieEngine.isLoaded) {
-                                    benchmarkOutput = "Loading NVIDIA Magpie v2607 Core ML models…"
-                                    let dir = await appState.assetManager.directory(for: .magpieTTS)
-                                    try await appState.magpieEngine.loadModels(from: dir)
-                                }
-                                benchmarkOutput = "Synthesizing Spanish benchmark via NVIDIA Magpie v2607…"
+                                benchmarkOutput = "Synthesizing native Spanish via Phonon-40m-es…"
+                                try await appState.ensurePhononLoaded()
                                 let t0 = Date()
-                                let clip = try await appState.magpieEngine.synthesizeSentence(
-                                    text: "Buenos días, el cielo de Madrid brilla hoy.",
-                                    voice: .sofia,
+                                let clip = try await appState.phononEngine.synthesizeSentence(
+                                    text: "Buenos días, por qué pero ya dado suena tan natural en español.",
+                                    voice: .celia,
                                     accent: .castilian
                                 )
-                                lastBenchmarkClip = clip
+                                lastSpanishBenchmarkClip = clip
                                 let ms = Date().timeIntervalSince(t0) * 1000.0
-                                let rtf = (ms / 1000.0) / max(0.01, clip.durationSeconds)
-                                let ver = await appState.magpieEngine.checkpointVersion
-                                let fsf = await appState.magpieEngine.frameStackingFactor
-                                ttsSummary = String(
-                                    format: "Magpie %@ (%d× stack · FP16 AR + FP32 NanoCodec): %.0f ms for %.1fs audio (RTF %.2f×)",
-                                    ver, fsf, ms, clip.durationSeconds, rtf
+                                let rtfx = (ms > 0) ? (clip.durationSeconds / (ms / 1000.0)) : 0
+                                phononSummary = String(
+                                    format: "Phonon-40m-es (Celia es-ES · 24 kHz ANE): %.0f ms for %.1fs audio (%.1f× RT)",
+                                    ms, clip.durationSeconds, rtfx
                                 )
                             } catch {
-                                ttsSummary = "Magpie v2607 error: \(error.localizedDescription)"
+                                phononSummary = "Phonon-40m-es error: \(error.localizedDescription)"
                             }
                         }
+
+                        var kokoroSummary = "Kokoro-82M (EN): not installed"
+                        if await appState.assetManager.isModelInstalled(.kokoroEnglish) {
+                            do {
+                                benchmarkOutput = "Synthesizing English tutor via Kokoro-82M…"
+                                try await appState.ensureKokoroLoaded()
+                                let t0 = Date()
+                                let clip = try await appState.kokoroEngine.synthesizeEnglish(
+                                    text: "Great job! Notice how naturally that Spanish sentence flows.",
+                                    voice: KokoroEnglishEngine.defaultFemaleVoice
+                                )
+                                lastEnglishBenchmarkClip = clip
+                                let ms = Date().timeIntervalSince(t0) * 1000.0
+                                let rtfx = (ms > 0) ? (clip.durationSeconds / (ms / 1000.0)) : 0
+                                kokoroSummary = String(
+                                    format: "Kokoro-82M (af_heart EN · 24 kHz FP32): %.0f ms for %.1fs audio (%.1f× RT)",
+                                    ms, clip.durationSeconds, rtfx
+                                )
+                            } catch {
+                                kokoroSummary = "Kokoro-82M error: \(error.localizedDescription)"
+                            }
+                        }
+
                         benchmarkOutput = String(
-                            format: "3.0s Concurrent Dual-STT -> Parakeet Ultra INT8: %.0f ms | ZIPA 300M FP16: %.0f ms\n%@",
-                            stt.parakeetMs, stt.zipaMs, ttsSummary
+                            format: "3.0s Concurrent Dual-STT -> Parakeet Ultra INT8: %.0f ms | ZIPA 300M FP16: %.0f ms\n%@\n%@",
+                            stt.parakeetMs, stt.zipaMs, phononSummary, kokoroSummary
                         )
                     }
                 } label: {
@@ -391,7 +507,7 @@ public struct HardwareSettingsView: View {
                 .disabled(isBenchmarking)
             }
 
-            Text("Measures concurrent `async let` execution of Parakeet Ultra INT8 + ZIPA CR Large FP16 on 3.0s audio, plus Magpie v2607 RTF on your iPhone 18 Pro Max.")
+            Text("Measures concurrent Parakeet Ultra INT8 + ZIPA CR Large FP16 on 3.0s audio, native Spanish Phonon-40m-es speed, and English Kokoro-82M speed on your iPhone 18 Pro Max.")
                 .font(CadenciaFont.uiCaption(12))
                 .foregroundStyle(CadenciaPalette.mutedSilver)
 
@@ -404,33 +520,57 @@ public struct HardwareSettingsView: View {
                     .background(Color.black.opacity(0.35), in: RoundedRectangle(cornerRadius: 12))
             }
 
-            if let clip = lastBenchmarkClip {
-                Button {
-                    Task {
-                        isPlayingBenchmarkSample = true
-                        defer { isPlayingBenchmarkSample = false }
-                        do {
-                            try await appState.magpieEngine.play(clip: clip, targetWPM: 120)
-                        } catch {
-                            benchmarkOutput = (benchmarkOutput ?? "") + "\nPlayback error: \(error.localizedDescription)"
+            HStack(spacing: 10) {
+                if let esClip = lastSpanishBenchmarkClip {
+                    Button {
+                        Task {
+                            isPlayingSpanishSample = true
+                            defer { isPlayingSpanishSample = false }
+                            do {
+                                try await appState.audioPlayer.play(clip: esClip, targetWPM: 140)
+                            } catch {
+                                benchmarkOutput = (benchmarkOutput ?? "") + "\nPlayback error: \(error.localizedDescription)"
+                            }
                         }
+                    } label: {
+                        Label(isPlayingSpanishSample ? "Playing ES…" : "Play Phonon ES", systemImage: isPlayingSpanishSample ? "speaker.wave.3.fill" : "play.circle.fill")
+                            .font(CadenciaFont.uiCaption(12, weight: .bold))
+                            .foregroundStyle(CadenciaPalette.ivoryText)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 9)
+                            .cadenciaGlassPill(tint: CadenciaPalette.saffronGold, interactive: false)
                     }
-                } label: {
-                    Label(isPlayingBenchmarkSample ? "Playing Native 1.0× Sample…" : "Play Native 1.0× Magpie Sample", systemImage: isPlayingBenchmarkSample ? "speaker.wave.3.fill" : "play.circle.fill")
-                        .font(CadenciaFont.uiCaption(12, weight: .bold))
-                        .foregroundStyle(CadenciaPalette.ivoryText)
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 9)
-                        .cadenciaGlassPill(tint: CadenciaPalette.saffronGold, interactive: false)
+                    .disabled(isPlayingSpanishSample || isPlayingEnglishSample)
                 }
-                .disabled(isPlayingBenchmarkSample)
+
+                if let enClip = lastEnglishBenchmarkClip {
+                    Button {
+                        Task {
+                            isPlayingEnglishSample = true
+                            defer { isPlayingEnglishSample = false }
+                            do {
+                                try await appState.audioPlayer.play(clip: enClip, targetWPM: 140)
+                            } catch {
+                                benchmarkOutput = (benchmarkOutput ?? "") + "\nPlayback error: \(error.localizedDescription)"
+                            }
+                        }
+                    } label: {
+                        Label(isPlayingEnglishSample ? "Playing EN…" : "Play Kokoro EN", systemImage: isPlayingEnglishSample ? "speaker.wave.3.fill" : "play.circle.fill")
+                            .font(CadenciaFont.uiCaption(12, weight: .bold))
+                            .foregroundStyle(CadenciaPalette.ivoryText)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 9)
+                            .cadenciaGlassPill(tint: CadenciaPalette.bioluminescentCobalt, interactive: false)
+                    }
+                    .disabled(isPlayingSpanishSample || isPlayingEnglishSample)
+                }
             }
         }
         .padding(18)
         .cadenciaGlassCard(cornerRadius: 24)
     }
 
-    // MARK: - 4. Protocol Parameters & Stage 1 Freeze Lock
+    // MARK: - 5. Protocol Parameters & Stage 1 Freeze Lock
 
     private var protocolParametersCard: some View {
         let p = appState.profile?.parameters ?? .protocolDefaults
@@ -491,7 +631,7 @@ public struct HardwareSettingsView: View {
         .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
     }
 
-    // MARK: - 5. Study Mode & Serial Story Settings
+    // MARK: - 6. Study Mode & Serial Story Settings
 
     private var profileStudyModeCard: some View {
         VStack(alignment: .leading, spacing: 14) {

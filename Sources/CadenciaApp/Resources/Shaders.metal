@@ -16,7 +16,7 @@ struct AuroraUniforms {
 struct OrbUniforms {
     float time;
     float energy;
-    float state;       // 0=Idle, 1=Listening (mic), 2=Thinking (Terra), 3=Speaking (Magpie)
+    float state;       // 0=Idle, 1=Listening (mic), 2=Thinking (Terra), 3=Speaking (Phonon / Kokoro)
     float aspect;
     float4 bands0;
     float4 bands1;
@@ -176,7 +176,7 @@ fragment float4 resonanceOrbFragment(VertexOut in [[stage_in]],
         primaryCol   = float3(0.96, 0.72, 0.28);
         secondaryCol = float3(0.88, 0.36, 0.24);
     } else if (u.state >= 2.5) {
-        // Speaking (NVIDIA Magpie v2607): Solar Amber & Rose Coral
+        // Speaking (Phonon-40m-es / Kokoro-82M): Solar Amber & Rose Coral
         primaryCol   = float3(0.98, 0.62, 0.28);
         secondaryCol = float3(0.90, 0.34, 0.42);
     } else {

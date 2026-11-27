@@ -109,11 +109,11 @@ public struct SessionScheduler: Sendable {
             isAudioFirst = fraction > 0 && Double((passageIndexInSession * 37) % 100) / 100.0 < fraction
         }
 
-        // Voice & Regional Accent Rotation (Rule 8: rotate through >=4 voices and >=2 regional accents)
-        let voices = MagpieVoice.allCases // 5 voices: Sofia, Aria, Jason, Leo, John
+        // Voice & Regional Accent Rotation (Rule 8: rotate through >=4 native Phonon voices and >=2 regional accents)
         let accents: [SpanishRegionalAccent] = [.castilian, .latinAmerican, .rioplatense]
-        let voice = voices[(profile.currentSessionNumber * 7 + passageIndexInSession) % voices.count]
         let accent = accents[(profile.currentSessionNumber + passageIndexInSession) % accents.count]
+        let regionalPool = accent == .castilian ? TutorVoice.castilianVoices : TutorVoice.latinAmericanVoices
+        let voice = regionalPool[(profile.currentSessionNumber * 7 + passageIndexInSession) % regionalPool.count]
 
         // Continuity alternation (Rule 7: episodes of chosen serial alternating with learner-named non-fiction)
         let format: PassageFormat

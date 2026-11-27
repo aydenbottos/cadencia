@@ -1,22 +1,43 @@
 import CadenciaCore
+import CadenciaSpeech
 import SwiftUI
 
-/// Immersive Bidirectional Voice Studio for Output 1 (Retell, min 28–40) and Output 2 (Open Talk / SIELE, min 62–75).
+/// Immersive Bidirectional Bilingual Voice Studio for Output 1 (Retell, min 28–40) and Output 2 (Open Talk / SIELE, min 62–75).
 /// Features:
-///  - Live 120Hz Raymarched Metal Resonance Orb responding to learner mic FFT & Magpie tutor audio
+///  - Live 120Hz Raymarched Metal Resonance Orb responding to learner mic FFT & dual tutor audio
+///  - Native Spanish voicing via **Gradium Phonon-40m-es** + English conversation coaching via **Kokoro-82M** (24 kHz stitched)
 ///  - Concurrent Parakeet Ultra 600M INT8 transcript + ZIPA CR Large 300M FP16 **IPA Phoneme Articulation Ribbon**
-///  - Natural implicit Recast Corrections (PDF p. 9 — zero grammar lectures!)
-///  - Live latency telemetry badges (Parakeet ms + ZIPA ms)
+///  - Natural implicit Recast Corrections + toggleable **ES + EN Tutor** vs **Spanish Only** mode
 public struct SpeakingPartnerView: View {
     @Bindable var controller: SessionController
 
     public var body: some View {
         VStack(spacing: 0) {
+            // Top Tutor Mode Bar (ES + EN Tutor via Phonon + Kokoro vs Spanish Only)
+            HStack(spacing: 10) {
+                Picker("Tutor Language", selection: $controller.conversationTutorMode) {
+                    ForEach(ConversationTutorMode.allCases) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+
+                Text(controller.conversationTutorMode.allowsEnglish ? "PHONON + KOKORO" : "PHONON ES")
+                    .font(CadenciaFont.mono(9, weight: .bold))
+                    .foregroundStyle(CadenciaPalette.saffronGold)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background(CadenciaPalette.saffronGold.opacity(0.14), in: Capsule())
+            }
+            .padding(.horizontal, 18)
+            .padding(.top, 8)
+            .padding(.bottom, 6)
+
             ScrollViewReader { proxy in
                 ScrollView(showsIndicators: false) {
                     VStack(spacing: 18) {
-                        // Current Tutor Prompt Banner
-                        VStack(alignment: .leading, spacing: 8) {
+                        // Current Tutor Prompt Banner (Spanish + optional English Coaching)
+                        VStack(alignment: .leading, spacing: 10) {
                             HStack {
                                 Label(
                                     controller.currentBlock == .output1 ? "OUTPUT I · RETELL" : "OUTPUT II · LIVE CONVERSATION",
@@ -26,15 +47,55 @@ public struct SpeakingPartnerView: View {
                                 .tracking(2)
                                 .foregroundStyle(CadenciaPalette.mediterraneanJade)
                                 Spacer()
-                                Text("CLOSED VOCABULARY")
-                                    .font(CadenciaFont.mono(10))
-                                    .foregroundStyle(CadenciaPalette.mutedSilver)
+                                Button {
+                                    Task {
+                                        let accent = controller.currentPassage?.accent ?? .castilian
+                                        let voice: TutorVoice = controller.currentBlock == .output2 ? .leonel : .celia
+                                        await controller.speakSpanishLine(controller.currentPartnerPromptEs, voice: voice, accent: accent)
+                                    }
+                                } label: {
+                                    Label("ES", systemImage: "speaker.wave.2.fill")
+                                        .font(CadenciaFont.mono(10, weight: .bold))
+                                        .foregroundStyle(CadenciaPalette.mediterraneanJade)
+                                        .padding(.horizontal, 8)
+                                        .padding(.vertical, 4)
+                                        .background(CadenciaPalette.mediterraneanJade.opacity(0.16), in: Capsule())
+                                }
+                                .buttonStyle(.plain)
                             }
+
                             Text(controller.currentPartnerPromptEs)
                                 .font(CadenciaFont.proseSerif(21))
                                 .foregroundStyle(CadenciaPalette.ivoryText)
                                 .lineSpacing(4)
-                            if let hint = controller.currentPartnerHintEn {
+
+                            if controller.conversationTutorMode.allowsEnglish,
+                               let englishCoach = controller.currentPartnerReplyEn ?? controller.currentPartnerHintEn,
+                               !englishCoach.isEmpty {
+                                HStack(alignment: .top, spacing: 10) {
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        Text("ENGLISH TUTOR · KOKORO-82M")
+                                            .font(CadenciaFont.mono(9, weight: .bold))
+                                            .foregroundStyle(CadenciaPalette.bioluminescentCobalt)
+                                        Text(englishCoach)
+                                            .font(CadenciaFont.uiCaption(13))
+                                            .foregroundStyle(CadenciaPalette.ivoryText.opacity(0.88))
+                                    }
+                                    Spacer()
+                                    Button {
+                                        Task { await controller.speakEnglishCoachLine(englishCoach) }
+                                    } label: {
+                                        Image(systemName: "speaker.wave.2.fill")
+                                            .font(.caption)
+                                            .foregroundStyle(CadenciaPalette.bioluminescentCobalt)
+                                            .padding(8)
+                                            .background(CadenciaPalette.bioluminescentCobalt.opacity(0.16), in: Circle())
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                                .padding(10)
+                                .background(CadenciaPalette.bioluminescentCobalt.opacity(0.10), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                            } else if let hint = controller.currentPartnerHintEn {
                                 Text(hint)
                                     .font(.caption)
                                     .foregroundStyle(CadenciaPalette.mutedSilver)
@@ -109,8 +170,10 @@ public struct SpeakingPartnerView: View {
     private var statusCaption: String {
         if controller.isRecordingVoice { return "LISTENING · TAP ORB TO SEND" }
         if controller.isEvaluatingVoice { return "PARAKEET INT8 + ZIPA FP16 + TERRA…" }
-        if controller.orbMode == .speaking { return "MAGPIE v2607 SPEAKING…" }
-        return "TAP ORB TO SPEAK SPANISH"
+        if controller.orbMode == .speaking { return "\(controller.activeSpeakingEngineLabel) SPEAKING…" }
+        return controller.conversationTutorMode.allowsEnglish
+            ? "TAP ORB · SPEAK SPANISH (OR ASK IN ENGLISH)"
+            : "TAP ORB TO SPEAK SPANISH"
     }
 
     private func turnEvaluationCard(_ turn: SpokenTurnEvaluation) -> some View {
@@ -164,7 +227,6 @@ public struct SpeakingPartnerView: View {
                         }
                     }
 
-                    // Top concrete articulatory cue if any mismatch detected
                     if let hint = turn.alignments.first(where: { $0.coachingHint != nil })?.coachingHint {
                         Label(hint, systemImage: "mouth.fill")
                             .font(.caption2)
@@ -173,7 +235,7 @@ public struct SpeakingPartnerView: View {
                 }
             }
 
-            // Implicit Recast Correction (PDF p. 9: repeat cleanly, zero grammar lecture!)
+            // Implicit Recast Correction
             if let recast = turn.partnerRecastEs, !recast.isEmpty {
                 HStack(alignment: .top, spacing: 8) {
                     Image(systemName: "sparkles")
@@ -186,19 +248,73 @@ public struct SpeakingPartnerView: View {
                             .font(CadenciaFont.proseSerif(16))
                             .foregroundStyle(CadenciaPalette.ivoryText)
                     }
+                    Spacer()
+                    Button {
+                        Task {
+                            let accent = controller.currentPassage?.accent ?? .castilian
+                            await controller.speakSpanishLine(recast, voice: .celia, accent: accent)
+                        }
+                    } label: {
+                        Image(systemName: "speaker.wave.2.fill")
+                            .font(.caption)
+                            .foregroundStyle(CadenciaPalette.saffronGold)
+                            .padding(6)
+                            .background(CadenciaPalette.saffronGold.opacity(0.15), in: Circle())
+                    }
+                    .buttonStyle(.plain)
                 }
                 .padding(10)
                 .background(CadenciaPalette.saffronGold.opacity(0.12), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
             }
 
-            // Partner Reply
-            VStack(alignment: .leading, spacing: 4) {
-                Text("TUTOR")
-                    .font(CadenciaFont.mono(10, weight: .bold))
-                    .foregroundStyle(CadenciaPalette.mediterraneanJade)
+            // Bilingual Tutor Reply: Spanish (Phonon-40m-es) + English Coaching (Kokoro-82M)
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("TUTOR · PHONON-40M-ES")
+                        .font(CadenciaFont.mono(10, weight: .bold))
+                        .foregroundStyle(CadenciaPalette.mediterraneanJade)
+                    Spacer()
+                    Button {
+                        Task { await controller.replayConversationTurn(turn) }
+                    } label: {
+                        Label("Replay", systemImage: "play.circle.fill")
+                            .font(CadenciaFont.mono(10, weight: .bold))
+                            .foregroundStyle(CadenciaPalette.ivoryText)
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 4)
+                            .background(Color.white.opacity(0.10), in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                }
                 Text(turn.partnerReplyEs)
                     .font(CadenciaFont.proseSerif(17))
                     .foregroundStyle(CadenciaPalette.ivoryText.opacity(0.95))
+
+                if let englishReply = turn.partnerReplyEn, !englishReply.isEmpty {
+                    HStack(alignment: .top, spacing: 8) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("ENGLISH · KOKORO-82M")
+                                .font(CadenciaFont.mono(9, weight: .bold))
+                                .foregroundStyle(CadenciaPalette.bioluminescentCobalt)
+                            Text(englishReply)
+                                .font(CadenciaFont.uiCaption(14))
+                                .foregroundStyle(CadenciaPalette.ivoryText.opacity(0.90))
+                        }
+                        Spacer()
+                        Button {
+                            Task { await controller.speakEnglishCoachLine(englishReply) }
+                        } label: {
+                            Image(systemName: "speaker.wave.2.fill")
+                                .font(.caption)
+                                .foregroundStyle(CadenciaPalette.bioluminescentCobalt)
+                                .padding(6)
+                                .background(CadenciaPalette.bioluminescentCobalt.opacity(0.16), in: Circle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .padding(10)
+                    .background(CadenciaPalette.bioluminescentCobalt.opacity(0.10), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                }
             }
 
             if !turn.correctlyUsedItemIds.isEmpty {

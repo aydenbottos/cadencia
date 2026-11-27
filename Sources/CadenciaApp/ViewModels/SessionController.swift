@@ -7,7 +7,7 @@ import SwiftUI
 /// Orchestrates the exact 75-minute Signal-Starvation session across all 5 blocks + Closing Ritual:
 ///   0–3 min:   Warm-Up (20 rapid meaning checks on shakiest items from last session)
 ///   3–28 min:  Input 1 (Audio + synced text together, tap-to-gloss, replay, pace doubt detector, 2–3 load-bearing probes)
-///   28–40 min: Output 1 (Voice Retell + 2–3 due-item follow-up questions with Parakeet Ultra + ZIPA + Magpie)
+///   28–40 min: Output 1 (Voice Retell + 2–3 due-item follow-up questions with Parakeet Ultra + ZIPA + Phonon-40m-es + Kokoro-82M)
 ///   40–62 min: Input 2 (Audio-First Theater -> Probes by ear -> Curtain Reveal of synced text)
 ///   62–75 min: Output 2 (Open Talk / Role-Play / Week 5+ SIELE Speaking OR 13-min Writing twice/week from Week 3+)
 ///   Closing:   1–7 Fatigue & Enjoyment + Daily "No Other Spanish" Diary + Session Telemetry Recap!
@@ -59,7 +59,10 @@ public final class SessionController {
     public var orbMode: ResonanceOrbMode = .idle
     public var speakingTurns: [SpokenTurnEvaluation] = []
     public var currentPartnerPromptEs: String = ""
+    public var currentPartnerReplyEn: String?
     public var currentPartnerHintEn: String?
+    public var conversationTutorMode: ConversationTutorMode = .bilingualCoach
+    public var activeSpeakingEngineLabel: String = "PHONON-40M-ES"
     public var isRecordingVoice: Bool = false
     public var isEvaluatingVoice: Bool = false
     public var writingPromptEs: String = ""
@@ -163,8 +166,16 @@ public final class SessionController {
             speakingTurns.removeAll()
             let lastTitle = currentPassage?.titleEs ?? "la historia"
             currentPartnerPromptEs = "Cuéntame con tus propias palabras qué ocurrió en «\(lastTitle)». ¿Cuál fue el momento más importante?"
-            currentPartnerHintEn = "Retell the passage you just heard in Spanish; your partner will ask 2–3 due-item questions."
-            await speakPartnerLine(currentPartnerPromptEs, voice: .sofia, accent: .castilian)
+            currentPartnerReplyEn = conversationTutorMode.allowsEnglish
+                ? "Feel free to retell the passage in Spanish—and if you get stuck, ask me anything in English!"
+                : nil
+            currentPartnerHintEn = "Retell the passage you just heard in Spanish; your tutor can also coach you in English."
+            await speakOpeningConversationPrompt(
+                spanish: currentPartnerPromptEs,
+                english: currentPartnerReplyEn,
+                voice: .celia,
+                accent: .castilian
+            )
         case .output2:
             orbMode = .idle
             if isWritingDay {
@@ -180,10 +191,20 @@ public final class SessionController {
                 currentPartnerPromptEs = week >= 5
                     ? "Vamos a practicar formato SIELE: imagina que acabas de llegar a un piso nuevo y hay un problema con la calefacción. Explícame la situación y propón una solución."
                     : "Hablemos un rato sobre tu semana y los temas de hoy. ¿Qué es lo que más te ha llamado la atención últimamente?"
+                currentPartnerReplyEn = conversationTutorMode.allowsEnglish
+                    ? (week >= 5
+                        ? "This is a SIELE speaking scenario. Respond in Spanish, or ask me in English if you need a phrase!"
+                        : "Let's chat naturally in Spanish—and I can jump in with English hints whenever you'd like.")
+                    : nil
                 currentPartnerHintEn = week >= 5
                     ? "Week 5+ SIELE Oral Interaction task — speak naturally!"
                     : "Open conversation steered toward your top-2,000 productive vocabulary."
-                await speakPartnerLine(currentPartnerPromptEs, voice: .leo, accent: .latinAmerican)
+                await speakOpeningConversationPrompt(
+                    spanish: currentPartnerPromptEs,
+                    english: currentPartnerReplyEn,
+                    voice: .leonel,
+                    accent: .latinAmerican
+                )
             }
         case .closing:
             timerTask?.cancel()
@@ -339,7 +360,7 @@ public final class SessionController {
             payloadJSON: "{\"wordCount\":\(passage.wordCount),\"audioFirst\":\(passage.isAudioFirst),\"voice\":\"\(passage.voice.rawValue)\",\"accent\":\"\(passage.accent.rawValue)\"}"
         ))
 
-        // Synthesize passage audio via on-device NVIDIA Magpie v2607 Core ML!
+        // Synthesize passage audio natively via on-device Gradium Phonon-40m-es!
         await synthesizeAndOptionallyPlay(passage: passage, autoPlay: firstTimeGrammar == nil)
     }
 
@@ -364,10 +385,10 @@ public final class SessionController {
     }
 
     private func synthesizeAndOptionallyPlay(passage: GeneratedPassage, autoPlay: Bool) async {
-        try? await appState.ensureMagpieLoaded()
-        guard await appState.magpieEngine.isLoaded else { return }
+        try? await appState.ensurePhononLoaded()
+        guard await appState.phononEngine.isLoaded else { return }
         do {
-            let clip = try await appState.magpieEngine.synthesizePassage(
+            let clip = try await appState.phononEngine.synthesizePassage(
                 sentences: passage.sentences.map(\.spanish),
                 voice: passage.voice,
                 accent: passage.accent
@@ -397,7 +418,7 @@ public final class SessionController {
         isPlayingAudio = true
         orbMode = .speaking
 
-        let speedRatio = max(0.55, min(1.35, Double(currentWPMOverride) / 140.0))
+        let speedRatio = max(0.68, min(1.30, Double(currentWPMOverride) / 140.0))
         let timings = clip.wordTimings
 
         // Synchronized 60Hz Karaoke word highlighter
@@ -414,7 +435,7 @@ public final class SessionController {
         }
 
         do {
-            try await appState.magpieEngine.play(clip: clip, targetWPM: currentWPMOverride)
+            try await appState.audioPlayer.play(clip: clip, targetWPM: currentWPMOverride)
         } catch {}
 
         playbackHighlightTask?.cancel()
@@ -425,13 +446,13 @@ public final class SessionController {
 
     public func stopAudioPlayback() async {
         playbackHighlightTask?.cancel()
-        await appState.magpieEngine.stopPlayback()
+        await appState.audioPlayer.stopPlayback()
         isPlayingAudio = false
         orbMode = .idle
     }
 
     /// Handles tap-to-gloss on ANY Spanish word in the passage -> displays English gloss, visual cue,
-    /// IPA, pronounces word via Magpie, AND logs a Failure (x0.5) in the Evidence Log (PDF p. 6)!
+    /// IPA, pronounces word natively via Phonon-40m-es, AND logs a Failure (x0.5) in the Evidence Log (PDF p. 6)!
     public func handleWordTapped(surface: String) async {
         HapticDirector.shared.playGlossTap()
         let lower = surface.lowercased().trimmingCharacters(in: CharacterSet.letters.inverted)
@@ -456,20 +477,22 @@ public final class SessionController {
                 ))
             }
 
-            // Speak single word pronunciation immediately via Magpie (cached -> instant!)
-            if let passage = currentPassage, await appState.magpieEngine.isLoaded {
+            // Speak single word pronunciation immediately via Phonon-40m-es (cached -> instant!)
+            if let passage = currentPassage {
                 Task {
-                    if let wordClip = try? await appState.magpieEngine.synthesizeSentence(
+                    try? await appState.ensurePhononLoaded()
+                    guard await appState.phononEngine.isLoaded else { return }
+                    if let wordClip = try? await appState.phononEngine.synthesizeSentence(
                         text: surface, voice: passage.voice, accent: passage.accent
                     ) {
-                        try? await appState.magpieEngine.play(clip: wordClip, targetWPM: 120)
+                        try? await appState.audioPlayer.play(clip: wordClip, targetWPM: 140)
                     }
                 }
             }
         }
     }
 
-    /// Handles sentence replay -> plays that exact sentence AND flags Doubt (extra meeting this session, PDF p. 6)!
+    /// Handles sentence replay -> plays that exact sentence natively via Phonon-40m-es AND flags Doubt (PDF p. 6)!
     public func replaySentence(_ sentence: PassageSentence) async {
         HapticDirector.shared.playDoubtPulse()
         replayedSentenceIndices.insert(sentence.id)
@@ -483,8 +506,10 @@ public final class SessionController {
             payloadJSON: "{\"sentenceIndex\":\(sentence.id)}"
         ))
 
-        if let passage = currentPassage, await appState.magpieEngine.isLoaded {
-            if let clip = try? await appState.magpieEngine.synthesizeSentence(
+        if let passage = currentPassage {
+            try? await appState.ensurePhononLoaded()
+            guard await appState.phononEngine.isLoaded else { return }
+            if let clip = try? await appState.phononEngine.synthesizeSentence(
                 text: sentence.spanish, voice: passage.voice, accent: passage.accent
             ) {
                 await playCurrentClip(clip)
@@ -629,7 +654,7 @@ public final class SessionController {
         }
     }
 
-    // MARK: - Block 2 & 4: Voice Speaking Partner (Parakeet Ultra INT8 + ZIPA CR Large FP16 + GPT-6.1 Terra + Magpie v2607)
+    // MARK: - Block 2 & 4: Bilingual Voice Tutor (Parakeet Ultra + ZIPA + GPT-6.1 Terra + Phonon-40m-es + Kokoro-82M)
 
     public func toggleVoiceRecording() async {
         if isRecordingVoice {
@@ -655,7 +680,9 @@ public final class SessionController {
         defer { isEvaluatingVoice = false }
 
         do {
-            let accent = currentPassage?.accent ?? .castilian
+            let accent = currentPassage?.accent ?? (currentBlock == .output2 ? .latinAmerican : .castilian)
+            let tutorVoice: TutorVoice = currentBlock == .output2 ? .leonel : .celia
+
             // Runs Parakeet Ultra 600M INT8 AND ZIPA CR Large 300M FP16 CONCURRENTLY on Core ML!
             let recognition = try await appState.speechRecognizer.stopAndRecognize(
                 expectedSpanishText: nil,
@@ -664,7 +691,7 @@ public final class SessionController {
             )
             guard !recognition.transcriptEs.isEmpty else {
                 orbMode = .idle
-                errorMessage = "Didn't catch speech—tap the orb and speak clearly in Spanish."
+                errorMessage = "Didn't catch speech—tap the orb and speak clearly."
                 return
             }
 
@@ -686,10 +713,12 @@ public final class SessionController {
                 return rec.meetingsCount > 0
             }.map(\.spanish)
 
-            let history: [(role: String, text: String)] = speakingTurns.flatMap { t in
-                [("learner", t.learnerTranscript), ("partner", t.partnerReplyEs)]
+            let history: [(role: String, text: String)] = speakingTurns.flatMap { t -> [(role: String, text: String)] in
+                let partnerJoined = [t.partnerReplyEn, t.partnerReplyEs].compactMap { $0 }.joined(separator: " ")
+                return [("learner", t.learnerTranscript), ("partner", partnerJoined)]
             }
 
+            let allowEnglish = conversationTutorMode.allowsEnglish
             let partnerResp = try await appState.terraClient.evaluateSpeakingTurn(
                 mode: currentBlock,
                 week: profile.currentWeek,
@@ -701,7 +730,8 @@ public final class SessionController {
                 steeringProductiveItems: steering,
                 scheduledGrammarPatterns: Array(schedGrammar),
                 allowedVocabularySample: allowedVocab,
-                conversationHistory: history
+                conversationHistory: history,
+                allowEnglishTutor: allowEnglish
             )
 
             // Resolve item IDs for strong productive successes & failed grammar patterns
@@ -736,6 +766,7 @@ public final class SessionController {
                 }
             }
 
+            let resolvedSegments = partnerResp.resolvedSpokenSegments(allowEnglish: allowEnglish)
             let eval = SpokenTurnEvaluation(
                 id: UUID().uuidString,
                 timestamp: Date(),
@@ -746,6 +777,8 @@ public final class SessionController {
                 alignments: recognition.alignments,
                 partnerRecastEs: partnerResp.recastCorrectionEs,
                 partnerReplyEs: partnerResp.partnerReplyEs,
+                partnerReplyEn: allowEnglish ? partnerResp.partnerReplyEn : nil,
+                spokenSegments: resolvedSegments,
                 correctlyUsedItemIds: usedIds,
                 failedGrammarPatternIds: partnerResp.failedGrammarPatternIds,
                 parakeetLatencyMs: recognition.parakeetLatencyMs,
@@ -753,6 +786,7 @@ public final class SessionController {
             )
             speakingTurns.append(eval)
             currentPartnerPromptEs = partnerResp.partnerReplyEs
+            currentPartnerReplyEn = allowEnglish ? partnerResp.partnerReplyEn : nil
             currentPartnerHintEn = partnerResp.followUpPromptEnHint
 
             try? await appState.database.appendEvidence(EvidenceEvent(
@@ -765,23 +799,118 @@ public final class SessionController {
                 payloadJSON: "{\"transcript\":\(jsonEscaped(recognition.transcriptEs)),\"ipa\":\(jsonEscaped(recognition.learnerIPA)),\"parakeetMs\":\(Int(recognition.parakeetLatencyMs)),\"zipaMs\":\(Int(recognition.zipaLatencyMs))}"
             ))
 
-            await speakPartnerLine(partnerResp.partnerReplyEs, voice: .sofia, accent: accent)
+            await speakBilingualPartnerTurn(segments: resolvedSegments, spanishVoice: tutorVoice, accent: accent)
         } catch {
             orbMode = .idle
             errorMessage = error.localizedDescription
         }
     }
 
-    private func speakPartnerLine(_ text: String, voice: MagpieVoice, accent: SpanishRegionalAccent) async {
-        guard await appState.magpieEngine.isLoaded else {
+    private func speakOpeningConversationPrompt(
+        spanish: String,
+        english: String?,
+        voice: TutorVoice,
+        accent: SpanishRegionalAccent
+    ) async {
+        var segments: [TutorSpeechSegment] = [TutorSpeechSegment(language: .spanish, text: spanish)]
+        if conversationTutorMode.allowsEnglish, let en = english, !en.isEmpty {
+            segments.append(TutorSpeechSegment(language: .english, text: en))
+        }
+        await speakBilingualPartnerTurn(segments: segments, spanishVoice: voice, accent: accent)
+    }
+
+    public func speakBilingualPartnerTurn(
+        segments: [TutorSpeechSegment],
+        spanishVoice: TutorVoice,
+        accent: SpanishRegionalAccent
+    ) async {
+        let hasSpanish = segments.contains { $0.language == .spanish }
+        let hasEnglish = segments.contains { $0.language == .english }
+
+        if hasSpanish { try? await appState.ensurePhononLoaded() }
+        if hasEnglish { try? await appState.ensureKokoroLoaded() }
+
+        let phononReady = await appState.phononEngine.isLoaded
+        let kokoroReady = await appState.kokoroEngine.isLoaded
+        guard (hasSpanish && phononReady) || (hasEnglish && kokoroReady) else {
             orbMode = .idle
             return
         }
+
+        if hasSpanish && phononReady && hasEnglish && kokoroReady {
+            activeSpeakingEngineLabel = "PHONON-40M-ES + KOKORO-82M"
+        } else if hasEnglish && kokoroReady && !hasSpanish {
+            activeSpeakingEngineLabel = "KOKORO-82M"
+        } else {
+            activeSpeakingEngineLabel = "PHONON-40M-ES"
+        }
+
         orbMode = .speaking
-        if let clip = try? await appState.magpieEngine.synthesizeSentence(text: text, voice: voice, accent: accent) {
-            try? await appState.magpieEngine.play(clip: clip, targetWPM: WeeklyPlanSpec.forWeek(profile.currentWeek).paceWPM)
+        do {
+            let clip = try await KokoroEnglishEngine.synthesizeBilingualTurn(
+                segments: segments,
+                spanishVoice: spanishVoice,
+                accent: accent,
+                spanishEngine: appState.phononEngine,
+                englishEngine: appState.kokoroEngine
+            )
+            if !clip.samples.isEmpty {
+                let pace = hasEnglish ? 140 : WeeklyPlanSpec.forWeek(profile.currentWeek).paceWPM
+                try await appState.audioPlayer.play(clip: clip, targetWPM: pace)
+            }
+        } catch {
+            errorMessage = "Tutor voice notice: \(error.localizedDescription)"
         }
         orbMode = .idle
+    }
+
+    public func speakSpanishLine(
+        _ text: String,
+        voice: TutorVoice = .celia,
+        accent: SpanishRegionalAccent = .castilian
+    ) async {
+        await speakBilingualPartnerTurn(
+            segments: [TutorSpeechSegment(language: .spanish, text: text)],
+            spanishVoice: voice,
+            accent: accent
+        )
+    }
+
+    public func speakEnglishCoachLine(
+        _ text: String,
+        voice: String = KokoroEnglishEngine.defaultFemaleVoice
+    ) async {
+        try? await appState.ensureKokoroLoaded()
+        guard await appState.kokoroEngine.isLoaded else {
+            errorMessage = "Install Kokoro-82M (English Tutor) in Settings to hear English tutor speech."
+            return
+        }
+        activeSpeakingEngineLabel = "KOKORO-82M"
+        orbMode = .speaking
+        do {
+            let clip = try await appState.kokoroEngine.synthesizeEnglish(text: text, voice: voice)
+            try await appState.audioPlayer.play(clip: clip, targetWPM: 140)
+        } catch {
+            errorMessage = "Kokoro-82M notice: \(error.localizedDescription)"
+        }
+        orbMode = .idle
+    }
+
+    public func replayConversationTurn(_ turn: SpokenTurnEvaluation) async {
+        let accent = currentPassage?.accent ?? (currentBlock == .output2 ? .latinAmerican : .castilian)
+        let tutorVoice: TutorVoice = currentBlock == .output2 ? .leonel : .celia
+        let segments: [TutorSpeechSegment]
+        if !turn.spokenSegments.isEmpty {
+            segments = turn.spokenSegments
+        } else {
+            var built: [TutorSpeechSegment] = []
+            if let en = turn.partnerReplyEn, !en.isEmpty {
+                built.append(TutorSpeechSegment(language: .english, text: en))
+            }
+            built.append(TutorSpeechSegment(language: .spanish, text: turn.partnerReplyEs))
+            segments = built
+        }
+        await speakBilingualPartnerTurn(segments: segments, spanishVoice: tutorVoice, accent: accent)
     }
 
     // MARK: - Block 4 (Alt): 13-Minute Writing Submission (Week 3+, Twice Weekly)

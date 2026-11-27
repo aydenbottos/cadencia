@@ -18,7 +18,7 @@ private enum ActiveLabSheet: String, Identifiable {
 ///  - Live Verdicts for Claim 1 (Density), Claim 2 (Capacity 30/60/120), Claim 3 (Conversion / Top-2000)
 ///  - Weekly 60-Item Calibration Audit with GPT-6.1 Terra grading + Automated Online MLE Multiplier Refit
 ///  - Vocabulary Size Test (Yes/No + Pseudowords + 400-Item Hold-Out >15% Guard + 100-Item Typed Recall)
-///  - Spanish Elicited Imitation Task (30 rising-length Ortega sentences via Magpie + Parakeet Ultra + ZIPA)
+///  - Spanish Elicited Imitation Task (30 rising-length Ortega sentences via Phonon-40m-es + Parakeet Ultra + ZIPA)
 ///  - Native-Speed Listening Test (Hours 30 & 60 unscripted passages + comprehension check)
 ///  - Baseline 10-Min Speaking Recorder (Solo Pilot Step 2)
 ///  - Stage 0 Bench Test Runner (Simulated Hours 2, 10, 20, 35, 50)
@@ -222,7 +222,7 @@ public struct ResearchLabView: View {
             labActionRow(
                 icon: "waveform.and.mic",
                 title: "Spanish Elicited Imitation Task (EIT)",
-                subtitle: "30 Ortega sentences (7–17 syllables) · Magpie audio -> Parakeet Ultra + ZIPA 0–4 scoring",
+                subtitle: "30 Ortega sentences (7–17 syllables) · Phonon-40m-es audio -> Parakeet Ultra + ZIPA 0–4 scoring",
                 tint: CadenciaPalette.bioluminescentCobalt
             ) { activeSheet = .spanishEIT }
 
@@ -893,15 +893,15 @@ private struct SpanishEITRunnerSheet: View {
 
     private func playPromptOnce(_ prompt: EITPrompt) async {
         isPlaying = true
-        statusLine = "Playing sentence via Magpie v2607…"
+        statusLine = "Playing native Spanish via Phonon-40m-es…"
         defer { isPlaying = false; hasPlayedCurrent = true }
-        try? await appState.ensureMagpieLoaded()
-        if await appState.magpieEngine.isLoaded,
-           let clip = try? await appState.magpieEngine.synthesizeSentence(text: prompt.spanish, voice: .sofia, accent: .castilian) {
-            try? await appState.magpieEngine.play(clip: clip, targetWPM: 120)
+        try? await appState.ensurePhononLoaded()
+        if await appState.phononEngine.isLoaded,
+           let clip = try? await appState.phononEngine.synthesizeSentence(text: prompt.spanish, voice: .celia, accent: .castilian) {
+            try? await appState.audioPlayer.play(clip: clip, targetWPM: 140)
             statusLine = "Now tap Repeat Aloud and say the exact sentence."
         } else {
-            statusLine = "Magpie not installed — read once & repeat: «\(prompt.spanish)»"
+            statusLine = "Phonon-40m-es not installed — read once & repeat: «\(prompt.spanish)»"
         }
     }
 
@@ -1011,12 +1011,13 @@ private struct NativeListeningTestSheet: View {
                                 HStack(spacing: 12) {
                                     Button {
                                         Task {
-                                            guard await appState.magpieEngine.isLoaded else { return }
+                                            try? await appState.ensurePhononLoaded()
+                                            guard await appState.phononEngine.isLoaded else { return }
                                             isPlaying = true
                                             defer { isPlaying = false }
                                             let sentences = p.transcript.components(separatedBy: ". ").filter { !$0.isEmpty }
-                                            if let clip = try? await appState.magpieEngine.synthesizePassage(sentences: sentences, voice: p.speaker, accent: p.accent) {
-                                                try? await appState.magpieEngine.play(clip: clip, targetWPM: p.wpm)
+                                            if let clip = try? await appState.phononEngine.synthesizePassage(sentences: sentences, voice: p.speaker, accent: p.accent) {
+                                                try? await appState.audioPlayer.play(clip: clip, targetWPM: p.wpm)
                                             }
                                         }
                                     } label: {

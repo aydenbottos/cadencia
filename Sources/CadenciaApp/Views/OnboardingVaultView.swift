@@ -6,7 +6,7 @@ import SwiftUI
 ///  Step 1: Study Protocol Mode (Solo Pilot / Group A Full / Group B Control / Stage 1 Capacity)
 ///  Step 2: Continuity World — pick 1 of 3 Spanish Serial Genres + Non-Fiction Topics
 ///  Step 3: Secure iOS Keychain OpenAI Key Vault (live GPT-6.1 Terra verification)
-///  Step 4: On-Device Core ML Speech Engine Setup (Magpie v2607, Parakeet Ultra INT8, ZIPA 300M FP16)
+///  Step 4: On-Device Core ML Speech Engine Setup (Phonon-40m-es, Kokoro-82M, Parakeet Ultra INT8, ZIPA 300M FP16)
 public struct OnboardingVaultView: View {
     @Bindable var appState: AppState
 
@@ -16,6 +16,7 @@ public struct OnboardingVaultView: View {
     @State private var selectedSerialId = "madrid_noir"
     @State private var selectedTopics: Set<String> = ["Architecture & Cities", "Science & Neuroscience", "Food & History"]
     @State private var apiKeyInput = ""
+    @State private var hfTokenInput = ""
     @State private var keyVerifyStatus: String?
     @State private var isVerifyingKey = false
     @State private var isFinishing = false
@@ -89,7 +90,7 @@ public struct OnboardingVaultView: View {
                     .font(CadenciaFont.displaySerif(36, weight: .bold))
                     .foregroundStyle(CadenciaPalette.ivoryText)
                     .lineSpacing(3)
-                Text("Every passage is written dynamically from what you are about to forget—4,500 items, 15+ usable events per minute, powered on-device by Magpie v2607, Parakeet Ultra INT8, ZIPA 300M FP16, and GPT-6.1 Terra.")
+                Text("Every passage is written dynamically from what you are about to forget—4,500 items, 15+ usable events per minute, powered on-device by Phonon-40m-es, Kokoro-82M, Parakeet Ultra INT8, ZIPA 300M FP16, and GPT-6.1 Terra.")
                     .font(.subheadline)
                     .foregroundStyle(CadenciaPalette.mutedSilver)
                     .lineSpacing(4)
@@ -269,6 +270,30 @@ public struct OnboardingVaultView: View {
             }
             .padding(20)
             .cadenciaGlassCard(cornerRadius: 22)
+
+            VStack(alignment: .leading, spacing: 10) {
+                Text("HUGGING FACE READ TOKEN (FOR PHONON-40M-ES)")
+                    .font(CadenciaFont.mono(11, weight: .semibold))
+                    .foregroundStyle(CadenciaPalette.bioluminescentCobalt)
+                Text("Optional now (you can also set this in Settings). Accept gradium/phonon-40m-es on huggingface.co and enter your Read token (`hf_…`) to download native Spanish voices on-device.")
+                    .font(.caption)
+                    .foregroundStyle(CadenciaPalette.mutedSilver)
+                SecureField("hf_... (Hugging Face Read Token)", text: $hfTokenInput)
+                    .textFieldStyle(.plain)
+                    .font(CadenciaFont.mono(14))
+                    .padding(14)
+                    .foregroundStyle(CadenciaPalette.ivoryText)
+                    .cadenciaGlassCard(cornerRadius: 14)
+                    .onChange(of: hfTokenInput) { _, newVal in
+                        let trimmed = newVal.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !trimmed.isEmpty {
+                            _ = KeychainVault.saveHuggingFaceToken(trimmed)
+                            appState.hasHuggingFaceToken = true
+                        }
+                    }
+            }
+            .padding(20)
+            .cadenciaGlassCard(cornerRadius: 22)
         }
     }
 
@@ -285,8 +310,11 @@ public struct OnboardingVaultView: View {
                     .foregroundStyle(CadenciaPalette.mutedSilver)
             }
 
-            modelRow(.magpieTTS) {
-                Task { await appState.downloadMagpie() }
+            modelRow(.phononSpanish) {
+                Task { await appState.downloadPhononSpanish() }
+            }
+            modelRow(.kokoroEnglish) {
+                Task { await appState.downloadKokoroEnglish() }
             }
             modelRow(.parakeetUltra) {
                 Task { await appState.downloadParakeetUltra() }
@@ -412,7 +440,8 @@ public struct OnboardingVaultView: View {
                 studyMode: studyMode,
                 serialId: selectedSerialId,
                 nonfictionTopics: Array(selectedTopics),
-                openAIKey: apiKeyInput
+                openAIKey: apiKeyInput,
+                huggingFaceToken: hfTokenInput
             )
             HapticDirector.shared.playStatePromotion()
         } catch {

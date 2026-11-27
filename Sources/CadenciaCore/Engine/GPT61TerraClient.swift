@@ -3,15 +3,54 @@ import Foundation
 import Security
 #endif
 
-// MARK: - Keychain API Key Vault
+// MARK: - Keychain API Key & Hugging Face Token Vault
 
 public enum KeychainVault {
     private static let service = "com.aydenbottos.cadencia.openai"
     private static let account = "openai_api_key"
+    private static let hfService = "com.aydenbottos.cadencia.huggingface"
+    private static let hfAccount = "hf_read_token"
 
     public static func saveAPIKey(_ key: String) -> Bool {
-        let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return deleteAPIKey() }
+        saveSecret(key, service: service, account: account)
+    }
+
+    public static func loadAPIKey() -> String? {
+        if let envKey = ProcessInfo.processInfo.environment["OPENAI_API_KEY"], !envKey.isEmpty {
+            return envKey
+        }
+        return loadSecret(service: service, account: account)
+    }
+
+    @discardableResult
+    public static func deleteAPIKey() -> Bool {
+        deleteSecret(service: service, account: account)
+    }
+
+    /// Saves the user's own Hugging Face Read Token (`hf_...`) for authenticating gated on-device model downloads
+    /// (such as `gradium/phonon-40m-es`) directly from Hugging Face.
+    public static func saveHuggingFaceToken(_ token: String) -> Bool {
+        saveSecret(token, service: hfService, account: hfAccount)
+    }
+
+    public static func loadHuggingFaceToken() -> String? {
+        if let env = ProcessInfo.processInfo.environment["HF_TOKEN"], !env.isEmpty {
+            return env
+        }
+        if let env = ProcessInfo.processInfo.environment["HUGGINGFACE_HUB_TOKEN"], !env.isEmpty {
+            return env
+        }
+        return loadSecret(service: hfService, account: hfAccount)
+    }
+
+    @discardableResult
+    public static func deleteHuggingFaceToken() -> Bool {
+        deleteSecret(service: hfService, account: hfAccount)
+    }
+
+    private static func saveSecret(_ value: String, service: String, account: String) -> Bool {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return deleteSecret(service: service, account: account) }
         #if canImport(Security)
         let data = Data(trimmed.utf8)
         let query: [String: Any] = [
@@ -25,15 +64,12 @@ public enum KeychainVault {
         addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
         return SecItemAdd(addQuery as CFDictionary, nil) == errSecSuccess
         #else
-        UserDefaults.standard.set(trimmed, forKey: account)
+        UserDefaults.standard.set(trimmed, forKey: "\(service).\(account)")
         return true
         #endif
     }
 
-    public static func loadAPIKey() -> String? {
-        if let envKey = ProcessInfo.processInfo.environment["OPENAI_API_KEY"], !envKey.isEmpty {
-            return envKey
-        }
+    private static func loadSecret(service: String, account: String) -> String? {
         #if canImport(Security)
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
@@ -47,12 +83,11 @@ public enum KeychainVault {
         guard status == errSecSuccess, let data = result as? Data else { return nil }
         return String(data: data, encoding: .utf8)
         #else
-        return UserDefaults.standard.string(forKey: account)
+        return UserDefaults.standard.string(forKey: "\(service).\(account)")
         #endif
     }
 
-    @discardableResult
-    public static func deleteAPIKey() -> Bool {
+    private static func deleteSecret(service: String, account: String) -> Bool {
         #if canImport(Security)
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
@@ -62,7 +97,7 @@ public enum KeychainVault {
         let status = SecItemDelete(query as CFDictionary)
         return status == errSecSuccess || status == errSecItemNotFound
         #else
-        UserDefaults.standard.removeObject(forKey: account)
+        UserDefaults.standard.removeObject(forKey: "\(service).\(account)")
         return true
         #endif
     }
@@ -530,14 +565,52 @@ public actor GPT61TerraClient {
         return verdict
     }
 
-    // MARK: - 3. Closed-Vocabulary Voice Speaking Partner (Output 1 Retell & Output 2 Open Talk / SIELE)
+    // MARK: - 3. Closed-Vocabulary Bilingual Voice Speaking Partner (Output 1 Retell & Output 2 Open Talk / SIELE)
 
     public struct SpeakingPartnerResponse: Decodable, Sendable {
         public let recastCorrectionEs: String?
         public let partnerReplyEs: String
+        public let partnerReplyEn: String?
+        public let spokenSegments: [TutorSpeechSegment]
         public let followUpPromptEnHint: String?
         public let correctlyUsedLemmas: [String]
         public let failedGrammarPatternIds: [String]
+
+        public init(
+            recastCorrectionEs: String?,
+            partnerReplyEs: String,
+            partnerReplyEn: String?,
+            spokenSegments: [TutorSpeechSegment],
+            followUpPromptEnHint: String?,
+            correctlyUsedLemmas: [String],
+            failedGrammarPatternIds: [String]
+        ) {
+            self.recastCorrectionEs = recastCorrectionEs
+            self.partnerReplyEs = partnerReplyEs
+            self.partnerReplyEn = partnerReplyEn
+            self.spokenSegments = spokenSegments
+            self.followUpPromptEnHint = followUpPromptEnHint
+            self.correctlyUsedLemmas = correctlyUsedLemmas
+            self.failedGrammarPatternIds = failedGrammarPatternIds
+        }
+
+        /// Returns clean, non-empty ordered segments for dual-engine synthesis (`es` -> Phonon-40m-es, `en` -> Kokoro-82M).
+        public func resolvedSpokenSegments(allowEnglish: Bool) -> [TutorSpeechSegment] {
+            let filtered = spokenSegments
+                .map { TutorSpeechSegment(id: $0.id, language: $0.language, text: $0.text.trimmingCharacters(in: .whitespacesAndNewlines)) }
+                .filter { !$0.text.isEmpty && (allowEnglish || $0.language == .spanish) }
+            if !filtered.isEmpty { return filtered }
+
+            var fallback: [TutorSpeechSegment] = []
+            if allowEnglish, let en = partnerReplyEn?.trimmingCharacters(in: .whitespacesAndNewlines), !en.isEmpty {
+                fallback.append(TutorSpeechSegment(language: .english, text: en))
+            }
+            let es = partnerReplyEs.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !es.isEmpty {
+                fallback.append(TutorSpeechSegment(language: .spanish, text: es))
+            }
+            return fallback
+        }
     }
 
     public func evaluateSpeakingTurn(
@@ -551,7 +624,8 @@ public actor GPT61TerraClient {
         steeringProductiveItems: [SyllabusItem],
         scheduledGrammarPatterns: [SyllabusItem],
         allowedVocabularySample: [String],
-        conversationHistory: [(role: String, text: String)]
+        conversationHistory: [(role: String, text: String)],
+        allowEnglishTutor: Bool = true
     ) async throws -> SpeakingPartnerResponse {
         let dueNames = targetDueItems.map(\.spanish).joined(separator: ", ")
         let steerNames = steeringProductiveItems.map { "\($0.spanish) (\($0.englishGloss))" }.joined(separator: ", ")
@@ -560,10 +634,25 @@ public actor GPT61TerraClient {
             ? "WEEK 5+ SIELE EXAM FORMAT: Frame turns like SIELE Oral Expression & Interaction (monologue description, negotiating an everyday situation, or defending an opinion)."
             : ""
 
+        let bilingualRule = allowEnglishTutor
+            ? """
+            - BILINGUAL VOICE TUTOR (SPANISH + ENGLISH):
+              You may speak BOTH Spanish (`es`, voiced by Phonon-40m-es) AND English (`en`, voiced by Kokoro-82M)!
+              * Always keep `partnerReplyEs` in natural Spanish (1–2 sentences using ALLOWED_VOCABULARY) to move the Spanish conversation forward.
+              * Put concise, helpful spoken English in `partnerReplyEn` whenever it helps the learner: e.g. answering an English question they asked, giving a brief warm coaching tip, clarifying a word/phrase, or offering a quick pronunciation/phrasing nudge (keep it brief, 1–2 spoken sentences, or null if pure Spanish flows best).
+              * Populate `spokenSegments` in the EXACT natural spoken order you want the tutor to speak aloud (each item has `language`: `"es"` or `"en"`, and `text`). Never mix Spanish and English inside the same segment so each engine speaks its native language cleanly!
+              * If the learner speaks English or asks "how do you say…", answer concisely in an `"en"` segment and model the target phrase in an `"es"` segment!
+            """
+            : """
+            - SPANISH-ONLY IMMERSION MODE:
+              Keep all spoken output 100% Spanish (`partnerReplyEn` MUST be null, and `spokenSegments` MUST contain only `"es"` segments).
+            """
+
         let instructions = """
-        You are Cadencia's warm, natural Spanish Voice Partner under the Signal-Starvation protocol:
-        - STRICT CLOSED VOCABULARY: Reply using ONLY vocabulary from ALLOWED_VOCABULARY plus names/numbers. Keep replies concise (1–3 natural spoken Spanish sentences) so conversation flows briskly.
-        - RECAST CORRECTIONS (PDF p. 9): If the learner made a Spanish grammar or lexical error, put the clean corrected version of their sentence in `recastCorrectionEs` and weave it naturally into your opening — with ZERO grammar lecture or metalinguistic explanation! Move the conversation forward immediately.
+        You are Cadencia's warm, natural Spanish Voice Tutor under the Signal-Starvation protocol:
+        - STRICT CLOSED VOCABULARY FOR SPANISH: Every Spanish sentence MUST use vocabulary from ALLOWED_VOCABULARY plus names/numbers. Keep Spanish replies concise (1–3 natural spoken Spanish sentences) so conversation flows briskly.
+        \(bilingualRule)
+        - RECAST CORRECTIONS (PDF p. 9): If the learner made a Spanish grammar or lexical error, put the clean corrected version of their sentence in `recastCorrectionEs` and weave it naturally into your Spanish turn — keep feedback brief and conversational, never a long grammar lecture!
         - MODE: \(mode == .output1 ? "OUTPUT 1 RETELL — Guide the learner to retell the passage just heard, then ask 2–3 questions that CANNOT be answered without using the passage's DUE_ITEMS." : "OUTPUT 2 OPEN TALK / ROLE-PLAY — Natural everyday conversation gently steering topics so the learner produces STEERING_TARGETS.")
         \(examNote)
         - EVALUATION: List every Spanish target lemma from DUE_ITEMS or STEERING_TARGETS that the learner used accurately in `correctlyUsedLemmas`. List any `GRAM_XXX` ID from SCHEDULED_GRAMMAR where the learner made a clear grammatical error in `failedGrammarPatternIds`.
@@ -590,11 +679,32 @@ public actor GPT61TerraClient {
             "properties": [
                 "recastCorrectionEs": ["type": ["string", "null"]],
                 "partnerReplyEs": ["type": "string"],
+                "partnerReplyEn": ["type": ["string", "null"]],
+                "spokenSegments": [
+                    "type": "array",
+                    "items": [
+                        "type": "object",
+                        "properties": [
+                            "language": ["type": "string", "enum": ["es", "en"]],
+                            "text": ["type": "string"],
+                        ],
+                        "required": ["language", "text"],
+                        "additionalProperties": false,
+                    ],
+                ],
                 "followUpPromptEnHint": ["type": ["string", "null"]],
                 "correctlyUsedLemmas": ["type": "array", "items": ["type": "string"]],
                 "failedGrammarPatternIds": ["type": "array", "items": ["type": "string"]],
             ],
-            "required": ["recastCorrectionEs", "partnerReplyEs", "followUpPromptEnHint", "correctlyUsedLemmas", "failedGrammarPatternIds"],
+            "required": [
+                "recastCorrectionEs",
+                "partnerReplyEs",
+                "partnerReplyEn",
+                "spokenSegments",
+                "followUpPromptEnHint",
+                "correctlyUsedLemmas",
+                "failedGrammarPatternIds",
+            ],
             "additionalProperties": false,
         ]
 

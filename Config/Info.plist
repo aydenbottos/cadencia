@@ -23,7 +23,7 @@
     <key>LSRequiresIPhoneOS</key>
     <true/>
     <key>NSMicrophoneUsageDescription</key>
-    <string>Cadencia listens to your Spanish speech locally on-device using Parakeet Ultra and ZIPA phoneme recognition to coach your fluency and pronunciation.</string>
+    <string>Cadencia listens to your speech locally on-device using Parakeet Ultra and ZIPA phoneme recognition to coach your Spanish fluency and pronunciation.</string>
     <key>UIBackgroundModes</key>
     <array>
         <string>audio</string>
@@ -49,8 +49,6 @@
     <key>LSSupportsOpeningDocumentsInPlace</key>
     <true/>
     <key>CadenciaZipaReleaseURL</key>
-    <string></string>
-    <key>CadenciaMagpieV2607ReleaseURL</key>
     <string></string>
 </dict>
 </plist>

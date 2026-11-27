@@ -153,7 +153,6 @@ def verify_python_tools() -> None:
     py_files = [
         ROOT / "tools" / "build_item_bank.py",
         ROOT / "tools" / "convert_zipa_coreml.py",
-        ROOT / "tools" / "convert_magpie_v2607_coreml.py",
         ROOT / "tools" / "bench_test.py",
     ]
     for f in py_files:

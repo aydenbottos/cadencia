@@ -25,6 +25,10 @@ let package = Package(
         .package(url: "https://github.com/FluidInference/FluidAudio.git", from: "0.18.4"),
     ],
     targets: [
+        .binaryTarget(
+            name: "PhononCore",
+            path: "Frameworks/PhononCore.xcframework"
+        ),
         .target(
             name: "CadenciaCore",
             dependencies: [],
@@ -40,9 +44,16 @@ let package = Package(
             name: "CadenciaSpeech",
             dependencies: [
                 "CadenciaCore",
+                "PhononCore",
                 .product(name: "FluidAudio", package: "FluidAudio"),
             ],
-            path: "Sources/CadenciaSpeech"
+            path: "Sources/CadenciaSpeech",
+            linkerSettings: [
+                .linkedFramework("CoreML"),
+                .linkedFramework("CoreVideo"),
+                .linkedFramework("Accelerate"),
+                .linkedFramework("AVFoundation"),
+            ]
         ),
         .target(
             name: "CadenciaApp",

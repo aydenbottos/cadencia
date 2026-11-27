@@ -92,34 +92,148 @@ public enum SessionBlockType: String, Codable, Sendable, CaseIterable {
     }
 }
 
-// MARK: - Voice & Regional Accent Rotation (Rule 8)
+// MARK: - Native Spanish Tutor Voices (Gradium Phonon-40m-es) & Regional Accent Rotation (Rule 8)
 
-public enum MagpieVoice: String, Codable, Sendable, CaseIterable {
-    case sofia = "Sofia"
-    case aria = "Aria"
-    case jason = "Jason"
-    case leo = "Leo"
-    case john = "John"
+/// Curated native Spanish voices from `gradium/phonon-voices` (CC0/public voice embeddings, ~250 KB each).
+/// In Phonon-40m-es the voice embedding itself carries authentic regional accent & prosody:
+///  - `es-es` (Castilian distinción): Celia, Iker, Nerea, Marcos
+///  - `es-mx` (Latin American seseo): Regina, Leonel, Rebeca, Nico
+public enum TutorVoice: String, Codable, Sendable, CaseIterable, Identifiable {
+    case celia = "Celia"
+    case iker = "Iker"
+    case nerea = "Nerea"
+    case marcos = "Marcos"
+    case regina = "Regina"
+    case leonel = "Leonel"
+    case rebeca = "Rebeca"
+    case nico = "Nico"
 
-    public var speakerIndex: Int {
+    public var id: String { rawValue }
+
+    /// Voice ID in `gradium/phonon-voices` (`voices/<phononVoiceId>.safetensors`).
+    public var phononVoiceId: String {
         switch self {
-        case .john: return 0
-        case .sofia: return 1
-        case .aria: return 2
-        case .jason: return 3
-        case .leo: return 4
+        case .celia: return "rmLBOdHrfkFym9MM"
+        case .iker: return "t-_TS1e-0GzDAX02"
+        case .nerea: return "EQcQFGkYfMn5YJgx"
+        case .marcos: return "jvPx8j8zLGQ3utZz"
+        case .regina: return "s58clrg2fe0MO7Y-"
+        case .leonel: return "BkuASiOJRrJEB5qA"
+        case .rebeca: return "Sx8m6WdXBG06zwZT"
+        case .nico: return "PwgPEaweQILZdGc4"
         }
     }
 
-    /// NVIDIA NeMo v2607 speaker index mapping (alphabetical in v2607 checkpoint vs CoreML speaker_info.json)
-    public var v2607SpeakerIndex: Int {
+    /// Stem filename written into the exported Phonon Core ML `voices/` folder.
+    public var phononBundleName: String { rawValue }
+
+    /// Native regional accent encoded in the voice embedding.
+    public var nativeAccent: SpanishRegionalAccent {
         switch self {
-        case .aria: return 0
-        case .jason: return 1
-        case .john: return 2
-        case .leo: return 3
-        case .sofia: return 4
+        case .celia, .iker, .nerea, .marcos: return .castilian
+        case .regina, .leonel, .rebeca, .nico: return .latinAmerican
         }
+    }
+
+    public var isFemale: Bool {
+        switch self {
+        case .celia, .nerea, .regina, .rebeca: return true
+        case .iker, .marcos, .leonel, .nico: return false
+        }
+    }
+
+    /// Matching English Kokoro-82M voice for bilingual tutor conversations (preserves speaker gender).
+    public var pairedKokoroEnglishVoice: String {
+        isFemale ? "af_heart" : "am_michael"
+    }
+
+    public var localeLabel: String {
+        nativeAccent == .castilian ? "es-ES" : "es-MX"
+    }
+
+    public static let castilianVoices: [TutorVoice] = [.celia, .iker, .nerea, .marcos]
+    public static let latinAmericanVoices: [TutorVoice] = [.regina, .leonel, .rebeca, .nico]
+
+    /// Selects a native Phonon voice whose regional accent matches `accent` while respecting `preferred` gender/identity.
+    public static func voice(for accent: SpanishRegionalAccent, preferred: TutorVoice = .celia) -> TutorVoice {
+        switch accent {
+        case .castilian:
+            if preferred.nativeAccent == .castilian { return preferred }
+            return preferred.isFemale ? .celia : .iker
+        case .latinAmerican, .rioplatense:
+            if preferred.nativeAccent == .latinAmerican { return preferred }
+            return preferred.isFemale ? .regina : .leonel
+        }
+    }
+
+    /// Maps both current Phonon names and legacy stored SQLite voice names seamlessly.
+    public static func fromStoredRawValue(_ raw: String) -> TutorVoice {
+        if let exact = TutorVoice(rawValue: raw) { return exact }
+        switch raw.lowercased() {
+        case "sofia", "celia": return .celia
+        case "aria", "nerea": return .nerea
+        case "jason", "iker": return .iker
+        case "leo", "leonel": return .leonel
+        case "john", "marcos": return .marcos
+        case "regina": return .regina
+        case "rebeca": return .rebeca
+        case "nico": return .nico
+        default: return .celia
+        }
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let raw = try container.decode(String.self)
+        self = Self.fromStoredRawValue(raw)
+    }
+}
+
+public enum TutorSpeechLanguage: String, Codable, Sendable, Hashable {
+    case spanish = "es"
+    case english = "en"
+}
+
+/// Ordered speech segment within a bilingual tutor turn.
+/// Spanish segments are voiced natively by `Phonon-40m-es`; English segments are voiced by `Kokoro-82M`.
+public struct TutorSpeechSegment: Identifiable, Codable, Sendable, Hashable {
+    public let id: String
+    public let language: TutorSpeechLanguage
+    public let text: String
+
+    public init(id: String = UUID().uuidString, language: TutorSpeechLanguage, text: String) {
+        self.id = id
+        self.language = language
+        self.text = text
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, language, text
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = (try? c.decode(String.self, forKey: .id)) ?? UUID().uuidString
+        self.language = try c.decode(TutorSpeechLanguage.self, forKey: .language)
+        self.text = try c.decode(String.self, forKey: .text)
+    }
+}
+
+public enum ConversationTutorMode: String, Codable, Sendable, CaseIterable, Identifiable {
+    case bilingualCoach = "bilingual"
+    case spanishImmersion = "spanish_only"
+
+    public var id: String { rawValue }
+
+    public var title: String {
+        switch self {
+        case .bilingualCoach: return "ES + EN Tutor"
+        case .spanishImmersion: return "Spanish Only"
+        }
+    }
+
+    public var allowsEnglish: Bool {
+        self == .bilingualCoach
     }
 }
 
@@ -161,7 +275,7 @@ public struct PassagePlan: Codable, Sendable {
     public let grammarPatterns: [SyllabusItem]
     public let allowedKnownLemmas: [String]
     public let holdoutBannedLemmas: [String]
-    public let voice: MagpieVoice
+    public let voice: TutorVoice
     public let accent: SpanishRegionalAccent
     public let priorContextWordsByItem: [String: [String]]
 
@@ -181,7 +295,7 @@ public struct PassagePlan: Codable, Sendable {
         grammarPatterns: [SyllabusItem],
         allowedKnownLemmas: [String],
         holdoutBannedLemmas: [String],
-        voice: MagpieVoice,
+        voice: TutorVoice,
         accent: SpanishRegionalAccent,
         priorContextWordsByItem: [String: [String]]
     ) {
@@ -310,7 +424,7 @@ public struct GeneratedPassage: Identifiable, Codable, Sendable {
     public let dueItemIds: [String]
     public let newItemIds: [String]
     public let grammarItemIds: [String]
-    public let voice: MagpieVoice
+    public let voice: TutorVoice
     public let accent: SpanishRegionalAccent
     public let targetWPM: Int
     public let isAudioFirst: Bool
@@ -338,7 +452,7 @@ public struct GeneratedPassage: Identifiable, Codable, Sendable {
         dueItemIds: [String],
         newItemIds: [String],
         grammarItemIds: [String],
-        voice: MagpieVoice,
+        voice: TutorVoice,
         accent: SpanishRegionalAccent,
         targetWPM: Int,
         isAudioFirst: Bool,
@@ -471,6 +585,8 @@ public struct SpokenTurnEvaluation: Identifiable, Codable, Sendable {
     public let alignments: [PhonemeAlignmentCell]
     public let partnerRecastEs: String?
     public let partnerReplyEs: String
+    public let partnerReplyEn: String?
+    public let spokenSegments: [TutorSpeechSegment]
     public let correctlyUsedItemIds: [String]
     public let failedGrammarPatternIds: [String]
     public let parakeetLatencyMs: Double
@@ -486,6 +602,8 @@ public struct SpokenTurnEvaluation: Identifiable, Codable, Sendable {
         alignments: [PhonemeAlignmentCell],
         partnerRecastEs: String?,
         partnerReplyEs: String,
+        partnerReplyEn: String? = nil,
+        spokenSegments: [TutorSpeechSegment] = [],
         correctlyUsedItemIds: [String],
         failedGrammarPatternIds: [String],
         parakeetLatencyMs: Double,
@@ -500,6 +618,8 @@ public struct SpokenTurnEvaluation: Identifiable, Codable, Sendable {
         self.alignments = alignments
         self.partnerRecastEs = partnerRecastEs
         self.partnerReplyEs = partnerReplyEs
+        self.partnerReplyEn = partnerReplyEn
+        self.spokenSegments = spokenSegments
         self.correctlyUsedItemIds = correctlyUsedItemIds
         self.failedGrammarPatternIds = failedGrammarPatternIds
         self.parakeetLatencyMs = parakeetLatencyMs

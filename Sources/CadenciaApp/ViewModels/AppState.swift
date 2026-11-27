@@ -5,8 +5,8 @@ import Observation
 import SwiftUI
 
 /// Top-level @Observable state container owning the local SQLite database, linguistic engines,
-/// GPT-6.1 Terra client, Magpie v2607 TTS engine, Parakeet Ultra + ZIPA dual STT recognizer,
-/// and GPU Memory Constellation coordinates.
+/// GPT-6.1 Terra client, Gradium Phonon-40m-es native Spanish TTS, Kokoro-82M English tutor TTS,
+/// Parakeet Ultra + ZIPA dual STT recognizer, and GPU Memory Constellation coordinates.
 @MainActor
 @Observable
 public final class AppState {
@@ -14,7 +14,9 @@ public final class AppState {
     public let database: CadenciaDatabase
     public let terraClient: GPT61TerraClient
     public let assetManager: ModelAssetManager
-    public let magpieEngine: MagpieV2607Engine
+    public let audioPlayer: TutorAudioPlayer
+    public let phononEngine: PhononSpanishEngine
+    public let kokoroEngine: KokoroEnglishEngine
     public let zipaEngine: ZipaPhonemeEngine
     public let speechRecognizer: DualSpeechRecognizer
     public let analyticsEngine = ResearchAnalyticsEngine()
@@ -35,6 +37,7 @@ public final class AppState {
 
     // Hardware & Model readiness
     public var hasOpenAIKey: Bool = false
+    public var hasHuggingFaceToken: Bool = false
     public var modelStatus: [ManagedModelKind: ModelDownloadProgress] = [:]
     public var engineRuntimeNote: [ManagedModelKind: String] = [:]
     public var liveAudioEnergy: Float = 0.0
@@ -55,11 +58,14 @@ public final class AppState {
         self.database = db
         self.terraClient = GPT61TerraClient()
         self.assetManager = ModelAssetManager()
-        self.magpieEngine = MagpieV2607Engine()
+        self.audioPlayer = TutorAudioPlayer()
+        self.phononEngine = PhononSpanishEngine()
+        self.kokoroEngine = KokoroEnglishEngine()
         let zipa = ZipaPhonemeEngine()
         self.zipaEngine = zipa
         self.speechRecognizer = DualSpeechRecognizer(zipaEngine: zipa)
         self.hasOpenAIKey = KeychainVault.loadAPIKey() != nil
+        self.hasHuggingFaceToken = KeychainVault.loadHuggingFaceToken() != nil
 
         for kind in ManagedModelKind.allCases {
             modelStatus[kind] = ModelDownloadProgress(
@@ -92,8 +98,8 @@ public final class AppState {
                 try await refreshLearnerData()
             }
 
-            // Wire live audio level from Magpie playback + microphone into Metal shaders
-            await magpieEngine.setAudioLevelHandler { [weak self] level in
+            // Wire live audio level from unified TutorAudioPlayer (Phonon + Kokoro) & microphone into Metal shaders
+            await audioPlayer.setAudioLevelHandler { [weak self] level in
                 Task { @MainActor in self?.liveAudioEnergy = level }
             }
             await speechRecognizer.setTelemetryHandler { [weak self] tel in
@@ -123,11 +129,11 @@ public final class AppState {
             }
         }
 
-        // 2. Warm installed Core ML engines concurrently in background
+        // 2. Warm installed Core ML engines sequentially in background
         startBackgroundModelWarmup()
     }
 
-    /// Awaits background loading of the 64k Spanish lemmatizer & hold-out set (called before sessions/bench tests).
+    /// Awaits background loading of the 64k Spanish lemmatizer & hold-out set.
     public func ensureLinguisticResourcesLoaded() async {
         await linguisticLoadTask?.value
     }
@@ -157,52 +163,89 @@ public final class AppState {
         }
     }
 
-    /// On-demand loader for Magpie TTS so playback in Memory Ledger, Research Lab, or Sessions
-    /// never silently skips audio if background warmup hasn't finished yet.
-    public func ensureMagpieLoaded() async throws {
-        if await magpieEngine.isLoaded { return }
-        guard await assetManager.isModelInstalled(.magpieTTS) else {
-            throw NSError(domain: "MagpieV2607Engine", code: 503, userInfo: [
-                NSLocalizedDescriptionKey: "NVIDIA Magpie v2607 is not installed yet. Install it in Settings."
+    /// On-demand loader for Gradium Phonon-40m-es native Spanish TTS.
+    public func ensurePhononLoaded() async throws {
+        if await phononEngine.isLoaded { return }
+        guard await assetManager.isModelInstalled(.phononSpanish) else {
+            throw NSError(domain: "PhononSpanishEngine", code: 503, userInfo: [
+                NSLocalizedDescriptionKey: "Phonon-40m-es is not installed yet. Add your Hugging Face token and install it in Settings."
             ])
         }
-        let dir = await assetManager.directory(for: .magpieTTS)
+        let dir = await assetManager.directory(for: .phononSpanish)
         let t0 = Date()
-        try await magpieEngine.loadModels(from: dir)
+        try await phononEngine.loadModels(from: dir)
         let ms = Int(Date().timeIntervalSince(t0) * 1000)
-        let ver = await magpieEngine.checkpointVersion
-        let fsf = await magpieEngine.frameStackingFactor
-        engineRuntimeNote[.magpieTTS] = "Loaded \(ver) (\(fsf)× stack · ANE+GPU+FP32) · \(ms) ms"
+        let voiceCount = await phononEngine.availableVoices.count
+        engineRuntimeNote[.phononSpanish] = "Loaded on ANE · \(voiceCount) native voices · \(ms) ms"
     }
 
-    /// Loads installed local Core ML models in fastest-first order (Magpie -> Parakeet ANE -> ZIPA Metal GPU)
-    /// recording exact per-model load latencies or errors in `engineRuntimeNote` (never silently swallowed!),
-    /// then warms optional Silero VAD in a completely detached background task.
+    /// On-demand loader for Kokoro-82M English conversation voice.
+    public func ensureKokoroLoaded() async throws {
+        if await kokoroEngine.isLoaded { return }
+        guard await assetManager.isModelInstalled(.kokoroEnglish) else {
+            throw NSError(domain: "KokoroEnglishEngine", code: 503, userInfo: [
+                NSLocalizedDescriptionKey: "Kokoro-82M English Tutor is not installed yet. Install it in Settings."
+            ])
+        }
+        let dir = await assetManager.directory(for: .kokoroEnglish)
+        let t0 = Date()
+        try await kokoroEngine.loadModels(from: dir)
+        let ms = Int(Date().timeIntervalSince(t0) * 1000)
+        engineRuntimeNote[.kokoroEnglish] = "Loaded FP32 Vocoder (af_heart + am_michael) · \(ms) ms"
+    }
+
+    /// Loads installed local Core ML models sequentially (Phonon ANE -> Kokoro EN -> Parakeet ANE -> ZIPA Metal GPU)
+    /// recording exact per-model load latencies or errors in `engineRuntimeNote`, then warms optional Silero VAD detached.
     public func warmInstalledModelsInBackground() async {
-        let magpie = self.magpieEngine
+        let phonon = self.phononEngine
+        let kokoro = self.kokoroEngine
         let speech = self.speechRecognizer
         let assets = self.assetManager
 
-        // 1. NVIDIA Magpie v2607 TTS (ANE + Metal GPU step + CPU FP32 NanoCodec) — first so tutor voice is ready immediately!
-        if await assets.isModelInstalled(.magpieTTS), !(await magpie.isLoaded) {
+        // 1. Gradium Phonon-40m-es (Native Spanish on ANE)
+        if await assets.isModelInstalled(.phononSpanish), !(await phonon.isLoaded) {
             await MainActor.run {
-                self.warmingLabel = "WARMING MAGPIE"
-                self.engineRuntimeNote[.magpieTTS] = "Loading on ANE + Metal GPU + CPU…"
+                self.warmingLabel = "WARMING PHONON"
+                self.engineRuntimeNote[.phononSpanish] = "Loading Phonon-40m-es on ANE…"
             }
-            let dir = await assets.directory(for: .magpieTTS)
+            let dir = await assets.directory(for: .phononSpanish)
             let t0 = Date()
             do {
-                try await magpie.loadModels(from: dir)
+                try await phonon.loadModels(from: dir)
                 let ms = Int(Date().timeIntervalSince(t0) * 1000)
-                let ver = await magpie.checkpointVersion
-                let fsf = await magpie.frameStackingFactor
-                await MainActor.run { self.engineRuntimeNote[.magpieTTS] = "Loaded \(ver) (\(fsf)× stack · ANE+GPU+FP32) · \(ms) ms" }
+                let voices = await phonon.availableVoices.count
+                await MainActor.run {
+                    self.engineRuntimeNote[.phononSpanish] = "Loaded on ANE · \(voices) native voices · \(ms) ms"
+                }
             } catch {
-                await MainActor.run { self.engineRuntimeNote[.magpieTTS] = "Load error: \(error.localizedDescription)" }
+                await MainActor.run {
+                    self.engineRuntimeNote[.phononSpanish] = "Load error: \(error.localizedDescription)"
+                }
             }
         }
 
-        // 2. Parakeet Ultra 600M INT8 (ANE)
+        // 2. Kokoro-82M English Tutor (FP32 Vocoder)
+        if await assets.isModelInstalled(.kokoroEnglish), !(await kokoro.isLoaded) {
+            await MainActor.run {
+                self.warmingLabel = "WARMING KOKORO"
+                self.engineRuntimeNote[.kokoroEnglish] = "Loading Kokoro-82M English (FP32 Vocoder)…"
+            }
+            let dir = await assets.directory(for: .kokoroEnglish)
+            let t0 = Date()
+            do {
+                try await kokoro.loadModels(from: dir)
+                let ms = Int(Date().timeIntervalSince(t0) * 1000)
+                await MainActor.run {
+                    self.engineRuntimeNote[.kokoroEnglish] = "Loaded FP32 Vocoder (af_heart + am_michael) · \(ms) ms"
+                }
+            } catch {
+                await MainActor.run {
+                    self.engineRuntimeNote[.kokoroEnglish] = "Load error: \(error.localizedDescription)"
+                }
+            }
+        }
+
+        // 3. Parakeet Ultra 600M INT8 (ANE)
         if await assets.isModelInstalled(.parakeetUltra), !(await speech.isParakeetReady) {
             await MainActor.run {
                 self.warmingLabel = "WARMING PARAKEET"
@@ -218,7 +261,7 @@ public final class AppState {
             }
         }
 
-        // 3. ZIPA CR Large 300M FP16 (Metal GPU — avoids 7,344-op ANE compiler stalls & runs parallel with Parakeet!)
+        // 4. ZIPA CR Large 300M FP16 (Metal GPU)
         if await assets.isModelInstalled(.zipaPhoneme), !(await speech.isZipaReady) {
             await MainActor.run {
                 self.warmingLabel = "WARMING ZIPA"
@@ -236,7 +279,7 @@ public final class AppState {
 
         await refreshModelStatuses()
 
-        // 4. Optional Silero VAD in a completely detached background task (never blocks `isWarmingModels`!)
+        // 5. Optional Silero VAD in a completely detached background task
         if !(await speech.isVADReady) {
             Task.detached(priority: .background) { [weak self] in
                 await speech.ensureVadLoaded(assetManager: assets)
@@ -250,12 +293,17 @@ public final class AppState {
         studyMode: StudyMode,
         serialId: String,
         nonfictionTopics: [String],
-        openAIKey: String
+        openAIKey: String,
+        huggingFaceToken: String = ""
     ) async throws {
         if !openAIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             _ = KeychainVault.saveAPIKey(openAIKey)
             await terraClient.setAPIKey(openAIKey)
             hasOpenAIKey = true
+        }
+        if !huggingFaceToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            _ = KeychainVault.saveHuggingFaceToken(huggingFaceToken)
+            hasHuggingFaceToken = true
         }
 
         let groupPrefix: String = switch studyMode {
@@ -317,28 +365,26 @@ public final class AppState {
         self.constellationStars = buildConstellationStars(items: allSyllabusItems, records: recs, params: profile.parameters)
     }
 
-    public var installedMagpieCheckpointVersion: String? = nil
-
     public func refreshModelStatuses() async {
         let zipaBundled = await assetManager.isZipaBundledInApp()
-        let magpieVer = await assetManager.installedMagpieVersion()
-        self.installedMagpieCheckpointVersion = magpieVer
+        let phononVoices = await assetManager.installedPhononVoiceCount()
         for kind in ManagedModelKind.allCases {
             let installed = await assetManager.isModelInstalled(kind)
             let readyMsg: String
-            if kind == .zipaPhoneme && zipaBundled {
+            switch kind {
+            case .zipaPhoneme where zipaBundled:
                 readyMsg = "Built-in · Metal GPU Ready"
-            } else if kind == .magpieTTS, let magpieVer {
-                readyMsg = magpieVer == "v2607"
-                    ? "Installed · v2607 GRPO (2× stack)"
-                    : "v2512 installed · Upgrade to v2607 available"
-            } else {
-                readyMsg = "Installed & ready on device"
+            case .phononSpanish where installed:
+                readyMsg = "Installed · \(max(1, phononVoices)) native Spanish voices"
+            case .kokoroEnglish where installed:
+                readyMsg = "Installed · Kokoro-82M English (FP32 Vocoder)"
+            default:
+                readyMsg = installed ? "Installed & ready on device" : "Tap Install to download on device"
             }
             modelStatus[kind] = ModelDownloadProgress(
                 kind: kind,
                 fractionCompleted: installed ? 1.0 : 0.0,
-                statusMessage: installed ? readyMsg : "Tap Install to download on device",
+                statusMessage: readyMsg,
                 isReady: installed,
                 errorMessage: nil
             )
@@ -347,7 +393,6 @@ public final class AppState {
 
     private func applyDownloadProgress(_ prog: ModelDownloadProgress) {
         if let existing = modelStatus[prog.kind] {
-            // Guard against out-of-order async callbacks reverting a finished download or moving progress backwards
             if existing.isReady && !prog.isReady && prog.errorMessage == nil { return }
             if !prog.isReady && prog.errorMessage == nil && prog.fractionCompleted + 0.001 < existing.fractionCompleted {
                 return
@@ -356,50 +401,96 @@ public final class AppState {
         modelStatus[prog.kind] = prog
     }
 
-    public func downloadMagpie() async {
-        modelStatus[.magpieTTS] = ModelDownloadProgress(
-            kind: .magpieTTS, fractionCompleted: 0.01,
-            statusMessage: "Starting NVIDIA Magpie v2607 download…",
-            isReady: false, errorMessage: nil
+    public func downloadPhononSpanish() async {
+        guard let hfToken = KeychainVault.loadHuggingFaceToken(), !hfToken.isEmpty else {
+            modelStatus[.phononSpanish] = ModelDownloadProgress(
+                kind: .phononSpanish,
+                fractionCompleted: 0,
+                statusMessage: "Hugging Face token required",
+                isReady: false,
+                errorMessage: "Accept gradium/phonon-40m-es on huggingface.co and save your free Read token in the Hugging Face Vault above."
+            )
+            return
+        }
+
+        modelStatus[.phononSpanish] = ModelDownloadProgress(
+            kind: .phononSpanish,
+            fractionCompleted: 0.02,
+            statusMessage: "Starting Phonon-40m-es download from Hugging Face…",
+            isReady: false,
+            errorMessage: nil
         )
         do {
-            try await assetManager.downloadMagpieAssets { [weak self] prog in
-                Task { @MainActor in
-                    let clamped = ModelDownloadProgress(
-                        kind: prog.kind,
-                        fractionCompleted: min(0.92, prog.fractionCompleted * 0.92),
-                        statusMessage: prog.isReady ? "Loading Magpie v2607 into Neural Engine…" : prog.statusMessage,
-                        isReady: false,
-                        errorMessage: prog.errorMessage
-                    )
-                    self?.applyDownloadProgress(clamped)
-                }
+            let bundleDir = try await assetManager.downloadPhononSpanish(hfToken: hfToken) { [weak self] prog in
+                Task { @MainActor in self?.applyDownloadProgress(prog) }
             }
-            modelStatus[.magpieTTS] = ModelDownloadProgress(
-                kind: .magpieTTS, fractionCompleted: 0.95,
-                statusMessage: "Loading Magpie v2607 (ANE + Metal GPU + FP32 NanoCodec)…",
-                isReady: false, errorMessage: nil
+            modelStatus[.phononSpanish] = ModelDownloadProgress(
+                kind: .phononSpanish,
+                fractionCompleted: 0.94,
+                statusMessage: "Compiling Phonon-40m-es for Apple Neural Engine (once per install)…",
+                isReady: false,
+                errorMessage: nil
             )
-            let dir = await assetManager.directory(for: .magpieTTS)
             let t0 = Date()
-            try await magpieEngine.loadModels(from: dir, forceReload: true)
+            try await phononEngine.loadModels(from: bundleDir, forceReload: true)
             let ms = Int(Date().timeIntervalSince(t0) * 1000)
-            let ver = await magpieEngine.checkpointVersion
-            let fsf = await magpieEngine.frameStackingFactor
-            self.installedMagpieCheckpointVersion = ver
-            self.engineRuntimeNote[.magpieTTS] = "Loaded \(ver) (\(fsf)× stack · ANE+GPU+FP32) · \(ms) ms"
-            modelStatus[.magpieTTS] = ModelDownloadProgress(
-                kind: .magpieTTS, fractionCompleted: 1.0,
-                statusMessage: ver == "v2607" ? "Installed · v2607 GRPO (2× stack)" : "Installed & ready on device",
-                isReady: true, errorMessage: nil
+            let voiceCount = await phononEngine.availableVoices.count
+            self.engineRuntimeNote[.phononSpanish] = "Loaded on ANE · \(voiceCount) native voices · \(ms) ms"
+            modelStatus[.phononSpanish] = ModelDownloadProgress(
+                kind: .phononSpanish,
+                fractionCompleted: 1.0,
+                statusMessage: "Installed · \(voiceCount) native Spanish voices",
+                isReady: true,
+                errorMessage: nil
             )
         } catch {
-            await refreshModelStatuses()
-            modelStatus[.magpieTTS] = ModelDownloadProgress(
-                kind: .magpieTTS,
-                fractionCompleted: installedMagpieCheckpointVersion != nil ? 1.0 : 0.0,
-                statusMessage: "Download / upgrade failed",
-                isReady: installedMagpieCheckpointVersion != nil,
+            modelStatus[.phononSpanish] = ModelDownloadProgress(
+                kind: .phononSpanish,
+                fractionCompleted: 0,
+                statusMessage: "Install failed",
+                isReady: false,
+                errorMessage: error.localizedDescription
+            )
+        }
+    }
+
+    public func downloadKokoroEnglish() async {
+        modelStatus[.kokoroEnglish] = ModelDownloadProgress(
+            kind: .kokoroEnglish,
+            fractionCompleted: 0.02,
+            statusMessage: "Starting Kokoro-82M English Tutor download…",
+            isReady: false,
+            errorMessage: nil
+        )
+        do {
+            let dir = try await assetManager.downloadKokoroEnglish { [weak self] prog in
+                Task { @MainActor in self?.applyDownloadProgress(prog) }
+            }
+            modelStatus[.kokoroEnglish] = ModelDownloadProgress(
+                kind: .kokoroEnglish,
+                fractionCompleted: 0.90,
+                statusMessage: "Loading Kokoro-82M English (FP32 Vocoder + G2P + voices)…",
+                isReady: false,
+                errorMessage: nil
+            )
+            let t0 = Date()
+            try await kokoroEngine.loadModels(from: dir, forceReload: true)
+            await assetManager.markKokoroReady()
+            let ms = Int(Date().timeIntervalSince(t0) * 1000)
+            self.engineRuntimeNote[.kokoroEnglish] = "Loaded FP32 Vocoder (af_heart + am_michael) · \(ms) ms"
+            modelStatus[.kokoroEnglish] = ModelDownloadProgress(
+                kind: .kokoroEnglish,
+                fractionCompleted: 1.0,
+                statusMessage: "Installed · Kokoro-82M English (FP32 Vocoder)",
+                isReady: true,
+                errorMessage: nil
+            )
+        } catch {
+            modelStatus[.kokoroEnglish] = ModelDownloadProgress(
+                kind: .kokoroEnglish,
+                fractionCompleted: 0,
+                statusMessage: "Install failed",
+                isReady: false,
                 errorMessage: error.localizedDescription
             )
         }
@@ -414,7 +505,6 @@ public final class AppState {
         do {
             let models = try await assetManager.downloadParakeetUltra { [weak self] prog in
                 Task { @MainActor in
-                    // Keep final ready flag gated until attached to DualSpeechRecognizer
                     let mapped = prog.isReady
                         ? ModelDownloadProgress(
                             kind: .parakeetUltra, fractionCompleted: 0.98,
@@ -425,14 +515,12 @@ public final class AppState {
                     self?.applyDownloadProgress(mapped)
                 }
             }
-            // Fast single-engine attach (~50ms) — never blocks on Silero VAD network download or ZIPA reload!
             try await speechRecognizer.attachParakeetModels(models)
             modelStatus[.parakeetUltra] = ModelDownloadProgress(
                 kind: .parakeetUltra, fractionCompleted: 1.0,
                 statusMessage: "Installed & ready on device",
                 isReady: true, errorMessage: nil
             )
-            // Quietly ensure Silero VAD is warmed in background without blocking Parakeet's UI completion
             let speech = self.speechRecognizer
             let assets = self.assetManager
             Task(priority: .utility) { [weak self] in

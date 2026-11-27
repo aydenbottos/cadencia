@@ -2,7 +2,7 @@ import CadenciaCore
 import SwiftUI
 
 /// Immersive Editorial Input Reader & Audio-First Listening Theater covering BOTH:
-/// - **Input 1 (Minutes 3–28)**: Synced 120Hz Karaoke Spanish prose + Magpie v2607 audio, tap-to-gloss
+/// - **Input 1 (Minutes 3–28)**: Synced 120Hz Karaoke Spanish prose + Phonon-40m-es native audio, tap-to-gloss
 ///   Liquid Glass inspector (with visual cue, IPA, audio), sentence tap-to-replay (logs Doubt),
 ///   20-second Grammar Micro-Note interstitial, and Load-Bearing Comprehension Probes.
 /// - **Input 2 (Minutes 40–62)**: Full-bleed Midnight Indigo Audio-First Theater (text completely hidden
@@ -161,7 +161,7 @@ public struct InputReaderView: View {
                 }
                 .padding(.top, 12)
 
-                // Living Raymarched Acoustic Orb reacting to Magpie v2607 audio
+                // Living Raymarched Acoustic Orb reacting to Phonon-40m-es native Spanish audio
                 ResonanceOrbView(
                     mode: controller.isPlayingAudio ? .speaking : .idle,
                     energy: controller.appState.liveAudioEnergy
@@ -448,21 +448,21 @@ public struct InputReaderView: View {
                 .buttonStyle(.plain)
 
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("NVIDIA Magpie v2607")
+                    Text("Phonon-40m-es · Native")
                         .font(CadenciaFont.mono(10, weight: .bold))
                         .foregroundStyle(CadenciaPalette.saffronGold)
-                    Text("\(passage.voice.rawValue) · \(controller.currentWPMOverride) WPM")
+                    Text("\(passage.voice.rawValue) (\(passage.voice.localeLabel)) · \(controller.currentWPMOverride) WPM")
                         .font(.caption)
                         .foregroundStyle(CadenciaPalette.ivoryText)
                 }
 
                 Spacer()
 
-                // Pitch-preserving WPM speed selector (70 -> 140 WPM)
+                // Pitch-preserving WPM speed selector (70 -> 160 WPM)
                 HStack(spacing: 6) {
                     Button {
                         controller.currentWPMOverride = max(70, controller.currentWPMOverride - 10)
-                        Task { await controller.appState.magpieEngine.updatePlaybackRate(targetWPM: controller.currentWPMOverride) }
+                        Task { await controller.appState.audioPlayer.updatePlaybackRate(targetWPM: controller.currentWPMOverride) }
                     } label: {
                         Image(systemName: "minus")
                             .frame(width: 30, height: 30)
@@ -470,7 +470,7 @@ public struct InputReaderView: View {
                     }
                     Button {
                         controller.currentWPMOverride = min(160, controller.currentWPMOverride + 10)
-                        Task { await controller.appState.magpieEngine.updatePlaybackRate(targetWPM: controller.currentWPMOverride) }
+                        Task { await controller.appState.audioPlayer.updatePlaybackRate(targetWPM: controller.currentWPMOverride) }
                     } label: {
                         Image(systemName: "plus")
                             .frame(width: 30, height: 30)

@@ -312,7 +312,7 @@ public struct NativeListeningPassage: Identifiable, Codable, Sendable {
     public let id: String
     public let checkpointHour: Int
     public let accent: SpanishRegionalAccent
-    public let speaker: MagpieVoice
+    public let speaker: TutorVoice
     public let wpm: Int
     public let title: String
     public let transcript: String
@@ -322,7 +322,7 @@ public struct NativeListeningPassage: Identifiable, Codable, Sendable {
         id: String,
         checkpointHour: Int,
         accent: SpanishRegionalAccent,
-        speaker: MagpieVoice,
+        speaker: TutorVoice,
         wpm: Int,
         title: String,
         transcript: String,

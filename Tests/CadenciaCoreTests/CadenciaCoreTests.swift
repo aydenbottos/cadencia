@@ -196,7 +196,7 @@ final class CadenciaCoreTests: XCTestCase {
             dueItems: [], newItems: [newItem], grammarPatterns: [],
             allowedKnownLemmas: ["camino", "puerta", "ventana", "hablar"],
             holdoutBannedLemmas: ["alcornoque"],
-            voice: .sofia, accent: .castilian, priorContextWordsByItem: [:]
+            voice: .celia, accent: .castilian, priorContextWordsByItem: [:]
         )
         let sentence = PassageSentence(id: 0, spanish: "El alcornoque está cerca de la puerta.", englishLine: "The cork oak is near the door.", wordTokens: ["El", "alcornoque", "está", "cerca", "de", "la", "puerta"])
         let report = verifier.verifyStageA(passageText: sentence.spanish, sentences: [sentence], plan: plan, priorContextByItem: [:])
@@ -310,99 +310,79 @@ final class CadenciaCoreTests: XCTestCase {
         XCTAssertEqual(extracted, "cadencia_zipa_fp16_ok")
     }
 
-    // MARK: - 8. NVIDIA Magpie v2607 Spanish Tokenizer, Attention Prior & argmax_or_multinomial_any EOS
+    // MARK: - 8. Phonon-40m-es Native Voice Mapping, Bilingual Conversation Segments & 24 kHz Stitching
 
-    func testMagpieV2607TokenizerAttentionPriorAndEOSDetector() {
-        let token2Id: [String: Int32] = [
-            ".": 7, " ": 100, "<pad>": 101,
-            "D": 15, "Í": 69, "A": 12, "S": 30, "Y": 36,
-            "p": 53, "ˈ": 91, "o": 52, "ɾ": 85, "e": 43, "k": 48,
-            "ʝ": 90, "a": 40, "d": 42, "ð": 77, "θ": 97, "s": 55, "ʎ": 88, "ʃ": 86,
-        ]
-        let dict: [String: [String]] = [
-            "POR": ["p", "ˈ", "o", "ɾ"],
-            "PERO": ["p", "ˈ", "e", "ɾ", "o"],
-            "YA": ["ʝ", "ˈ", "a"],
-            "DADO": ["d", "ˈ", "a", "ð", "o"],
-            "QUE": ["k", "ˈ", "e"],
-            "CALLE": ["k", "ˈ", "a", "ʎ", "e"],
-        ]
+    func testPhononVoicesBilingualTurnsAndAudioStitching() throws {
+        // Legacy SQLite voice names decode transparently to native Spanish Phonon voices
+        XCTAssertEqual(TutorVoice.fromStoredRawValue("Sofia"), .celia)
+        XCTAssertEqual(TutorVoice.fromStoredRawValue("Aria"), .nerea)
+        XCTAssertEqual(TutorVoice.fromStoredRawValue("Jason"), .iker)
+        XCTAssertEqual(TutorVoice.fromStoredRawValue("Leo"), .leonel)
+        XCTAssertEqual(TutorVoice.fromStoredRawValue("John"), .marcos)
+        XCTAssertEqual(TutorVoice.fromStoredRawValue("Regina"), .regina)
 
-        // v2607 Spanish offset=480, eos=3358: bare word "por" must auto-append "." and terminate with 3358
-        let v2607Tok = MagpieSpanishTokenizer(token2Id: token2Id, phonemeDict: dict, spanishOffset: 480, eosTokenId: 3358)
-        let porIds = v2607Tok.tokenize(text: "por", accent: .castilian)
-        XCTAssertEqual(porIds.first, 480 + 100, "Leading space must use v2607 offset 480")
-        XCTAssertEqual(porIds.last, 3358, "Must terminate with v2607 EOS 3358")
-        XCTAssertTrue(porIds.contains(480 + 7), "Bare word must auto-append terminal period '.' to prevent trailing hallucination")
-        XCTAssertTrue(porIds.contains(480 + 85), "Must emit Spanish tap /ɾ/ from es_ES dictionary")
+        // JSON Codable backwards compatibility for persisted passages
+        let legacyJSON = Data("\"Sofia\"".utf8)
+        let decodedLegacy = try JSONDecoder().decode(TutorVoice.self, from: legacyJSON)
+        XCTAssertEqual(decodedLegacy, .celia)
 
-        // OOV word "días" must use NeMo IpaG2p uppercase grapheme fallback (D, Í, A, S)
-        let diasIds = v2607Tok.tokenize(text: "días", accent: .castilian)
-        XCTAssertTrue(diasIds.contains(480 + 15) && diasIds.contains(480 + 69) && diasIds.contains(480 + 12) && diasIds.contains(480 + 30))
+        // Accent-matched voice resolution (voice carries regional accent in Phonon-40m-es)
+        XCTAssertEqual(TutorVoice.voice(for: .castilian, preferred: .regina), .celia)
+        XCTAssertEqual(TutorVoice.voice(for: .latinAmerican, preferred: .celia), .regina)
+        XCTAssertEqual(TutorVoice.voice(for: .latinAmerican, preferred: .iker), .leonel)
+        XCTAssertEqual(TutorVoice.voice(for: .castilian, preferred: .leonel), .iker)
 
-        // Ultra-short OOV word "y" must be padded to >= 4 inner tokens before EOS
-        let yIds = v2607Tok.tokenize(text: "y", accent: .castilian)
-        XCTAssertGreaterThanOrEqual(yIds.count - 2, 4)
+        // Paired English Kokoro-82M voices preserve speaker gender
+        XCTAssertEqual(TutorVoice.celia.pairedKokoroEnglishVoice, "af_heart")
+        XCTAssertEqual(TutorVoice.leonel.pairedKokoroEnglishVoice, "am_michael")
 
-        // Regional accent overrides: LatAm yeísmo (ʎ -> ʝ) and Rioplatense sheísmo (ʎ -> ʃ)
-        let calleLatam = v2607Tok.tokenize(text: "calle.", accent: .latinAmerican)
-        let calleRio = v2607Tok.tokenize(text: "calle.", accent: .rioplatense)
-        XCTAssertTrue(calleLatam.contains(480 + 90))
-        XCTAssertTrue(calleRio.contains(480 + 86))
-
-        // Legacy v2512 offset=96, eos=2361 compatibility
-        let v2512Tok = MagpieSpanishTokenizer(token2Id: token2Id, phonemeDict: dict, spanishOffset: 96, eosTokenId: 2361)
-        let queLegacy = v2512Tok.tokenize(text: "que", accent: .castilian)
-        XCTAssertEqual(queLegacy.first, 196)
-        XCTAssertEqual(queLegacy.last, 2361)
-
-        // Monotonic attention prior advances cleanly and suppresses past attention sinks
-        var prior = MagpieAttentionPriorState(textLen: 12, epsilon: 0.1, lookaheadWindow: 6, advanceThreshold: 8, decayThreshold: 10)
-        var scores = [Float](repeating: 0.01, count: 12)
-        scores[4] = 0.9
-        prior.update(alignmentScores: scores)
-        XCTAssertEqual(prior.lastAttended, 4)
-        XCTAssertEqual(prior.prior[3], 1.0, accuracy: 1e-5)
-        XCTAssertEqual(prior.prior[4], 1.0, accuracy: 1e-5)
-        XCTAssertEqual(prior.prior[10], 1.0, accuracy: 1e-5)
-        XCTAssertEqual(prior.prior[0], 0.1, accuracy: 1e-5)
-
-        var biasBuf = [Float](repeating: 0, count: 16)
-        biasBuf.withUnsafeMutableBufferPointer { ptr in
-            prior.fillLogPriorBias(into: ptr.baseAddress!, maxTextLen: 16)
-        }
-        XCTAssertEqual(biasBuf[4], 0.0, accuracy: 1e-5)
-        XCTAssertEqual(biasBuf[0], logf(0.1), accuracy: 1e-4)
-        XCTAssertEqual(biasBuf[12], -30_000.0, accuracy: 1e-3)
-
-        // Exact NeMo argmax_or_multinomial_any EOS detector on 2x stacked frames (16 slots)
-        let nonEOS = [Int32](repeating: 42, count: 16)
-        var mainEOSLane1 = nonEOS
-        mainEOSLane1[10] = 2017 // EOS in frame lane 1 predicted by main decoder head even when multinomial missed it!
-        XCTAssertEqual(
-            MagpieEOSDetector.firstEOSLane(
-                sampled: nonEOS,
-                greedyLT: nonEOS,
-                greedyMain: mainEOSLane1,
-                frameStackingFactor: 2,
-                framesEmittedSoFar: 6,
-                minFrames: 4
-            ),
-            1,
-            "Must stop at lane 1 (emitting lane 0) when main head argmax hits EOS!"
+        // Bilingual GPT-6.1 Terra turn resolution: ES+EN mode keeps both; Spanish-only strips English
+        let resp = GPT61TerraClient.SpeakingPartnerResponse(
+            recastCorrectionEs: "Fui al mercado ayer.",
+            partnerReplyEs: "¡Genial! ¿Qué compraste en el mercado?",
+            partnerReplyEn: "Nice job! Use 'fui' for 'I went' in the past tense.",
+            spokenSegments: [
+                TutorSpeechSegment(language: .english, text: "Nice job! Use 'fui' for 'I went' in the past tense."),
+                TutorSpeechSegment(language: .spanish, text: "¡Genial! ¿Qué compraste en el mercado?"),
+            ],
+            followUpPromptEnHint: "Tell your tutor what you bought.",
+            correctlyUsedLemmas: ["mercado"],
+            failedGrammarPatternIds: []
         )
-        // Respects minFrames guard
-        var ltEOSLane0 = nonEOS
-        ltEOSLane0[0] = 2017
-        XCTAssertNil(
-            MagpieEOSDetector.firstEOSLane(
-                sampled: ltEOSLane0,
-                greedyLT: ltEOSLane0,
-                greedyMain: ltEOSLane0,
-                frameStackingFactor: 2,
-                framesEmittedSoFar: 0,
-                minFrames: 4
-            )
+        let bilingualSegs = resp.resolvedSpokenSegments(allowEnglish: true)
+        XCTAssertEqual(bilingualSegs.count, 2)
+        XCTAssertEqual(bilingualSegs[0].language, .english)
+        XCTAssertEqual(bilingualSegs[1].language, .spanish)
+
+        let spanishOnlySegs = resp.resolvedSpokenSegments(allowEnglish: false)
+        XCTAssertEqual(spanishOnlySegs.count, 1)
+        XCTAssertEqual(spanishOnlySegs[0].language, .spanish)
+
+        // Seamless 24 kHz stitching between Phonon Spanish and Kokoro English clips
+        let clipEn = SynthesizedAudioClip(
+            samples: [Float](repeating: 0.2, count: 24_000),
+            sampleRate: 24_000.0,
+            durationSeconds: 1.0,
+            wordTimings: [WordTimingSpan(wordIndex: 0, word: "Great", startTime: 0, endTime: 1.0)],
+            synthesisLatencyMs: 60,
+            realTimeFactor: 0.06,
+            cachedFileURL: nil
         )
+        let clipEs = SynthesizedAudioClip(
+            samples: [Float](repeating: 0.3, count: 12_000),
+            sampleRate: 24_000.0,
+            durationSeconds: 0.5,
+            wordTimings: [WordTimingSpan(wordIndex: 0, word: "Hola", startTime: 0, endTime: 0.5)],
+            synthesisLatencyMs: 35,
+            realTimeFactor: 0.07,
+            cachedFileURL: nil
+        )
+        let stitched = TutorAudioCodec.stitchClips([clipEn, clipEs], pauseSeconds: 0.10)
+        XCTAssertEqual(stitched.sampleRate, 24_000.0, accuracy: 1e-6)
+        XCTAssertEqual(stitched.samples.count, 24_000 + 2_400 + 12_000)
+        XCTAssertEqual(stitched.durationSeconds, 1.6, accuracy: 1e-3)
+        XCTAssertEqual(stitched.wordTimings.count, 2)
+        XCTAssertEqual(stitched.wordTimings[1].wordIndex, 1)
+        XCTAssertEqual(stitched.wordTimings[1].startTime, 1.1, accuracy: 1e-3)
     }
 }

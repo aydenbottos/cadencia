@@ -26,6 +26,7 @@ targets:
       - sdk: MetalKit.framework
       - sdk: CoreHaptics.framework
       - sdk: CoreML.framework
+      - sdk: CoreVideo.framework
       - sdk: Accelerate.framework
       - sdk: AVFoundation.framework
       - sdk: QuartzCore.framework
@@ -41,6 +42,7 @@ targets:
         SWIFT_VERSION: "6.0"
         TARGETED_DEVICE_FAMILY: "1,2"
         SUPPORTS_MACCATALYST: NO
+        EXCLUDED_ARCHS[sdk=iphonesimulator*]: x86_64
         MARKETING_VERSION: "1.0.0"
         CURRENT_PROJECT_VERSION: "1"
         CODE_SIGNING_ALLOWED: NO

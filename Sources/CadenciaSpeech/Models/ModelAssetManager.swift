@@ -1,10 +1,12 @@
+import CadenciaCore
 import Compression
 import CoreML
 import FluidAudio
 import Foundation
 
 public enum ManagedModelKind: String, CaseIterable, Identifiable, Sendable {
-    case magpieTTS = "magpie_v2607"
+    case phononSpanish = "phonon_40m_es"
+    case kokoroEnglish = "kokoro_82m_en"
     case parakeetUltra = "parakeet_ultra_int8"
     case zipaPhoneme = "zipa_cr_large_300m_fp16"
     case sileroVAD = "silero_vad"
@@ -13,7 +15,8 @@ public enum ManagedModelKind: String, CaseIterable, Identifiable, Sendable {
 
     public var displayName: String {
         switch self {
-        case .magpieTTS: return "NVIDIA Magpie v2607 TTS"
+        case .phononSpanish: return "Gradium Phonon-40m-es"
+        case .kokoroEnglish: return "Kokoro-82M (English Tutor)"
         case .parakeetUltra: return "Parakeet Ultra 600M (INT8)"
         case .zipaPhoneme: return "ZIPA CR Large 300M (FP16)"
         case .sileroVAD: return "Silero VAD (Core ML)"
@@ -22,7 +25,8 @@ public enum ManagedModelKind: String, CaseIterable, Identifiable, Sendable {
 
     public var roleDescription: String {
         switch self {
-        case .magpieTTS: return "On-device neural Spanish tutor · v2607 GRPO (2× stack) · 5 voices · FP32 NanoCodec"
+        case .phononSpanish: return "Native Spanish voice for all passages & ledger · 24 kHz ANE · 8 es-ES & es-MX voices"
+        case .kokoroEnglish: return "On-device English conversation tutor · 24 kHz · FP32 Vocoder"
         case .parakeetUltra: return "On-device learner speech-to-text · INT8 ANE · >100× real-time"
         case .zipaPhoneme: return "On-device IPA phoneme recognizer · FP16 Multifunction Metal GPU"
         case .sileroVAD: return "Real-time speech endpointing & silence trimming"
@@ -31,7 +35,8 @@ public enum ManagedModelKind: String, CaseIterable, Identifiable, Sendable {
 
     public var estimatedSizeMB: Int {
         switch self {
-        case .magpieTTS: return 820
+        case .phononSpanish: return 125
+        case .kokoroEnglish: return 210
         case .parakeetUltra: return 640
         case .zipaPhoneme: return 590
         case .sileroVAD: return 4
@@ -61,13 +66,12 @@ public struct ModelDownloadProgress: Sendable {
     }
 }
 
-/// Manages on-device storage, built-in bundle discovery, and direct cloud downloads
-/// (HuggingFace & GitHub Releases CDN) for all 4 Core ML models on iPhone 18 Pro Max.
+/// Manages on-device storage, built-in bundle discovery, and direct on-device cloud downloads
+/// (HuggingFace & GitHub Releases CDN) for all 5 Core ML models on iPhone 18 Pro Max.
 /// Zero computer/LAN interaction required.
 public actor ModelAssetManager {
-    public static let magpieHuggingFaceRepo = "FluidInference/magpie-tts-multilingual-357m-coreml"
-    public static let magpieV2607DefaultReleaseURL = "https://github.com/aydenbottos/cadencia/releases/download/models-magpie-v2607/MagpieV2607_CoreML.zip"
-    public static let magpieV2607InfoPlistKey = "CadenciaMagpieV2607ReleaseURL"
+    public static let phononModelRepo = "gradium/phonon-40m-es"
+    public static let phononVoicesRepo = "gradium/phonon-voices"
     public static let zipaInfoPlistKey = "CadenciaZipaReleaseURL"
 
     public let rootDirectory: URL
@@ -98,17 +102,21 @@ public actor ModelAssetManager {
         let fm = FileManager.default
         let dir = directory(for: kind)
         switch kind {
-        case .magpieTTS:
-            let req = [
-                "text_encoder.mlmodelc",
-                "decoder_prefill.mlmodelc",
-                "decoder_step.mlmodelc",
-                "constants/constants.json",
-                "tokenizer/spanish_phoneme_token2id.json",
-            ]
-            let hasCodec = fm.fileExists(atPath: dir.appendingPathComponent("nanocodec_decoder_v3.mlmodelc").path)
-                || fm.fileExists(atPath: dir.appendingPathComponent("nanocodec_decoder.mlmodelc").path)
-            return hasCodec && req.allSatisfy { fm.fileExists(atPath: dir.appendingPathComponent($0).path) }
+        case .phononSpanish:
+            let hasMeta = fm.fileExists(atPath: dir.appendingPathComponent("bundle.json").path)
+            let hasHost = fm.fileExists(atPath: dir.appendingPathComponent("host.safetensors").path)
+            let hasTok = fm.fileExists(atPath: dir.appendingPathComponent("tokenizer.json").path)
+            let items = (try? fm.contentsOfDirectory(atPath: dir.path)) ?? []
+            let hasFlow = items.contains { $0.hasPrefix("flow-") && ($0.hasSuffix(".mlpackage") || $0.hasSuffix(".mlmodelc")) }
+            let hasMimi = items.contains { $0.hasPrefix("mimi-") && ($0.hasSuffix(".mlpackage") || $0.hasSuffix(".mlmodelc")) }
+            let voiceFiles = (try? fm.contentsOfDirectory(atPath: dir.appendingPathComponent("voices").path)) ?? []
+            let hasVoices = voiceFiles.contains { $0.hasSuffix(".safetensors") }
+            return hasMeta && hasHost && hasTok && hasFlow && hasMimi && hasVoices
+
+        case .kokoroEnglish:
+            guard fm.fileExists(atPath: dir.appendingPathComponent(".ready").path) else { return false }
+            let contents = (try? fm.contentsOfDirectory(atPath: dir.path)) ?? []
+            return contents.contains { $0 != ".ready" && !$0.hasPrefix(".") }
 
         case .parakeetUltra:
             return AsrModels.modelsExist(
@@ -128,186 +136,193 @@ public actor ModelAssetManager {
         }
     }
 
-    /// Returns `"v2607"` when genuine NVIDIA Magpie v2607 (frame_stacking_factor >= 2) is installed,
-    /// `"v2512"` when legacy FluidInference v2512 weights are installed, or `nil` when not installed.
-    public func installedMagpieVersion() -> String? {
-        guard isModelInstalled(.magpieTTS) else { return nil }
-        let constURL = directory(for: .magpieTTS).appendingPathComponent("constants/constants.json")
-        guard let data = try? Data(contentsOf: constURL),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else { return "v2512" }
-        if let ver = json["version"] as? String, ver == "v2607" { return "v2607" }
-        if let fsf = json["frame_stacking_factor"] as? Int, fsf >= 2 { return "v2607" }
-        return "v2512"
+    /// Returns the number of installed native Spanish voice embeddings in the local Phonon bundle.
+    public func installedPhononVoiceCount() -> Int {
+        let voicesDir = directory(for: .phononSpanish).appendingPathComponent("voices")
+        let files = (try? FileManager.default.contentsOfDirectory(atPath: voicesDir.path)) ?? []
+        return files.filter { $0.hasSuffix(".safetensors") }.count
     }
 
-    // MARK: - Download Genuine NVIDIA Magpie v2607 Core ML (Zero-Computer Cloud Release)
+    // MARK: - 1. Download Gradium Phonon-40m-es (User HF Auth + Public Native Spanish Voices + Pure-Rust Core ML Export)
 
-    public func downloadMagpieAssets(
-        repoId: String = ModelAssetManager.magpieHuggingFaceRepo,
+    /// Downloads `gradium/phonon-40m-es` directly from Hugging Face using the user's own Keychain HF Read token,
+    /// downloads all 8 native `es-ES` & `es-MX` voices from `gradium/phonon-voices`, converts them on-device in
+    /// pure Rust (`ptts_export_coreml`) into Apple Neural Engine Core ML packages, and removes the raw download.
+    public func downloadPhononSpanish(
+        hfToken: String,
         onProgress: @escaping @Sendable (ModelDownloadProgress) -> Void
-    ) async throws {
-        let destRoot = directory(for: .magpieTTS)
-        try FileManager.default.createDirectory(at: destRoot.deletingLastPathComponent(), withIntermediateDirectories: true)
+    ) async throws -> URL {
+        let token = hfToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !token.isEmpty else {
+            throw NSError(domain: "ModelAssetManager", code: 401, userInfo: [
+                NSLocalizedDescriptionKey: "Hugging Face token required. Accept gradium/phonon-40m-es on huggingface.co and save your free Read token in Settings -> Hugging Face Vault."
+            ])
+        }
 
-        let configuredURL = (Bundle.main.object(forInfoDictionaryKey: Self.magpieV2607InfoPlistKey) as? String)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let releaseURLString = (configuredURL?.isEmpty == false) ? configuredURL! : Self.magpieV2607DefaultReleaseURL
+        let fm = FileManager.default
+        let destRoot = directory(for: .phononSpanish)
+        let rawDir = rootDirectory.appendingPathComponent("phonon_40m_es_raw", isDirectory: true)
+        let rawVoicesDir = rawDir.appendingPathComponent("voices", isDirectory: true)
+        let stagingDir = rootDirectory.appendingPathComponent("phonon_40m_es_staging", isDirectory: true)
 
-        if let releaseURL = URL(string: releaseURLString) {
-            let tmpZip = rootDirectory.appendingPathComponent("magpie_v2607_download.zip")
-            let stagingDir = rootDirectory.appendingPathComponent("magpie_v2607_staging", isDirectory: true)
-            try? FileManager.default.removeItem(at: tmpZip)
-            try? FileManager.default.removeItem(at: stagingDir)
+        try? fm.removeItem(at: rawDir)
+        try? fm.removeItem(at: stagingDir)
+        try fm.createDirectory(at: rawVoicesDir, withIntermediateDirectories: true)
+        try fm.createDirectory(at: stagingDir, withIntermediateDirectories: true)
 
+        defer {
+            try? fm.removeItem(at: rawDir)
+        }
+
+        onProgress(.init(
+            kind: .phononSpanish,
+            fractionCompleted: 0.03,
+            statusMessage: "Authenticating with Hugging Face for gradium/phonon-40m-es…",
+            isReady: false,
+            errorMessage: nil
+        ))
+
+        // 1. Download checkpoint metadata + tokenizer + full-fidelity model.safetensors (116 MB)
+        let smallFiles = ["config.json", "tokenizer.json"]
+        for (idx, file) in smallFiles.enumerated() {
+            let url = URL(string: "https://huggingface.co/\(Self.phononModelRepo)/resolve/main/\(file)")!
+            try await downloadFile(
+                from: url,
+                to: rawDir.appendingPathComponent(file),
+                bearerToken: token
+            )
             onProgress(.init(
-                kind: .magpieTTS,
-                fractionCompleted: 0.03,
-                statusMessage: "Downloading NVIDIA Magpie v2607 Core ML (GRPO 2× stack)…",
+                kind: .phononSpanish,
+                fractionCompleted: 0.04 + 0.02 * Double(idx + 1),
+                statusMessage: "Downloaded \(file)…",
                 isReady: false,
                 errorMessage: nil
             ))
-
-            do {
-                try await downloadFileWithProgress(from: releaseURL, to: tmpZip) { frac in
-                    onProgress(.init(
-                        kind: .magpieTTS,
-                        fractionCompleted: 0.03 + 0.80 * frac,
-                        statusMessage: "Downloading Magpie v2607: \(Int(frac * 100))%",
-                        isReady: false,
-                        errorMessage: nil
-                    ))
-                }
-
-                onProgress(.init(
-                    kind: .magpieTTS,
-                    fractionCompleted: 0.86,
-                    statusMessage: "Extracting precompiled Magpie v2607 Core ML bundles…",
-                    isReady: false,
-                    errorMessage: nil
-                ))
-
-                try FileManager.default.createDirectory(at: stagingDir, withIntermediateDirectories: true)
-                try MiniZipExtractor.extract(zipURL: tmpZip, to: stagingDir)
-                try? FileManager.default.removeItem(at: tmpZip)
-
-                // Verify extracted archive integrity before replacing any existing install
-                let required = [
-                    "text_encoder.mlmodelc",
-                    "decoder_prefill.mlmodelc",
-                    "decoder_step.mlmodelc",
-                    "nanocodec_decoder_v3.mlmodelc",
-                    "constants/constants.json",
-                    "tokenizer/spanish_phoneme_token2id.json",
-                ]
-                let fm = FileManager.default
-                if required.allSatisfy({ fm.fileExists(atPath: stagingDir.appendingPathComponent($0).path) }) {
-                    if fm.fileExists(atPath: destRoot.path) {
-                        try fm.removeItem(at: destRoot)
-                    }
-                    try fm.moveItem(at: stagingDir, to: destRoot)
-                    onProgress(.init(
-                        kind: .magpieTTS,
-                        fractionCompleted: 1.0,
-                        statusMessage: "Installed · v2607 GRPO (2× frame-stacked)",
-                        isReady: true,
-                        errorMessage: nil
-                    ))
-                    return
-                } else {
-                    try? fm.removeItem(at: stagingDir)
-                    throw NSError(domain: "ModelAssetManager", code: 500, userInfo: [
-                        NSLocalizedDescriptionKey: "Downloaded Magpie v2607 archive was incomplete."
-                    ])
-                }
-            } catch {
-                try? FileManager.default.removeItem(at: tmpZip)
-                try? FileManager.default.removeItem(at: stagingDir)
-                // If an existing v2512 install was being upgraded, surface the exact error instead of silently re-downloading v2512!
-                if installedMagpieVersion() != nil {
-                    throw error
-                }
-                // Otherwise fall back cleanly to HuggingFace legacy bundle only if GitHub Release is unavailable
-                onProgress(.init(
-                    kind: .magpieTTS,
-                    fractionCompleted: 0.04,
-                    statusMessage: "v2607 release unavailable · Falling back to HuggingFace mirror…",
-                    isReady: false,
-                    errorMessage: nil
-                ))
-            }
         }
 
-        // Legacy HuggingFace mirror fallback (v2512)
-        try FileManager.default.createDirectory(at: destRoot, withIntermediateDirectories: true)
-        var filesToFetch: [String] = [
-            "manifest.json",
-            "constants/constants.json",
-            "constants/speaker_info.json",
-            "constants/tokenizer_info.json",
-            "constants/tokenizer_metadata.json",
-            "constants/speaker_0.npy",
-            "constants/speaker_1.npy",
-            "constants/speaker_2.npy",
-            "constants/speaker_3.npy",
-            "constants/speaker_4.npy",
-            "constants/text_embedding.npy",
-            "tokenizer/spanish_phoneme_token2id.json",
-            "tokenizer/spanish_phoneme_phoneme_dict.json",
-            "constants/local_transformer/in_proj_weight.npy",
-            "constants/local_transformer/in_proj_bias.npy",
-            "constants/local_transformer/pos_emb.npy",
-            "constants/local_transformer/norm1_weight.npy",
-            "constants/local_transformer/norm2_weight.npy",
-            "constants/local_transformer/sa_qkv_weight.npy",
-            "constants/local_transformer/sa_o_weight.npy",
-            "constants/local_transformer/ffn_conv1_weight.npy",
-            "constants/local_transformer/ffn_conv2_weight.npy",
-        ]
-        for cb in 0..<8 {
-            filesToFetch.append("constants/audio_embedding_\(cb).npy")
-            filesToFetch.append("constants/local_transformer/out_proj_\(cb)_weight.npy")
-            filesToFetch.append("constants/local_transformer/out_proj_\(cb)_bias.npy")
-        }
-
-        let bundles = [
-            "text_encoder.mlmodelc",
-            "decoder_prefill.mlmodelc",
-            "decoder_step.mlmodelc",
-            "nanocodec_decoder_v3.mlmodelc",
-        ]
-        let bundleSubfiles = [
-            "coremldata.bin",
-            "metadata.json",
-            "model.mil",
-            "weights/weight.bin",
-            "analytics/coremldata.bin",
-        ]
-        for b in bundles {
-            for sub in bundleSubfiles {
-                filesToFetch.append("\(b)/\(sub)")
-            }
-        }
-
-        let total = Double(filesToFetch.count)
-        for (idx, relPath) in filesToFetch.enumerated() {
-            let localURL = destRoot.appendingPathComponent(relPath)
-            if FileManager.default.fileExists(atPath: localURL.path) { continue }
-            let remoteURL = URL(string: "https://huggingface.co/\(repoId)/resolve/main/\(relPath)")!
+        let weightsURL = URL(string: "https://huggingface.co/\(Self.phononModelRepo)/resolve/main/model.safetensors")!
+        try await downloadFileWithProgress(
+            from: weightsURL,
+            to: rawDir.appendingPathComponent("model.safetensors"),
+            bearerToken: token
+        ) { frac in
             onProgress(.init(
-                kind: .magpieTTS,
-                fractionCompleted: Double(idx) / total,
-                statusMessage: "Downloading \(relPath)…",
+                kind: .phononSpanish,
+                fractionCompleted: 0.08 + 0.60 * frac,
+                statusMessage: "Downloading Phonon-40m-es weights: \(Int(frac * 100))%",
                 isReady: false,
                 errorMessage: nil
             ))
-            try await downloadFile(from: remoteURL, to: localURL)
         }
 
-        onProgress(.init(kind: .magpieTTS, fractionCompleted: 1.0, statusMessage: "Magpie Core ML ready", isReady: true, errorMessage: nil))
+        // 2. Download all 8 curated native Spanish voices (4 Castilian es-ES + 4 Mexican es-MX, public repo, ~2 MB total)
+        let voices = TutorVoice.allCases
+        for (idx, voice) in voices.enumerated() {
+            let voiceURL = URL(string: "https://huggingface.co/\(Self.phononVoicesRepo)/resolve/main/voices/\(voice.phononVoiceId).safetensors")!
+            let destVoice = rawVoicesDir.appendingPathComponent("\(voice.phononBundleName).safetensors")
+            onProgress(.init(
+                kind: .phononSpanish,
+                fractionCompleted: 0.68 + 0.12 * (Double(idx) / Double(voices.count)),
+                statusMessage: "Downloading native \(voice.localeLabel) voice: \(voice.rawValue)…",
+                isReady: false,
+                errorMessage: nil
+            ))
+            try await downloadFile(from: voiceURL, to: destVoice, bearerToken: nil)
+        }
+
+        // 3. Export pure-Rust Core ML packages on-device (`ptts_export_coreml`)
+        onProgress(.init(
+            kind: .phononSpanish,
+            fractionCompleted: 0.82,
+            statusMessage: "Exporting Phonon-40m-es Core ML graphs on device…",
+            isReady: false,
+            errorMessage: nil
+        ))
+        try await PhononSpanishEngine.exportCoreMLBundle(
+            checkpointDir: rawDir,
+            voicesDir: rawVoicesDir,
+            outputDir: stagingDir
+        )
+
+        // 4. Atomically install into CadenciaModels/phonon_40m_es
+        if fm.fileExists(atPath: destRoot.path) {
+            try fm.removeItem(at: destRoot)
+        }
+        try fm.moveItem(at: stagingDir, to: destRoot)
+
+        onProgress(.init(
+            kind: .phononSpanish,
+            fractionCompleted: 0.90,
+            statusMessage: "Compiling Phonon-40m-es for Apple Neural Engine…",
+            isReady: false,
+            errorMessage: nil
+        ))
+        return destRoot
     }
 
-    // MARK: - Download Parakeet Ultra 600M INT8 via FluidAudio
+    // MARK: - 2. Download Kokoro-82M English Tutor via FluidAudio
+
+    public func downloadKokoroEnglish(
+        onProgress: @escaping @Sendable (ModelDownloadProgress) -> Void
+    ) async throws -> URL {
+        let destRoot = directory(for: .kokoroEnglish)
+        try FileManager.default.createDirectory(at: destRoot, withIntermediateDirectories: true)
+
+        onProgress(.init(
+            kind: .kokoroEnglish,
+            fractionCompleted: 0.04,
+            statusMessage: "Connecting to Hugging Face for Kokoro-82M English Core ML…",
+            isReady: false,
+            errorMessage: nil
+        ))
+
+        _ = try await KokoroAneResourceDownloader.ensureModels(
+            variant: .english,
+            directory: destRoot,
+            additionalModelNames: ["KokoroVocoder_v2.mlmodelc"],
+            progressHandler: { prog in
+                let dlFrac = min(1.0, max(0.0, prog.fractionCompleted <= 0.51 ? prog.fractionCompleted * 2.0 : prog.fractionCompleted))
+                let uiFrac = 0.05 + 0.72 * dlFrac
+                let message: String
+                switch prog.phase {
+                case .listing:
+                    message = "Listing Kokoro-82M English Core ML files…"
+                case .downloading(let done, let total):
+                    if total > 0 {
+                        message = "Downloading Kokoro-82M English (\(done)/\(total) files · \(Int(dlFrac * 100))%)…"
+                    } else {
+                        message = "Downloading Kokoro-82M English (\(Int(dlFrac * 100))%)…"
+                    }
+                case .compiling(let name):
+                    message = "Compiling \(name)…"
+                }
+                onProgress(.init(
+                    kind: .kokoroEnglish,
+                    fractionCompleted: uiFrac,
+                    statusMessage: message,
+                    isReady: false,
+                    errorMessage: nil
+                ))
+            }
+        )
+
+        onProgress(.init(
+            kind: .kokoroEnglish,
+            fractionCompleted: 0.84,
+            statusMessage: "Downloading English G2P lexicon & voices (af_heart, am_michael)…",
+            isReady: false,
+            errorMessage: nil
+        ))
+        return destRoot
+    }
+
+    public func markKokoroReady() {
+        let dir = directory(for: .kokoroEnglish)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: dir.appendingPathComponent(".ready").path, contents: Data())
+    }
+
+    // MARK: - 3. Download Parakeet Ultra 600M INT8 via FluidAudio
 
     public func downloadParakeetUltra(
         onProgress: @escaping @Sendable (ModelDownloadProgress) -> Void
@@ -320,14 +335,11 @@ public actor ModelAssetManager {
             errorMessage: nil
         ))
 
-        // Phase 1: Download files (FluidAudio ProgressReporter maps repo downloads 0.0 -> 0.5;
-        // normalize cleanly to 0.05 -> 0.75 so progress never stalls at 50%!)
         let targetDir = try await AsrModels.download(
             version: .ultra,
             encoderPrecision: .int8,
             encoderComputeUnits: .cpuAndNeuralEngine,
             progressHandler: { prog in
-                // FluidAudio emits downloadPhaseWeight = 0.5 during repo downloads -> normalize * 2.0
                 let dlFrac = min(1.0, max(0.0, prog.fractionCompleted <= 0.51 ? prog.fractionCompleted * 2.0 : prog.fractionCompleted))
                 let uiFrac = 0.05 + 0.70 * dlFrac
                 let message: String
@@ -353,7 +365,6 @@ public actor ModelAssetManager {
             }
         )
 
-        // Phase 2: Explicitly signal download complete and Core ML ANE compilation started!
         onProgress(.init(
             kind: .parakeetUltra,
             fractionCompleted: 0.78,
@@ -396,20 +407,16 @@ public actor ModelAssetManager {
         return models
     }
 
-    // MARK: - Zero-Computer ZIPA CR Large 300M FP16 (Built-In Bundle OR Direct Cloud CDN)
+    // MARK: - 4. Zero-Computer ZIPA CR Large 300M FP16 (Built-In Bundle OR Direct Cloud CDN)
 
-    /// Returns the precompiled `ZipaCRLarge300M_FP16.mlmodelc` baked into `Cadencia.app` immediately,
-    /// or downloads & extracts `ZipaCRLarge300M_FP16.mlmodelc.zip` directly on-device from the
-    /// CI-configured GitHub Release CDN (`Info.plist -> CadenciaZipaReleaseURL`).
     public func installZipaFromCloud(
         onProgress: @escaping @Sendable (ModelDownloadProgress) -> Void
     ) async throws -> URL {
-        // 1. Instant path: already built into Cadencia.app by GitHub Actions (zero download!)
         if let bundled = Bundle.main.url(forResource: "ZipaCRLarge300M_FP16", withExtension: "mlmodelc") {
             onProgress(.init(
                 kind: .zipaPhoneme,
                 fractionCompleted: 1.0,
-                statusMessage: "Built-in · ANE Ready",
+                statusMessage: "Built-in · Metal GPU Ready",
                 isReady: true,
                 errorMessage: nil
             ))
@@ -420,18 +427,17 @@ public actor ModelAssetManager {
         try FileManager.default.createDirectory(at: destRoot, withIntermediateDirectories: true)
         let compiledFinal = destRoot.appendingPathComponent("ZipaCRLarge300M_FP16.mlmodelc")
         if FileManager.default.fileExists(atPath: compiledFinal.path) {
-            onProgress(.init(kind: .zipaPhoneme, fractionCompleted: 1.0, statusMessage: "ZIPA CR Large 300M FP16 ready on ANE", isReady: true, errorMessage: nil))
+            onProgress(.init(kind: .zipaPhoneme, fractionCompleted: 1.0, statusMessage: "ZIPA CR Large 300M FP16 ready", isReady: true, errorMessage: nil))
             return compiledFinal
         }
 
-        // 2. Cloud download path (for lightweight IPA builds): uses auto-injected GitHub Release CDN URL
         guard let urlStr = (Bundle.main.object(forInfoDictionaryKey: Self.zipaInfoPlistKey) as? String)?
                 .trimmingCharacters(in: .whitespacesAndNewlines),
               !urlStr.isEmpty,
               let remoteURL = URL(string: urlStr)
         else {
             throw NSError(domain: "ModelAssetManager", code: 404, userInfo: [
-                NSLocalizedDescriptionKey: "ZIPA FP16 cloud release URL is not configured in this build. Rebuild with GitHub Actions (default builds bundle ZIPA directly inside the app)."
+                NSLocalizedDescriptionKey: "ZIPA FP16 cloud release URL is not configured in this build."
             ])
         }
 
@@ -446,7 +452,7 @@ public actor ModelAssetManager {
             errorMessage: nil
         ))
 
-        try await downloadFileWithProgress(from: remoteURL, to: tmpZip) { frac in
+        try await downloadFileWithProgress(from: remoteURL, to: tmpZip, bearerToken: nil) { frac in
             onProgress(.init(
                 kind: .zipaPhoneme,
                 fractionCompleted: 0.05 + 0.80 * frac,
@@ -459,7 +465,7 @@ public actor ModelAssetManager {
         onProgress(.init(
             kind: .zipaPhoneme,
             fractionCompleted: 0.88,
-            statusMessage: "Extracting precompiled ANE model bundle…",
+            statusMessage: "Extracting precompiled ZIPA model bundle…",
             isReady: false,
             errorMessage: nil
         ))
@@ -467,14 +473,13 @@ public actor ModelAssetManager {
         try MiniZipExtractor.extract(zipURL: tmpZip, to: destRoot)
         try? FileManager.default.removeItem(at: tmpZip)
 
-        // If the archive contained an uncompiled .mlpackage instead of .mlmodelc, compile natively on-device
         let pkgDest = destRoot.appendingPathComponent("ZipaCRLarge300M_FP16.mlpackage")
         if !FileManager.default.fileExists(atPath: compiledFinal.path),
            FileManager.default.fileExists(atPath: pkgDest.path) {
             onProgress(.init(
                 kind: .zipaPhoneme,
                 fractionCompleted: 0.93,
-                statusMessage: "Compiling ZIPA FP16 for Neural Engine…",
+                statusMessage: "Compiling ZIPA FP16…",
                 isReady: false,
                 errorMessage: nil
             ))
@@ -492,7 +497,7 @@ public actor ModelAssetManager {
         onProgress(.init(
             kind: .zipaPhoneme,
             fractionCompleted: 1.0,
-            statusMessage: "ZIPA CR Large 300M FP16 ready on ANE",
+            statusMessage: "ZIPA CR Large 300M FP16 ready",
             isReady: true,
             errorMessage: nil
         ))
@@ -505,14 +510,34 @@ public actor ModelAssetManager {
         FileManager.default.createFile(atPath: dir.appendingPathComponent(".ready").path, contents: Data())
     }
 
-    private func downloadFile(from remote: URL, to local: URL) async throws {
+    // MARK: - Authenticated & Streaming HTTP Helpers
+
+    private func makeRequest(url: URL, bearerToken: String?) -> URLRequest {
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 300
+        if let token = bearerToken, !token.isEmpty {
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        return req
+    }
+
+    private func formatHTTPError(code: Int, fileName: String, hasBearer: Bool) -> NSError {
+        let msg: String
+        if (code == 401 || code == 403) && hasBearer {
+            msg = "HTTP \(code) downloading \(fileName): accept the license at huggingface.co/gradium/phonon-40m-es and verify your Hugging Face Read token."
+        } else {
+            msg = "Download failed for \(fileName) (HTTP \(code))"
+        }
+        return NSError(domain: "ModelAssetManager", code: code, userInfo: [NSLocalizedDescriptionKey: msg])
+    }
+
+    private func downloadFile(from remote: URL, to local: URL, bearerToken: String?) async throws {
         try FileManager.default.createDirectory(at: local.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let (tmpURL, response) = try await session.download(from: remote)
+        let req = makeRequest(url: remote, bearerToken: bearerToken)
+        let (tmpURL, response) = try await session.download(for: req)
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             let code = (response as? HTTPURLResponse)?.statusCode ?? -1
-            throw NSError(domain: "ModelAssetManager", code: code, userInfo: [
-                NSLocalizedDescriptionKey: "Failed to download \(remote.lastPathComponent) (HTTP \(code))"
-            ])
+            throw formatHTTPError(code: code, fileName: remote.lastPathComponent, hasBearer: bearerToken != nil)
         }
         if FileManager.default.fileExists(atPath: local.path) {
             try FileManager.default.removeItem(at: local)
@@ -523,15 +548,15 @@ public actor ModelAssetManager {
     private func downloadFileWithProgress(
         from remote: URL,
         to local: URL,
+        bearerToken: String?,
         onFraction: @Sendable (Double) -> Void
     ) async throws {
         try FileManager.default.createDirectory(at: local.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let (bytes, response) = try await session.bytes(from: remote)
+        let req = makeRequest(url: remote, bearerToken: bearerToken)
+        let (bytes, response) = try await session.bytes(for: req)
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             let code = (response as? HTTPURLResponse)?.statusCode ?? -1
-            throw NSError(domain: "ModelAssetManager", code: code, userInfo: [
-                NSLocalizedDescriptionKey: "Cloud download failed for \(remote.lastPathComponent) (HTTP \(code))"
-            ])
+            throw formatHTTPError(code: code, fileName: remote.lastPathComponent, hasBearer: bearerToken != nil)
         }
         let expectedLen = max(1, response.expectedContentLength)
         FileManager.default.createFile(atPath: local.path, contents: nil)
@@ -574,7 +599,6 @@ public enum MiniZipExtractor {
             throw NSError(domain: "MiniZipExtractor", code: 1, userInfo: [NSLocalizedDescriptionKey: "Truncated ZIP archive."])
         }
 
-        // Locate End of Central Directory record (0x06054b50) scanning backwards from EOF
         let minSearch = max(0, totalLen - 65_557)
         var eocdOffset = -1
         var cursor = totalLen - 22
@@ -610,7 +634,6 @@ public enum MiniZipExtractor {
             let name = String(data: data.subdata(in: nameStart..<(nameStart + nameLen)), encoding: .utf8) ?? ""
             cdPos = nameStart + nameLen + extraLen + commentLen
 
-            // Guard against zip-slip path traversal
             let outURL = destinationDir.appendingPathComponent(name).standardizedFileURL
             guard outURL.path.hasPrefix(canonicalDest) else { continue }
 
@@ -631,7 +654,6 @@ public enum MiniZipExtractor {
             try fm.createDirectory(at: outURL.deletingLastPathComponent(), withIntermediateDirectories: true)
 
             if method == 0 {
-                // Stored (uncompressed) — stream 4MB chunks directly from memory-mapped ZIP (constant <4MB RAM even on 850MB archives!)
                 fm.createFile(atPath: outURL.path, contents: nil)
                 let outHandle = try FileHandle(forWritingTo: outURL)
                 defer { try? outHandle.close() }
@@ -645,7 +667,6 @@ public enum MiniZipExtractor {
                 }
             } else if method == 8 {
                 let compressedSlice = data.subdata(in: payloadStart..<payloadEnd)
-                // Raw DEFLATE (RFC 1951) decoded via Apple's hardware-accelerated Compression.framework
                 var output = Data(count: max(1, uncompSize))
                 let decodedCount: Int = output.withUnsafeMutableBytes { dstBuf in
                     compressedSlice.withUnsafeBytes { srcBuf in
