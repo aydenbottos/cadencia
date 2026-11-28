@@ -1,29 +1,29 @@
 import Foundation
 
 /// Implements the automatic Stage A (deterministic local) Input Contract Verifier
-/// from the revised 16-page Signal-Starvation Hypothesis Test Protocol (pp. 6–8):
+/// from the 17-page Signal-Starvation Hypothesis Test Protocol (pp. 6–9):
 ///
 /// **Full Contract (Sessions 5+):**
 /// - Passage form: 180–250 words.
-/// - Rule 1 (Closed vocabulary): 100% of lemmas belong to the 5 allowed groups: Known,
-///   Learning with p > 85%, this passage's due list, this passage's new list, or names/numbers.
-///   ZERO tolerance for hold-out lemmas.
-/// - Rule 2 (New items): at most 6 per passage; each appears >= 3 times with 3 of those uses
-///   at least 30 words apart. Further uses are free and never fail the rule.
-/// - Rule 3 (Due items & Scheduled share): every item on the due list appears >= 1 time;
-///   new + due items together make up at most 23% of running words. A single passage has NO lower limit.
-/// - Rule 4 (Fresh context): a due item never appears beside the same content words (±3 window)
-///   as in an earlier meeting.
-/// - Empty-list rule: a rule about a list that is empty passes automatically.
+/// - Rule 1 (Closed vocabulary): 100% of lemmas belong to the 5 allowed groups (Known, Learning p > 85%,
+///   due list, new list, names/numbers). ZERO tolerance for hold-out lemmas.
+/// - Rule 2 (New items): at most 6 per passage; each appears >= 3 times with 3 uses >= 30 words apart;
+///   further uses are free and never fail the rule.
+/// - Rule 3 (Due items & Scheduled share): every due item appears >= 1 time; combined new + due <= 23%;
+///   no lower limit per passage.
+/// - Rule 4 (Fresh context): no repeated ±3 content neighbors for due items.
+/// - Empty-list rule: a rule about an empty list passes automatically.
 ///
-/// **Bootstrap Contract (Sessions 1–4):**
-/// - Passage form: 6–10 sentences of <= 8 words each, each with a picture and an English line on tap.
-/// - Rule 1 (Closed vocabulary): >= 80% of words are items met so far, items on the passage's
-///   new/due list, names, or numbers. The rest (<= 20%) MUST be glossed transparent cognates.
-///   ZERO tolerance for hold-out lemmas.
-/// - Rule 2 (New items): at most 8 per passage; each appears in at least 3 different sentences
-///   during the session. No spacing rule and no upper limit on uses.
-/// - Rule 3 (Scheduled share): NO limit (neither cap nor floor). Due items (if any) appear >= 1x.
+/// **Bootstrap Contract (Sessions 1–4, Fixed Kits of 6–8, pp. 8–9):**
+/// - Feasibility pre-check: 23% arithmetic is skipped; only pre-check is that a kit holds a verb and a noun.
+/// - Passage form: 6–10 sentences of 8 words or fewer, each with a picture and an English line on tap.
+/// - Rule 1 (Closed vocabulary): >= 80% of words are items met so far, items in the passage's kit,
+///   fixed cast names (Ana, Luis, Carla, Perú, México — NOT a tagger!), or numbers. Remaining <= 20%
+///   must be glossed transparent cognates. Words are matched against a table of each item's inflected forms,
+///   and `al` and `del` count as TWO items (`a`+`el`, `de`+`el`). Patterns are not part of Rule 1.
+/// - Rule 2 (New items): every kit item appears >= 1x in its passage (and in >= 3 different sentences
+///   during the session across kit + recombination passages). No spacing rule and no upper limit on uses.
+/// - Rule 3 (Scheduled share): NO limit. Due items (if any) appear >= 1x.
 /// - Rule 4 (Fresh context): applies unchanged.
 public struct ContractVerifier: Sendable {
     public let lemmatizer: SpanishLemmatizer
@@ -42,8 +42,7 @@ public struct ContractVerifier: Sendable {
         glossedTransparentCognates: Set<String> = [],
         priorSessionSentenceCountsByItemId: [String: Int] = [:]
     ) -> VerificationReport {
-        // Analyze sentence-by-sentence so every violation carries exact 0-based offending sentence indices
-        // for Step 4 targeted sentence repair!
+        _ = priorSessionSentenceCountsByItemId
         var tokens: [AnalyzedToken] = []
         var tokenSentenceIndex: [Int] = []
         var sentenceWordCounts: [Int] = []
@@ -72,12 +71,19 @@ public struct ContractVerifier: Sendable {
             tokenSentenceIndex = Array(repeating: 0, count: fallbackToks.count)
         }
 
-        let totalWords = tokens.count
+        let totalSurfaceWords = tokens.count
         var violations: [ContractViolation] = []
 
-        // 0. Passage form check
+        // 0. Passage form & Bootstrap kit feasibility check
         if plan.isBootstrap {
-            // Bootstrap (p. 8): 6 to 10 sentences of 8 words or fewer
+            if !plan.newItems.isEmpty && !BootstrapKitLibrary.checkKitFeasibility(items: plan.newItems) {
+                violations.append(ContractViolation(
+                    ruleNumber: 0,
+                    ruleName: "Bootstrap Kit Feasibility",
+                    detail: "Bootstrap kit must hold at least one verb and one noun.",
+                    offendingTokens: plan.newItems.map(\.spanish)
+                ))
+            }
             if sentences.count < 6 || sentences.count > 10 {
                 violations.append(ContractViolation(
                     ruleNumber: 0,
@@ -103,12 +109,11 @@ public struct ContractVerifier: Sendable {
                 ))
             }
         } else {
-            // Full contract (p. 6): 180 to 250 words
-            if totalWords < parameters.passageMinWords || totalWords > parameters.passageMaxWords {
+            if totalSurfaceWords < parameters.passageMinWords || totalSurfaceWords > parameters.passageMaxWords {
                 violations.append(ContractViolation(
                     ruleNumber: 0,
                     ruleName: "Passage Length (\(parameters.passageMinWords)–\(parameters.passageMaxWords) words)",
-                    detail: "Passage has \(totalWords) words; required \(parameters.passageMinWords)–\(parameters.passageMaxWords).",
+                    detail: "Passage has \(totalSurfaceWords) words; required \(parameters.passageMinWords)–\(parameters.passageMaxWords).",
                     offendingTokens: [],
                     offendingSentenceIndices: sentences.isEmpty ? [] : [max(0, sentences.count - 1)]
                 ))
@@ -116,18 +121,32 @@ public struct ContractVerifier: Sendable {
         }
 
         // Build lookup sets
-        let allowedSet = Set(plan.allowedKnownLemmas.map { $0.lowercased() })
+        var allowedSet = Set(plan.allowedKnownLemmas.map { $0.lowercased() })
+        for item in plan.dueItems { allowedSet.insert(item.spanish.lowercased()) }
+        for item in plan.newItems { allowedSet.insert(item.spanish.lowercased()) }
+        if allowedSet.contains("un") { allowedSet.insert("uno") }
+        if allowedSet.contains("uno") { allowedSet.insert("un") }
+
         let holdoutSet = Set(plan.holdoutBannedLemmas.map { $0.lowercased() })
         let cognateSet = Set(plan.transparentCognateLemmas.map { $0.lowercased() })
             .union(glossedTransparentCognates.map { $0.lowercased() })
+
+        // Bootstrap cast list comes from the fixed cast list (NOT a tagger!)
+        var fixedCastSet = BootstrapKitLibrary.fixedCastLowercaseSet
+        for name in plan.bootstrapCastNames {
+            let low = name.lowercased()
+            fixedCastSet.insert(low)
+            fixedCastSet.insert(SpanishLemmatizer.stripSpanishAccents(low))
+        }
 
         let dueLexical = plan.dueItems.filter { $0.itemType == .lemma }
         let dueChunks = plan.dueItems.filter { $0.itemType == .chunk }
         let newLexical = plan.newItems.filter { $0.itemType == .lemma }
         let newChunks = plan.newItems.filter { $0.itemType == .chunk }
 
-        let dueLemmaToItem = Dictionary(uniqueKeysWithValues: dueLexical.map { ($0.spanish.lowercased(), $0) })
-        let newLemmaToItem = Dictionary(uniqueKeysWithValues: newLexical.map { ($0.spanish.lowercased(), $0) })
+        let dueKeys = Set(dueLexical.map { $0.spanish.lowercased() })
+        let newKeys = Set(newLexical.map { $0.spanish.lowercased() })
+        let scheduledKeys = dueKeys.union(newKeys)
 
         // Multi-word chunk matches
         let chunkMatches = lemmatizer.findChunks(in: tokens)
@@ -144,7 +163,7 @@ public struct ContractVerifier: Sendable {
             }
         }
 
-        // Track occurrences & Rule 1 closed vocabulary
+        // Track occurrences using the table of inflected forms + two-item expansion for `al` and `del`!
         var holdoutLeaks: [String] = []
         var holdoutSentenceIndices: Set<Int> = []
         var offListLemmas: [String] = []
@@ -152,67 +171,85 @@ public struct ContractVerifier: Sendable {
         var nonCognateBootstrapOffList: [String] = []
         var nonCognateSentenceIndices: Set<Int> = []
 
-        var coreCompliantCount = 0
-        var scheduledTokenIndices: Set<Int> = []
-        var lemmaPositions: [String: [Int]] = [:]
-        var surfacePositions: [String: [Int]] = [:]
-        var lemmaSentences: [String: Set<Int>] = [:]
-        var surfaceSentences: [String: Set<Int>] = [:]
+        var totalCheckedUnits = 0
+        var coreCompliantUnits = 0
+        var scheduledUnitCount = 0
+        var itemPositions: [String: [Int]] = [:]
+        var itemSentences: [String: Set<Int>] = [:]
 
         for tok in tokens {
-            let lem = tok.lemma.lowercased()
             let norm = tok.normalized
+            let lem = tok.lemma.lowercased()
             let sIdx = tok.wordIndex < tokenSentenceIndex.count ? tokenSentenceIndex[tok.wordIndex] : 0
+            let isNumber = tok.surface.allSatisfy(\.isNumber)
 
-            lemmaPositions[lem, default: []].append(tok.wordIndex)
-            surfacePositions[norm, default: []].append(tok.wordIndex)
-            lemmaSentences[lem, default: []].insert(sIdx)
-            surfaceSentences[norm, default: []].insert(sIdx)
+            // Fixed cast list in Bootstrap (NOT tagger!); standard proper name/number detection from Session 5+
+            let isCastOrNumber: Bool = plan.isBootstrap
+                ? (isNumber || fixedCastSet.contains(norm) || fixedCastSet.contains(SpanishLemmatizer.stripSpanishAccents(norm)))
+                : tok.isProperNameOrNumber
 
-            if holdoutSet.contains(lem) && !allowedSet.contains(lem) {
-                holdoutLeaks.append(tok.surface)
-                holdoutSentenceIndices.insert(sIdx)
+            if isCastOrNumber {
+                totalCheckedUnits += 1
+                coreCompliantUnits += 1
+                continue
             }
 
-            let isScheduledLemma = dueLemmaToItem[lem] != nil
-                || newLemmaToItem[lem] != nil
-                || dueLemmaToItem[norm] != nil
-                || newLemmaToItem[norm] != nil
-            if isScheduledLemma {
-                scheduledTokenIndices.insert(tok.wordIndex)
-            }
+            // Expand `al` -> [a, el], `del` -> [de, el], and match every word against the inflected-forms table!
+            let atomicSets = BootstrapKitLibrary.expandTokenToCandidateItemSets(
+                normalizedSurface: norm,
+                lemmatizerLemma: lem
+            )
 
-            let isCoreAllowed = tok.isProperNameOrNumber
-                || allowedSet.contains(lem)
-                || allowedSet.contains(norm)
-                || Self.isArticleOrContractionAllowed(surface: norm, lemma: lem, allowedSet: allowedSet)
-                || chunkCoveredWordIndices.contains(tok.wordIndex)
+            for candSet in atomicSets {
+                totalCheckedUnits += 1
 
-            if isCoreAllowed {
-                coreCompliantCount += 1
-            } else {
-                offListLemmas.append("\(tok.surface) (\(lem))")
-                offListSentenceIndices.insert(sIdx)
-                if plan.isBootstrap {
-                    let isAllowedCognate = !holdoutSet.contains(lem)
-                        && (cognateSet.contains(lem) || cognateSet.contains(norm))
-                    if !isAllowedCognate {
-                        nonCognateBootstrapOffList.append("\(tok.surface) (\(lem))")
-                        nonCognateSentenceIndices.insert(sIdx)
+                // Record positions & sentences for EVERY canonical item this inflected form belongs to
+                for key in candSet {
+                    itemPositions[key, default: []].append(tok.wordIndex)
+                    itemSentences[key, default: []].insert(sIdx)
+                }
+
+                // Hold-out zero-tolerance guard
+                let allowedMatch = !candSet.isDisjoint(with: allowedSet)
+                if !allowedMatch, holdoutSet.contains(lem) || holdoutSet.contains(norm) {
+                    holdoutLeaks.append(tok.surface)
+                    holdoutSentenceIndices.insert(sIdx)
+                }
+
+                if !candSet.isDisjoint(with: scheduledKeys) {
+                    scheduledUnitCount += 1
+                }
+
+                let isCoreAllowed = allowedMatch || chunkCoveredWordIndices.contains(tok.wordIndex)
+                if isCoreAllowed {
+                    coreCompliantUnits += 1
+                } else {
+                    offListLemmas.append("\(tok.surface) (\(lem))")
+                    offListSentenceIndices.insert(sIdx)
+                    if plan.isBootstrap {
+                        let isGlossedCognate = !holdoutSet.contains(lem)
+                            && !holdoutSet.contains(norm)
+                            && !candSet.isDisjoint(with: cognateSet)
+                        if !isGlossedCognate {
+                            nonCognateBootstrapOffList.append("\(tok.surface) (\(lem))")
+                            nonCognateSentenceIndices.insert(sIdx)
+                        }
                     }
                 }
             }
         }
 
-        // Add chunk tokens belonging to due/new chunks to scheduled share
+        // Add chunk tokens belonging to due/new chunks to scheduled share (without double-counting)
         let scheduledChunkIds = Set((dueChunks + newChunks).map(\.id))
-        for m in chunkMatches where scheduledChunkIds.contains(m.itemId) {
-            for k in m.startIndex..<(m.startIndex + m.length) {
-                scheduledTokenIndices.insert(k)
+        if !scheduledChunkIds.isEmpty {
+            var extraChunkTokens = 0
+            for m in chunkMatches where scheduledChunkIds.contains(m.itemId) {
+                extraChunkTokens += m.length
             }
+            scheduledUnitCount = min(totalCheckedUnits, scheduledUnitCount + extraChunkTokens)
         }
 
-        // Hold-out zero-tolerance check (all sessions)
+        // Hold-out zero-tolerance check
         if !holdoutLeaks.isEmpty {
             violations.append(ContractViolation(
                 ruleNumber: 1,
@@ -224,15 +261,13 @@ public struct ContractVerifier: Sendable {
         }
 
         // Rule 1: Closed Vocabulary
-        //  - Sessions 5+: 100% of words belong to the 5 allowed groups (Known, Learning p>85%, due, new, names/numbers).
-        //  - Bootstrap (Sessions 1–4): >= 80% are met-so-far / new / due / names / numbers; the rest MUST be glossed transparent cognates.
-        let closedCompliance = totalWords > 0 ? Double(coreCompliantCount) / Double(totalWords) : 0.0
+        let closedCompliance = totalCheckedUnits > 0 ? Double(coreCompliantUnits) / Double(totalCheckedUnits) : 0.0
         if plan.isBootstrap {
             if closedCompliance < 0.80 {
                 violations.append(ContractViolation(
                     ruleNumber: 1,
                     ruleName: "Bootstrap Closed Vocabulary (>=80%)",
-                    detail: String(format: "Met/new/name word share %.1f%% < required 80%%. Use more items from the passage's new/met lists.", closedCompliance * 100),
+                    detail: String(format: "Met/kit/cast word share %.1f%% < required 80%%. Build sentences from the kit items, met items, and cast names (%@).", closedCompliance * 100, BootstrapKitLibrary.fixedCastDisplayNames.joined(separator: ", ")),
                     offendingTokens: Array(Set(offListLemmas)).sorted().prefix(12).map { $0 },
                     offendingSentenceIndices: Array(offListSentenceIndices).sorted()
                 ))
@@ -241,7 +276,7 @@ public struct ContractVerifier: Sendable {
                 violations.append(ContractViolation(
                     ruleNumber: 1,
                     ruleName: "Bootstrap Cognate Remainder",
-                    detail: "Words outside met/new/names in Bootstrap must be glossed transparent cognates. Replace non-cognate off-list words.",
+                    detail: "Words outside met/kit/cast in Bootstrap must be glossed transparent cognates. Replace non-cognate off-list words.",
                     offendingTokens: Array(Set(nonCognateBootstrapOffList)).sorted().prefix(12).map { $0 },
                     offendingSentenceIndices: Array(nonCognateSentenceIndices).sorted()
                 ))
@@ -273,39 +308,38 @@ public struct ContractVerifier: Sendable {
             }
 
             if plan.isBootstrap {
-                // Bootstrap Rule 2 (p. 8): each new item appears in >= 3 different sentences (no spacing rule, no upper limit)
+                // Bootstrap Rule 2 (Revised Protocol p. 8):
+                // "Every kit item appears in its passage, and in at least three different sentences during the session.
+                //  No spacing rule and no upper limit on uses."
                 for item in plan.newItems {
-                    let distinctSentCount: Int
+                    let countInPassage: Int
                     if item.itemType == .chunk {
-                        distinctSentCount = (chunkSentencesById[item.id] ?? []).count
+                        countInPassage = (chunkSentencesById[item.id] ?? []).count
                     } else {
-                        let key = item.spanish.lowercased()
-                        distinctSentCount = Self.matchedSentences(for: key, lemmaSentences: lemmaSentences, surfaceSentences: surfaceSentences).count
+                        countInPassage = (itemSentences[item.spanish.lowercased()] ?? []).count
                     }
-                    let cumulative = (priorSessionSentenceCountsByItemId[item.id] ?? 0) + distinctSentCount
-                    if cumulative < parameters.newItemMinOccurrences {
-                        underSpacedNew.append("\(item.spanish) (\(cumulative)/\(parameters.newItemMinOccurrences) distinct sentences)")
+                    if countInPassage < 1 {
+                        underSpacedNew.append("\(item.spanish) (missing from kit passage)")
                     }
                 }
                 if !underSpacedNew.isEmpty {
                     violations.append(ContractViolation(
                         ruleNumber: 2,
-                        ruleName: "Bootstrap New Items (>=3 Sentences)",
-                        detail: "Every bootstrap new item must appear in at least \(parameters.newItemMinOccurrences) different sentences (no spacing limit).",
+                        ruleName: "Bootstrap Kit Coverage",
+                        detail: "Every kit item must appear at least once in its kit passage (no spacing limit).",
                         offendingTokens: underSpacedNew,
-                        offendingSentenceIndices: sentences.isEmpty ? [] : [0, sentences.count / 2, max(0, sentences.count - 1)]
+                        offendingSentenceIndices: sentences.isEmpty ? [] : [max(0, sentences.count - 1)]
                     ))
                 }
             } else {
-                // Full Contract Rule 2 (p. 6): each appears >= 3 times with 3 of those uses >= 30 words apart; extra uses are free!
+                // Full Contract Rule 2 (p. 6): each appears >= 3 times with 3 uses >= 30 words apart; extra uses are free!
                 let minSpacing = parameters.newItemMinWordSpacing
                 for item in plan.newItems {
                     let positions: [Int]
                     if item.itemType == .chunk {
                         positions = (chunkPositionsById[item.id] ?? []).sorted()
                     } else {
-                        let key = item.spanish.lowercased()
-                        positions = Self.matchedPositions(for: key, lemmaPositions: lemmaPositions, surfacePositions: surfacePositions)
+                        positions = Array(Set(itemPositions[item.spanish.lowercased()] ?? [])).sorted()
                     }
                     if positions.count < parameters.newItemMinOccurrences {
                         underSpacedNew.append("\(item.spanish) (count \(positions.count)/\(parameters.newItemMinOccurrences))")
@@ -329,9 +363,6 @@ public struct ContractVerifier: Sendable {
         }
 
         // Rule 3: Due Items & Scheduled Share
-        //  - Every due item appears >= 1x (passes automatically if dueItems is empty).
-        //  - From Session 5+: combined new + due <= 23% of running words; NO lower limit per passage.
-        //  - Bootstrap (Sessions 1–4): NO limit on scheduled share.
         var missingDue: [String] = []
         if !plan.dueItems.isEmpty {
             for item in plan.dueItems {
@@ -339,8 +370,7 @@ public struct ContractVerifier: Sendable {
                 if item.itemType == .chunk {
                     count = chunkPositionsById[item.id]?.count ?? 0
                 } else {
-                    let key = item.spanish.lowercased()
-                    count = Self.matchedPositions(for: key, lemmaPositions: lemmaPositions, surfacePositions: surfacePositions).count
+                    count = (itemPositions[item.spanish.lowercased()] ?? []).count
                 }
                 if count == 0 {
                     missingDue.append(item.spanish)
@@ -357,7 +387,7 @@ public struct ContractVerifier: Sendable {
             }
         }
 
-        let scheduledShare = totalWords > 0 ? Double(scheduledTokenIndices.count) / Double(totalWords) : 0.0
+        let scheduledShare = totalCheckedUnits > 0 ? Double(scheduledUnitCount) / Double(totalCheckedUnits) : 0.0
         let hasAnyScheduledList = !plan.dueItems.isEmpty || !plan.newItems.isEmpty
         if !plan.isBootstrap && hasAnyScheduledList && scheduledShare > parameters.scheduledShareCap + 0.0005 {
             violations.append(ContractViolation(
@@ -374,7 +404,7 @@ public struct ContractVerifier: Sendable {
         var freshCollisionSentenceIndices: Set<Int> = []
         for item in dueLexical {
             guard let priorNeighbors = priorContextByItem[item.id], !priorNeighbors.isEmpty else { continue }
-            let positions = Self.matchedPositions(for: item.spanish.lowercased(), lemmaPositions: lemmaPositions, surfacePositions: surfacePositions)
+            let positions = Array(Set(itemPositions[item.spanish.lowercased()] ?? [])).sorted()
             for pos in positions {
                 let neighbors = contentNeighbors(around: pos, in: tokens, window: 3)
                 let overlap = priorNeighbors.intersection(neighbors)
@@ -398,7 +428,7 @@ public struct ContractVerifier: Sendable {
 
         return VerificationReport(
             passed: violations.isEmpty,
-            totalWords: totalWords,
+            totalWords: totalSurfaceWords,
             closedVocabCompliance: closedCompliance,
             scheduledWordShare: scheduledShare,
             missingDueItems: missingDue,
@@ -412,9 +442,22 @@ public struct ContractVerifier: Sendable {
         )
     }
 
+    /// Finds every new item ID from `candidateItems` whose inflected forms appear inside `sentenceSpanish`
+    /// (Bootstrap Rule 5: whole-sentence picture-matching probe logs against each new item in that sentence!).
+    public func matchedItemIds(in sentenceSpanish: String, from candidateItems: [SyllabusItem]) -> [String] {
+        let toks = lemmatizer.analyze(sentenceSpanish)
+        var presentKeys: Set<String> = []
+        for tok in toks {
+            for set in BootstrapKitLibrary.expandTokenToCandidateItemSets(normalizedSurface: tok.normalized, lemmatizerLemma: tok.lemma) {
+                presentKeys.formUnion(set)
+            }
+        }
+        return candidateItems
+            .filter { presentKeys.contains($0.spanish.lowercased()) }
+            .map(\.id)
+    }
+
     /// Returns the maximum number of sorted token positions whose pairwise spacing is at least `minSpacing`.
-    /// Implements Revised Protocol Rule 2: "at least three times, with three of those uses at least 30 words apart.
-    /// Further uses are free and never fail the rule."
     public static func maxSpacedOccurrences(positions: [Int], minSpacing: Int) -> Int {
         guard !positions.isEmpty else { return 0 }
         var count = 0
@@ -426,81 +469,6 @@ public struct ContractVerifier: Sendable {
             }
         }
         return count
-    }
-
-    private static func matchedPositions(
-        for key: String,
-        lemmaPositions: [String: [Int]],
-        surfacePositions: [String: [Int]]
-    ) -> [Int] {
-        var set = Set(lemmaPositions[key] ?? []).union(surfacePositions[key] ?? [])
-        // Account for Spanish article/determiner inflection quirks (e.g. "la" / "las" -> lemma "el"; "un" / "una" -> "uno")
-        if key == "la" {
-            set.formUnion(surfacePositions["las"] ?? [])
-        } else if key == "el" {
-            set.formUnion(surfacePositions["los"] ?? [])
-            set.formUnion(surfacePositions["al"] ?? [])
-            set.formUnion(surfacePositions["del"] ?? [])
-        } else if key == "de" {
-            set.formUnion(surfacePositions["del"] ?? [])
-        } else if key == "a" {
-            set.formUnion(surfacePositions["al"] ?? [])
-        } else if key == "uno" || key == "un" {
-            set.formUnion(surfacePositions["un"] ?? [])
-            set.formUnion(surfacePositions["una"] ?? [])
-            set.formUnion(surfacePositions["unos"] ?? [])
-            set.formUnion(surfacePositions["unas"] ?? [])
-        }
-        return set.sorted()
-    }
-
-    private static func matchedSentences(
-        for key: String,
-        lemmaSentences: [String: Set<Int>],
-        surfaceSentences: [String: Set<Int>]
-    ) -> Set<Int> {
-        var set = (lemmaSentences[key] ?? []).union(surfaceSentences[key] ?? [])
-        if key == "la" {
-            set.formUnion(surfaceSentences["las"] ?? [])
-        } else if key == "el" {
-            set.formUnion(surfaceSentences["los"] ?? [])
-            set.formUnion(surfaceSentences["al"] ?? [])
-            set.formUnion(surfaceSentences["del"] ?? [])
-        } else if key == "de" {
-            set.formUnion(surfaceSentences["del"] ?? [])
-        } else if key == "a" {
-            set.formUnion(surfaceSentences["al"] ?? [])
-        } else if key == "uno" || key == "un" {
-            set.formUnion(surfaceSentences["un"] ?? [])
-            set.formUnion(surfaceSentences["una"] ?? [])
-            set.formUnion(surfaceSentences["unos"] ?? [])
-            set.formUnion(surfaceSentences["unas"] ?? [])
-        }
-        return set
-    }
-
-    /// Handles mandatory Spanish contractions & determiner inflections (`al`, `del`, `los`/`las`, `un`/`una`/`unos`/`unas`).
-    private static func isArticleOrContractionAllowed(
-        surface: String,
-        lemma: String,
-        allowedSet: Set<String>
-    ) -> Bool {
-        switch surface {
-        case "al":
-            return allowedSet.contains("a") && allowedSet.contains("el") || allowedSet.contains("al")
-        case "del":
-            return allowedSet.contains("de") && allowedSet.contains("el") || allowedSet.contains("del")
-        case "los":
-            return allowedSet.contains("el")
-        case "las":
-            return allowedSet.contains("la") || allowedSet.contains("el")
-        case "un", "una", "unos", "unas":
-            return allowedSet.contains("un") || allowedSet.contains("uno")
-        default:
-            if lemma == "uno" && allowedSet.contains("un") { return true }
-            if lemma == "un" && allowedSet.contains("uno") { return true }
-            return false
-        }
     }
 
     /// Extracts ±window adjacent content-word lemmas around a target word position for Rule 4 tracking.
@@ -529,9 +497,15 @@ public struct ContractVerifier: Sendable {
         for sentence in passage.sentences {
             let tokens = lemmatizer.analyze(sentence.spanish)
             for tok in tokens {
-                if let itemId = lemmaToId[tok.lemma.lowercased()] {
-                    let neighbors = Array(contentNeighbors(around: tok.wordIndex, in: tokens, window: 3)).sorted()
-                    records.append((itemId, sentence.spanish, neighbors))
+                let sets = BootstrapKitLibrary.expandTokenToCandidateItemSets(normalizedSurface: tok.normalized, lemmatizerLemma: tok.lemma)
+                for candSet in sets {
+                    for key in candSet {
+                        if let itemId = lemmaToId[key] {
+                            let neighbors = Array(contentNeighbors(around: tok.wordIndex, in: tokens, window: 3)).sorted()
+                            records.append((itemId, sentence.spanish, neighbors))
+                            break
+                        }
+                    }
                 }
             }
         }

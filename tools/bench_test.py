@@ -38,11 +38,65 @@ SEED_DB = ROOT / "Sources" / "CadenciaCore" / "Resources" / "cadencia_seed.sqlit
 MODEL_ID = "gpt-6.1-terra"
 
 WORD_RE = re.compile(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]+", re.UNICODE)
-PROPER_NAMES = {
-    "clara", "mateo", "lucía", "lucia", "tomás", "tomas", "ana", "pedro", "maría", "maria",
+BOOTSTRAP_FIXED_CAST = {"ana", "luis", "carla", "perú", "peru", "méxico", "mexico"}
+PROPER_NAMES = BOOTSTRAP_FIXED_CAST | {
+    "clara", "mateo", "lucía", "lucia", "tomás", "tomas", "pedro", "maría", "maria",
     "juan", "carlos", "elena", "diego", "sofía", "sofia", "marta", "pablo", "laura",
-    "madrid", "barcelona", "sevilla", "valencia", "oaxaca", "patagonia", "españa", "méxico",
+    "madrid", "barcelona", "sevilla", "valencia", "oaxaca", "patagonia", "españa",
 }
+SESSION1_KITS = [
+    (["ser", "el", "un", "de", "y", "doctor", "hotel", "famoso"], "ser with a noun or adjective; agreement"),
+    (["no", "en", "estar", "restaurante", "hospital", "moderno", "pero", "muy"], "estar for location; negation"),
+    (["tener", "que", "su", "familia", "problema", "importante", "con", "persona"], "tener; possessive su; relative que"),
+    (["a", "ir", "para", "universidad", "estudiante", "profesor", "clase", "este"], "ir a; a + el = al"),
+    (["haber", "mucho", "más", "música", "café", "parque", "centro"], "hay; más ... que"),
+    (["yo", "mi", "también", "porque", "visitar", "estudiar", "museo", "historia"], "first-person verb forms; porque"),
+    (["o", "todo", "usar", "necesitar", "teléfono", "minuto"], "infinitive after para; todo + article"),
+    (["cuando", "otro", "poder", "preparar", "animal", "favorito", "color"], "poder + infinitive; cuando clauses"),
+]
+EXPLICIT_INFLECTIONS = {
+    "ser": {"ser", "soy", "eres", "es", "somos", "sois", "son"},
+    "el": {"el", "la", "los", "las"},
+    "un": {"un", "una", "unos", "unas", "uno"},
+    "uno": {"uno", "un", "una", "unos", "unas"},
+    "de": {"de"}, "y": {"y", "e"}, "a": {"a"}, "no": {"no"}, "en": {"en"}, "pero": {"pero"}, "muy": {"muy"},
+    "que": {"que", "qué"}, "con": {"con"}, "para": {"para"}, "más": {"más", "mas"}, "yo": {"yo"},
+    "también": {"también", "tambien"}, "porque": {"porque"}, "o": {"o", "u"}, "cuando": {"cuando", "cuándo"},
+    "doctor": {"doctor", "doctora", "doctores", "doctoras"},
+    "hotel": {"hotel", "hoteles"},
+    "famoso": {"famoso", "famosa", "famosos", "famosas"},
+    "estar": {"estar", "estoy", "estás", "está", "estamos", "estáis", "están"},
+    "restaurante": {"restaurante", "restaurantes"}, "hospital": {"hospital", "hospitales"},
+    "moderno": {"moderno", "moderna", "modernos", "modernas"},
+    "tener": {"tener", "tengo", "tienes", "tiene", "tenemos", "tenéis", "tienen"},
+    "su": {"su", "sus"}, "familia": {"familia", "familias"}, "problema": {"problema", "problemas"},
+    "importante": {"importante", "importantes"}, "persona": {"persona", "personas"},
+    "ir": {"ir", "voy", "vas", "va", "vamos", "vais", "van"},
+    "universidad": {"universidad", "universidades"}, "estudiante": {"estudiante", "estudiantes"},
+    "profesor": {"profesor", "profesora", "profesores", "profesoras"}, "clase": {"clase", "clases"},
+    "este": {"este", "esta", "esto", "estos", "estas"},
+    "haber": {"haber", "hay", "he", "has", "ha", "hemos", "han"},
+    "mucho": {"mucho", "mucha", "muchos", "muchas"}, "música": {"música", "musica"},
+    "café": {"café", "cafés", "cafe"}, "parque": {"parque", "parques"}, "centro": {"centro", "centros"},
+    "mi": {"mi", "mis"},
+    "visitar": {"visitar", "visito", "visitas", "visita", "visitamos", "visitan"},
+    "estudiar": {"estudiar", "estudio", "estudias", "estudia", "estudiamos", "estudian"},
+    "museo": {"museo", "museos"}, "historia": {"historia", "historias"},
+    "todo": {"todo", "toda", "todos", "todas"},
+    "usar": {"usar", "uso", "usas", "usa", "usamos", "usan"},
+    "necesitar": {"necesitar", "necesito", "necesitas", "necesita", "necesitamos", "necesitan"},
+    "teléfono": {"teléfono", "teléfonos", "telefono"}, "minuto": {"minuto", "minutos"},
+    "otro": {"otro", "otra", "otros", "otras"},
+    "poder": {"poder", "puedo", "puedes", "puede", "podemos", "pueden"},
+    "preparar": {"preparar", "preparo", "preparas", "prepara", "preparamos", "preparan"},
+    "animal": {"animal", "animales"},
+    "favorito": {"favorito", "favorita", "favoritos", "favoritas"},
+    "color": {"color", "colores"},
+}
+SURFACE_TO_LEMMAS: Dict[str, Set[str]] = {}
+for _lem, _forms in EXPLICIT_INFLECTIONS.items():
+    for _f in _forms:
+        SURFACE_TO_LEMMAS.setdefault(_f, set()).add(_lem)
 
 PASSAGE_JSON_SCHEMA = {
     "type": "object",
@@ -206,6 +260,22 @@ def is_contraction_allowed(surface: str, lemma: str, allowed_set: Set[str]) -> b
     return (lemma == "uno" and "un" in allowed_set) or (lemma == "un" and "uno" in allowed_set)
 
 
+def expand_token(surface: str, inflections: Dict[str, str]) -> List[Set[str]]:
+    low = surface.lower()
+    if low == "al":
+        return [{"a"}, {"el"}]
+    if low == "del":
+        return [{"de"}, {"el"}]
+    cands = {low, lemmatize_word(surface, inflections)}
+    if low in SURFACE_TO_LEMMAS:
+        cands |= SURFACE_TO_LEMMAS[low]
+    if "un" in cands:
+        cands.add("uno")
+    if "uno" in cands:
+        cands.add("un")
+    return [cands]
+
+
 def verify_stage_a(
     passage: Dict,
     due_items: List[Dict],
@@ -214,13 +284,12 @@ def verify_stage_a(
     bank: SeedBank,
     is_bootstrap: bool,
 ) -> Tuple[bool, List[str], Dict[str, float], bool]:
-    """Deterministic local Stage A Verifier matching revised ContractVerifier.swift."""
+    """Deterministic local Stage A Verifier matching revised 17-page ContractVerifier.swift."""
     sentences = passage.get("sentences", [])
     violations: List[str] = []
     overcrowding = False
 
     words: List[str] = []
-    lemmas: List[str] = []
     word_sents: List[int] = []
     sent_word_counts: List[int] = []
 
@@ -229,10 +298,9 @@ def verify_stage_a(
         sent_word_counts.append(len(sw))
         for w in sw:
             words.append(w)
-            lemmas.append(lemmatize_word(w, bank.inflections))
             word_sents.append(s_idx)
 
-    total_words = len(words)
+    total_surface_words = len(words)
 
     if is_bootstrap:
         if len(sentences) < 6 or len(sentences) > 10:
@@ -241,35 +309,56 @@ def verify_stage_a(
         if overlong:
             violations.append(f"Bootstrap sentences exceeding 8 words: {overlong}")
     else:
-        if total_words < 180 or total_words > 250:
-            violations.append(f"Word count {total_words} outside 180–250 range.")
+        if total_surface_words < 180 or total_surface_words > 250:
+            violations.append(f"Word count {total_surface_words} outside 180–250 range.")
             overcrowding = True
 
     due_set = {it["spanish"].lower() for it in due_items}
     new_set = {it["spanish"].lower() for it in new_items}
     scheduled_set = due_set | new_set
     full_allowed = allowed_lemmas | scheduled_set
+    if "un" in full_allowed:
+        full_allowed.add("uno")
     glossed_cogs = {g["spanish"].lower() for g in passage.get("transparentCognateGlosses", [])}
     cog_pool = bank.transparent_cognates | glossed_cogs
 
-    holdout_hits = [w for w, l in zip(words, lemmas) if l in bank.holdout_lemmas and l not in full_allowed]
+    total_units = 0
+    core_ok = 0
+    sched_units = 0
+    item_positions: Dict[str, List[int]] = {}
+    holdout_hits: List[str] = []
+    off_list: List[str] = []
+    non_cog_off: List[str] = []
+
+    for idx, w in enumerate(words):
+        low = w.lower()
+        is_name = (low in BOOTSTRAP_FIXED_CAST) if is_bootstrap else (
+            low in PROPER_NAMES or (idx > 0 and w[0].isupper() and low not in bank.inflections)
+        )
+        if is_name or w.isdigit():
+            total_units += 1
+            core_ok += 1
+            continue
+        for cands in expand_token(w, bank.inflections):
+            total_units += 1
+            for k in cands:
+                item_positions.setdefault(k, []).append(idx)
+            matched = bool(cands & full_allowed)
+            if not matched and (low in bank.holdout_lemmas or lemmatize_word(w, bank.inflections) in bank.holdout_lemmas):
+                holdout_hits.append(w)
+            if cands & scheduled_set:
+                sched_units += 1
+            if matched:
+                core_ok += 1
+            else:
+                off_list.append(w)
+                if is_bootstrap and not (cands & cog_pool):
+                    non_cog_off.append(w)
+
     if holdout_hits:
         violations.append(f"Rule 1 HOLDOUT LEAK: {holdout_hits[:5]}")
 
-    core_ok = 0
-    off_list = []
-    non_cog_off = []
-    for idx, (w, l) in enumerate(zip(words, lemmas)):
-        low = w.lower()
-        is_name = low in PROPER_NAMES or (idx > 0 and w[0].isupper() and low not in bank.inflections)
-        if is_name or l in full_allowed or low in full_allowed or is_contraction_allowed(low, l, full_allowed):
-            core_ok += 1
-        else:
-            off_list.append(f"{w}({l})")
-            if is_bootstrap and not (l in cog_pool or low in cog_pool):
-                non_cog_off.append(f"{w}({l})")
-
-    closed_compliance = core_ok / max(1, total_words)
+    closed_compliance = core_ok / max(1, total_units)
     if is_bootstrap:
         if closed_compliance < 0.80:
             violations.append(f"Rule 1 Bootstrap compliance {closed_compliance*100:.1f}% < 80%: {off_list[:8]}")
@@ -279,14 +368,13 @@ def verify_stage_a(
         if closed_compliance < 1.0:
             violations.append(f"Rule 1 Closed Vocab ({closed_compliance*100:.1f}% < 100%): {off_list[:10]}")
 
-    # Rule 2: New items (empty passes automatically)
+    # Rule 2: New items (Bootstrap: every kit item >=1x in passage; Full: >=3x with 3 uses >=30w apart)
     for it in new_items:
         target = it["spanish"].lower()
-        positions = [i for i, (w, l) in enumerate(zip(words, lemmas)) if l == target or w.lower() == target]
+        positions = sorted(set(item_positions.get(target, [])))
         if is_bootstrap:
-            distinct_sents = {word_sents[i] for i in positions}
-            if len(distinct_sents) < 3:
-                violations.append(f"Rule 2 Bootstrap new item '{target}' in {len(distinct_sents)}/3 sentences.")
+            if len(positions) < 1:
+                violations.append(f"Rule 2 Bootstrap kit item '{target}' missing from passage.")
         else:
             if len(positions) < 3:
                 violations.append(f"Rule 2 New item '{target}' appeared {len(positions)}x (need >=3).")
@@ -294,25 +382,23 @@ def verify_stage_a(
                 violations.append(f"Rule 2 New item '{target}' lacks 3 uses >=30 words apart: {positions}.")
 
     # Rule 3: Due coverage & scheduled word share <= 23% (no lower limit; no limit in Bootstrap)
-    missing_due = [d for d in due_set if d not in set(lemmas) and d not in {w.lower() for w in words}]
+    missing_due = [d for d in due_set if not item_positions.get(d)]
     if missing_due:
         violations.append(f"Rule 3 Missing due items: {missing_due[:6]}")
         overcrowding = True
 
-    sched_count = sum(1 for w, l in zip(words, lemmas) if l in scheduled_set or w.lower() in scheduled_set)
-    sched_share = sched_count / max(1, total_words)
+    sched_share = sched_units / max(1, total_units)
     if not is_bootstrap and scheduled_set and sched_share > 0.2305:
         violations.append(f"Rule 3 Scheduled share {sched_share*100:.1f}% > 23.0% cap.")
         overcrowding = True
 
-    # Rule 5: Probes (empty eligible targets -> 0 allowed)
     eligible_count = len(due_items) + len(new_items)
     needed_probes = min(2, eligible_count)
     if len(passage.get("probes", [])) < needed_probes:
         violations.append(f"Rule 5 Needs at least {needed_probes} probe(s).")
 
     metrics = {
-        "total_words": float(total_words),
+        "total_words": float(total_surface_words),
         "closed_compliance": closed_compliance,
         "scheduled_share": sched_share,
     }
@@ -323,21 +409,21 @@ def simulate_state_plan(bank: SeedBank, hour: int, idx: int) -> Tuple[List[Dict]
     lexical = [it for it in bank.active_items if it["item_type"] in ("lemma", "chunk")]
     is_bootstrap = hour == 0
     if is_bootstrap:
-        boot = [it for it in lexical if it["is_bootstrap"] == 1]
-        core = [it for it in boot if it["is_transparent_cognate"] == 0]
-        cogs = [it for it in boot if it["is_transparent_cognate"] == 1]
-        verbs = [it for it in core if it["pos"] in ("VERB", "AUX")]
-        offset = idx * 5
+        by_es = {it["spanish"].lower(): it for it in lexical}
+        kit_idx = idx % len(SESSION1_KITS)
+        kit_lemmas, _ = SESSION1_KITS[kit_idx]
+        met_lemmas: Set[str] = set()
+        for prev_i in range(kit_idx):
+            met_lemmas.update(SESSION1_KITS[prev_i][0])
         chosen = []
-        if idx == 0 and verbs:
-            chosen.append(verbs[0])
-        for it in core[offset : offset + 5]:
-            if it not in chosen and len(chosen) < 5:
-                chosen.append(it)
-        for it in cogs[(idx * 3) : (idx * 3) + 3]:
-            if it not in chosen and len(chosen) < 8:
-                chosen.append(it)
-        allowed = {it["spanish"].lower() for it in chosen}
+        for w in kit_lemmas:
+            if w in by_es:
+                chosen.append(by_es[w])
+            elif w == "un" and "uno" in by_es:
+                copy_un = dict(by_es["uno"])
+                copy_un["spanish"] = "un"
+                chosen.append(copy_un)
+        allowed = met_lemmas | {it["spanish"].lower() for it in chosen}
         return [], chosen, allowed, True
 
     met_map = {10: 720, 20: 1650, 35: 2900, 50: 4150}

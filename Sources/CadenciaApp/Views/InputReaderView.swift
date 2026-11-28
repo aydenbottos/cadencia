@@ -413,16 +413,16 @@ public struct InputReaderView: View {
             ForEach(passage.probes) { probe in
                 let chosen = controller.probeAnswers[probe.id]
                 VStack(alignment: .leading, spacing: 12) {
-                    HStack(spacing: 8) {
-                        Text(probe.questionEn)
-                            .font(CadenciaFont.uiTitle(16))
-                            .foregroundStyle(CadenciaPalette.ivoryText)
-                        if probe.isPictureMatch {
-                            Spacer()
+                    if probe.isPictureMatch, let sentEs = probe.targetSentenceSpanish, !sentEs.isEmpty {
+                        HStack(alignment: .center, spacing: 10) {
+                            Text(sentEs)
+                                .font(CadenciaFont.proseSerif(20))
+                                .foregroundStyle(CadenciaPalette.ivoryText)
+                                .frame(maxWidth: .infinity, alignment: .leading)
                             Button {
                                 Task {
                                     await controller.speakSpanishLine(
-                                        probe.targetDueLemma,
+                                        sentEs,
                                         voice: passage.voice,
                                         accent: passage.accent
                                     )
@@ -431,10 +431,41 @@ public struct InputReaderView: View {
                                 Image(systemName: "speaker.wave.2.fill")
                                     .font(.caption.weight(.bold))
                                     .foregroundStyle(CadenciaPalette.saffronGold)
-                                    .frame(width: 32, height: 32)
+                                    .frame(width: 34, height: 34)
                                     .background(CadenciaPalette.saffronGold.opacity(0.16), in: Circle())
                             }
                             .buttonStyle(.plain)
+                        }
+                        .padding(12)
+                        .background(CadenciaPalette.saffronGold.opacity(0.10), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+
+                        Text(probe.questionEn)
+                            .font(CadenciaFont.uiCaption(13, weight: .semibold))
+                            .foregroundStyle(CadenciaPalette.mutedSilver)
+                    } else {
+                        HStack(spacing: 8) {
+                            Text(probe.questionEn)
+                                .font(CadenciaFont.uiTitle(16))
+                                .foregroundStyle(CadenciaPalette.ivoryText)
+                            if probe.isPictureMatch {
+                                Spacer()
+                                Button {
+                                    Task {
+                                        await controller.speakSpanishLine(
+                                            probe.targetDueLemma,
+                                            voice: passage.voice,
+                                            accent: passage.accent
+                                        )
+                                    }
+                                } label: {
+                                    Image(systemName: "speaker.wave.2.fill")
+                                        .font(.caption.weight(.bold))
+                                        .foregroundStyle(CadenciaPalette.saffronGold)
+                                        .frame(width: 32, height: 32)
+                                        .background(CadenciaPalette.saffronGold.opacity(0.16), in: Circle())
+                                }
+                                .buttonStyle(.plain)
+                            }
                         }
                     }
 

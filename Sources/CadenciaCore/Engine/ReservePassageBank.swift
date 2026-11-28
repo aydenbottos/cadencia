@@ -184,6 +184,96 @@ public enum ReservePassageBank {
         lemmatizer: SpanishLemmatizer,
         generatorCallsUsed: Int
     ) -> GeneratedPassage {
+        let verifier = ContractVerifier(lemmatizer: lemmatizer)
+
+        // For Session 1 fixed kits (1...8), serve the exact hand-written acceptance passage for THAT kit!
+        if plan.isBootstrap,
+           let kitNum = plan.bootstrapKitNumber,
+           kitNum >= 1,
+           kitNum <= BootstrapKitLibrary.session1AcceptancePassages.count {
+            let kitTemplate = BootstrapKitLibrary.session1AcceptancePassages[kitNum - 1]
+            let sentences: [PassageSentence] = kitTemplate.sentences.enumerated().map { idx, s in
+                PassageSentence(
+                    id: idx,
+                    spanish: s.es,
+                    englishLine: s.en,
+                    wordTokens: lemmatizer.extractWordTokens(s.es),
+                    visualSymbol: s.symbol
+                )
+            }
+            let fullText = sentences.map(\.spanish).joined(separator: " ")
+            let wordCount = lemmatizer.extractWordTokens(fullText).count
+            let glosses: [NewItemGloss] = plan.newItems.map { item in
+                NewItemGloss(
+                    itemId: item.id,
+                    spanish: item.spanish,
+                    englishGloss: item.englishGloss,
+                    contextClueNote: "Kit \(kitNum) vocabulary",
+                    visualCueSymbol: item.visualSymbol
+                )
+            }
+            let probes: [PassageProbe] = kitTemplate.probes.enumerated().map { idx, p in
+                let matchedIds = verifier.matchedItemIds(in: p.sentenceEs, from: plan.newItems)
+                let primaryId = matchedIds.first ?? plan.newItems.first?.id ?? "kit\(kitNum)_probe_\(idx)"
+                let primaryLemma = plan.newItems.first(where: { $0.id == primaryId })?.spanish ?? "kit"
+                return PassageProbe(
+                    id: "\(plan.passageId)_kit\(kitNum)_probe_\(idx)",
+                    targetDueItemId: primaryId,
+                    targetDueLemma: primaryLemma,
+                    questionEn: "Which picture matches this sentence?",
+                    options: p.options,
+                    correctOptionIndex: p.correct,
+                    hingeExplanation: p.hinge,
+                    isPictureMatch: true,
+                    optionSymbols: p.symbols,
+                    targetSentenceSpanish: p.sentenceEs,
+                    targetItemIds: matchedIds.isEmpty ? [primaryId] : matchedIds
+                )
+            }
+            let grammarNotes: [GrammarMicroNote] = plan.grammarPatterns.compactMap { g in
+                guard let note = g.microNoteEn else { return nil }
+                return GrammarMicroNote(
+                    grammarItemId: g.id,
+                    title: g.spanish,
+                    noteEn: note,
+                    contrastAEs: g.contrastAEs ?? "",
+                    contrastAEn: g.contrastAEn ?? "",
+                    contrastBEs: g.contrastBEs ?? "",
+                    contrastBEn: g.contrastBEn ?? ""
+                )
+            }
+            return GeneratedPassage(
+                id: plan.passageId,
+                sessionNumber: plan.sessionNumber,
+                blockType: plan.blockType,
+                format: plan.format,
+                titleEs: kitTemplate.titleEs,
+                titleEn: kitTemplate.titleEn,
+                episodeSummaryForNext: kitTemplate.titleEn,
+                sentences: sentences,
+                fullText: fullText,
+                wordCount: wordCount,
+                newItemGlosses: glosses,
+                probes: probes,
+                grammarNotes: grammarNotes,
+                dueItemIds: plan.dueItems.map(\.id),
+                newItemIds: plan.newItems.map(\.id),
+                grammarItemIds: plan.grammarPatterns.map(\.id),
+                voice: plan.voice,
+                accent: plan.accent,
+                targetWPM: plan.targetWPM,
+                isAudioFirst: plan.isAudioFirst,
+                isBootstrap: true,
+                rewriteAttempts: max(0, generatorCallsUsed - 1),
+                generatorCallsUsed: generatorCallsUsed,
+                isReserveFallback: true,
+                dueListWasReduced: false,
+                scheduledWordShare: 0.90,
+                flaggedForNativeAudit: false,
+                createdAt: Date()
+            )
+        }
+
         let pool = plan.isBootstrap ? bootstrapReserves : fullReserves
         let template = pool[abs(plan.sessionNumber * 7 + plan.passageIndexInSession) % pool.count]
 

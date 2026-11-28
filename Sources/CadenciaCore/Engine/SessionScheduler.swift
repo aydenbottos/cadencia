@@ -79,7 +79,7 @@ public struct SessionScheduler: Sendable {
             .map(\.0)
     }
 
-    /// Plans the exact next passage (180–250 words, or bootstrap micro-story) before generation.
+    /// Plans the exact next passage (180–250 words, or Bootstrap fixed-kit / recombination micro-scene) before generation.
     public func planNextPassage(
         profile: LearnerProfile,
         blockType: SessionBlockType,
@@ -93,6 +93,7 @@ public struct SessionScheduler: Sendable {
         serialEpisodeNumber: Int,
         storySummarySoFar: String,
         dueReductionFactor: Double = 1.0,
+        sessionSentenceCountsByItemId: [String: Int] = [:],
         now: Date = Date()
     ) -> PassagePlan {
         let week = profile.currentWeek
@@ -104,7 +105,6 @@ public struct SessionScheduler: Sendable {
         if isBootstrap || blockType == .input1 {
             isAudioFirst = false
         } else {
-            // Match weekly audioFirstFraction (20% in Wk2 -> 80% in Wk7–8)
             let fraction = weekSpec.audioFirstFraction
             isAudioFirst = fraction > 0 && Double((passageIndexInSession * 37) % 100) / 100.0 < fraction
         }
@@ -115,97 +115,61 @@ public struct SessionScheduler: Sendable {
         let regionalPool = accent == .castilian ? TutorVoice.castilianVoices : TutorVoice.latinAmericanVoices
         let voice = regionalPool[(profile.currentSessionNumber * 7 + passageIndexInSession) % regionalPool.count]
 
-        // Continuity alternation (Rule 7: episodes of chosen serial alternating with learner-named non-fiction)
-        let format: PassageFormat
-        let topicTitle: String
-        if isBootstrap {
-            format = .bootstrapMicroStory
-            topicTitle = "Bootstrap Scene #\(passageIndexInSession + 1) · \(serialGenre.titleEs)"
-        } else if passageIndexInSession % 2 == 0 {
-            format = .serialEpisode
-            topicTitle = "\(serialGenre.titleEs) — Episode \(serialEpisodeNumber + 1)"
-        } else {
-            format = .nonfictionBrief
-            let topics = profile.nonfictionTopics.isEmpty
-                ? ["Architecture & Cities", "Science & Nature", "Food & History", "Technology & Music"]
-                : profile.nonfictionTopics
-            topicTitle = topics[(profile.currentSessionNumber + passageIndexInSession / 2) % topics.count]
-        }
-
         // Partition syllabus
         let activeLexical = allItems.filter { !$0.isHoldout && ($0.itemType == .lemma || $0.itemType == .chunk) }
         let activeGrammar = allItems.filter { !$0.isHoldout && $0.itemType == .grammar }
 
-        // 1. Select New Items (at most 8 per passage in Bootstrap Sessions 1–4, at most 6 from Session 5+)
-        let maxNewThisPassage = isBootstrap
-            ? modelEngine.parameters.maxNewItemsPerBootstrapPassage
-            : modelEngine.parameters.maxNewItemsPerPassage
-
-        let targetNewCount: Int
-        if newItemsRemainingInSession <= 0 {
-            targetNewCount = 0
-        } else if isBootstrap {
-            targetNewCount = min(maxNewThisPassage, newItemsRemainingInSession)
-        } else {
-            let estimatedPassagesLeft = max(1, estimatedPassagesForWeek(week) - passageIndexInSession)
-            let paced = Int(ceil(Double(newItemsRemainingInSession) / Double(estimatedPassagesLeft)))
-            targetNewCount = min(maxNewThisPassage, max(1, min(paced, newItemsRemainingInSession)))
-        }
+        // 1. Select New Items & Grammar Pattern
+        // Revised 17-page Bootstrap Contract (pp. 8–9):
+        //   - Sessions 1–4 introduce 60 items in 8 fixed kits of 6–8, one kit per passage.
+        //   - Session 1 uses the exact 8 protocol kits (with cast Ana, Luis, Carla; Perú, México).
+        //   - After the 8 kit passages, the rest of the session recombines items met so far and adds NONE.
+        //   - One present-tense pattern per kit.
+        var bootstrapKitNumber: Int? = nil
+        var bootstrapPatternDesc: String? = nil
+        var isBootstrapRecombination = false
+        var kitGrammarItem: SyllabusItem? = nil
 
         let selectedNewItemsRaw: [SyllabusItem]
         if isBootstrap {
-            // Revised Bootstrap contract (p. 8): nothing is pre-loaded as Known; function words and
-            // transparent cognates enter via the new list (up to 8 per passage).
-            // Interleave unmet bootstrap function/core verbs (~5, ensuring a core verb like ser/estar
-            // joins early) with unmet bootstrap transparent cognates (~3) so even Passage 1 has
-            // nouns + verbs + function words on its new list and easily satisfies >=80% Rule 1!
-            let bootstrapUnmet = activeLexical.filter { item in
-                let rec = records[item.id]
-                return item.isBootstrap && (rec?.meetingsCount ?? 0) == 0 && !(rec?.isHeldBackControl ?? false)
-            }.sorted { $0.rankIndex < $1.rankIndex }
-
-            let fallbackUnmet = activeLexical.filter {
-                (records[$0.id]?.meetingsCount ?? 0) == 0 && !(records[$0.id]?.isHeldBackControl ?? false)
-            }.sorted { $0.rankIndex < $1.rankIndex }
-
-            let pool = bootstrapUnmet.isEmpty ? fallbackUnmet : bootstrapUnmet
-            let corePool = pool.filter { !$0.isTransparentCognate }
-            let cogPool = pool.filter { $0.isTransparentCognate }.sorted { lhs, rhs in
-                let lhsContent = (lhs.pos == "NOUN" || lhs.pos == "ADJ")
-                let rhsContent = (rhs.pos == "NOUN" || rhs.pos == "ADJ")
-                if lhsContent != rhsContent { return lhsContent }
-                return lhs.rankIndex < rhs.rankIndex
+            let candidateKitNum = passageIndexInSession + 1
+            if candidateKitNum <= 8 && newItemsRemainingInSession > 0 {
+                if profile.currentSessionNumber == 1,
+                   let resolved = BootstrapKitLibrary.resolveSession1Kit(kitNumber: candidateKitNum, allItems: allItems) {
+                    bootstrapKitNumber = resolved.spec.kitNumber
+                    bootstrapPatternDesc = resolved.spec.pattern
+                    kitGrammarItem = BootstrapKitLibrary.makeGrammarItem(for: resolved.spec)
+                    selectedNewItemsRaw = resolved.items
+                } else if let dynamicKit = BootstrapKitLibrary.buildDynamicBootstrapKit(
+                    sessionNumber: profile.currentSessionNumber,
+                    kitNumber: candidateKitNum,
+                    allItems: allItems,
+                    records: records,
+                    remainingBudget: newItemsRemainingInSession
+                ) {
+                    bootstrapKitNumber = dynamicKit.spec.kitNumber
+                    bootstrapPatternDesc = dynamicKit.spec.pattern
+                    kitGrammarItem = BootstrapKitLibrary.makeGrammarItem(for: dynamicKit.spec)
+                    selectedNewItemsRaw = dynamicKit.items
+                } else {
+                    isBootstrapRecombination = true
+                    selectedNewItemsRaw = []
+                }
+            } else {
+                // Post-kit recombination passage: recombines items met so far and adds NO new items!
+                isBootstrapRecombination = true
+                selectedNewItemsRaw = []
             }
-            let verbPool = corePool.filter { $0.pos == "VERB" || $0.pos == "AUX" }
-
-            var chosen: [SyllabusItem] = []
-            var seenIds: Set<String> = []
-            let wantCogs = min(cogPool.count, max(1, targetNewCount / 3))
-            let wantCore = max(0, targetNewCount - wantCogs)
-
-            // Guarantee at least 1 core verb (e.g. ser / estar) in the very first passage so natural sentences flow
-            let hasAnyMetVerb = activeLexical.contains {
-                ($0.pos == "VERB" || $0.pos == "AUX") && (records[$0.id]?.meetingsCount ?? 0) > 0
-            }
-            if !hasAnyMetVerb, let firstVerb = verbPool.first, chosen.count < targetNewCount {
-                chosen.append(firstVerb)
-                seenIds.insert(firstVerb.id)
-            }
-            for item in corePool where chosen.count < wantCore && !seenIds.contains(item.id) {
-                chosen.append(item)
-                seenIds.insert(item.id)
-            }
-            for item in cogPool where chosen.count < targetNewCount && !seenIds.contains(item.id) {
-                chosen.append(item)
-                seenIds.insert(item.id)
-            }
-            for item in pool where chosen.count < targetNewCount && !seenIds.contains(item.id) {
-                chosen.append(item)
-                seenIds.insert(item.id)
-            }
-            selectedNewItemsRaw = chosen.sorted { $0.rankIndex < $1.rankIndex }
         } else {
-            // Mix lemmas (~94%) and chunks (~6%) in frequency order
+            let maxNewThisPassage = modelEngine.parameters.maxNewItemsPerPassage
+            let targetNewCount: Int
+            if newItemsRemainingInSession <= 0 {
+                targetNewCount = 0
+            } else {
+                let estimatedPassagesLeft = max(1, estimatedPassagesForWeek(week) - passageIndexInSession)
+                let paced = Int(ceil(Double(newItemsRemainingInSession) / Double(estimatedPassagesLeft)))
+                targetNewCount = min(maxNewThisPassage, max(1, min(paced, newItemsRemainingInSession)))
+            }
             let newPool = activeLexical.filter { item in
                 let rec = records[item.id]
                 return (rec?.meetingsCount ?? 0) == 0 && !(rec?.isHeldBackControl ?? false)
@@ -217,14 +181,35 @@ public struct SessionScheduler: Sendable {
             selectedNewItemsRaw = Array(newPool.prefix(targetNewCount))
         }
 
+        // Continuity & Title (Bootstrap Rule 7: scenes with the fixed cast, no plot required)
+        let format: PassageFormat
+        let topicTitle: String
+        if isBootstrap {
+            format = .bootstrapMicroStory
+            if let kitNum = bootstrapKitNumber {
+                topicTitle = "Session \(profile.currentSessionNumber) · Kit \(kitNum) of 8"
+            } else {
+                topicTitle = "Session \(profile.currentSessionNumber) · Recombination Scene #\(max(1, passageIndexInSession - 7))"
+            }
+        } else if passageIndexInSession % 2 == 0 {
+            format = .serialEpisode
+            topicTitle = "\(serialGenre.titleEs) — Episode \(serialEpisodeNumber + 1)"
+        } else {
+            format = .nonfictionBrief
+            let topics = profile.nonfictionTopics.isEmpty
+                ? ["Architecture & Cities", "Science & Nature", "Food & History", "Technology & Music"]
+                : profile.nonfictionTopics
+            topicTitle = topics[(profile.currentSessionNumber + passageIndexInSession / 2) % topics.count]
+        }
+
         // 2. Select Due Items (Rule 3: from Session 5+, new + due <= 23% of target length, no per-passage floor)
-        let targetPassageWords = isBootstrap ? 60 : 215
+        let targetPassageWords = isBootstrap ? 56 : 215
         let maxScheduledWordSlots = isBootstrap
             ? 24 // Bootstrap has no scheduled share limit (p. 8)
             : Int((Double(targetPassageWords) * modelEngine.parameters.scheduledShareCap).rounded(.down))
         let newWordSlots = selectedNewItemsRaw.count * modelEngine.parameters.newItemMinOccurrences
         let rawDueBudget = isBootstrap
-            ? 12
+            ? (profile.currentSessionNumber == 1 && !isBootstrapRecombination ? 0 : 10)
             : max(0, min(32, maxScheduledWordSlots - newWordSlots))
         let adjustedDueBudget = max(0, Int((Double(rawDueBudget) * dueReductionFactor).rounded()))
 
@@ -232,7 +217,6 @@ public struct SessionScheduler: Sendable {
         if adjustedDueBudget == 0 {
             selectedDueItemsRaw = []
         } else if profile.studyMode == .groupBSchedulerOff {
-            // Group B (Control): NO forgetting timing — sample met items in natural frequency order
             let metLexical = activeLexical.filter { item in
                 guard let rec = records[item.id] else { return false }
                 return rec.meetingsCount > 0 && !rec.isHeldBackControl
@@ -241,7 +225,6 @@ public struct SessionScheduler: Sendable {
             let rotated = Array(metLexical.dropFirst(strideStart)) + Array(metLexical.prefix(strideStart))
             selectedDueItemsRaw = Array(rotated.prefix(min(adjustedDueBudget, metLexical.count)))
         } else {
-            // Group A / Solo Pilot / Stage 1: Forgetting-timed due priority!
             let spacingIntervals: Set<Int> = [1, 2, 4, 8, 16]
             let scoredDue: [(SyllabusItem, Double)] = activeLexical.compactMap { item in
                 guard let rec = records[item.id], rec.meetingsCount > 0, !rec.isHeldBackControl else { return nil }
@@ -252,11 +235,9 @@ public struct SessionScheduler: Sendable {
                     return nil
                 }
                 var priority = 0.0
-                if rec.needsExtraMeetingThisSession {
-                    priority += 100.0
-                }
+                if rec.needsExtraMeetingThisSession { priority += 100.0 }
                 if p >= 0.70 && p <= 0.85 {
-                    priority += 50.0 + (0.85 - p) * 100.0 // Sweet spot!
+                    priority += 50.0 + (0.85 - p) * 100.0
                 } else if p < 0.70 {
                     priority += 35.0 + p * 20.0
                 } else if hitsSpacingMilestone {
@@ -270,9 +251,9 @@ public struct SessionScheduler: Sendable {
                 .map(\.0)
         }
 
-        // Step 1 Zero-Cost Feasibility Check (Protocol p. 7):
-        // From Session 5+, 3 uses of each new item + 1 use of each due item must fit inside 23% of target length.
-        // If they do not, split the lists across two passages (excess remains in queue for the next passage).
+        // Step 1 Zero-Cost Feasibility Check (Protocol pp. 7–8):
+        //   - Bootstrap sessions SKIP the 23% arithmetic; only pre-check is that a kit holds a verb and a noun.
+        //   - Full sessions (5+): 3*new + due <= floor(0.23 * 215); excess splits to next passage.
         let selectedNewItems: [SyllabusItem]
         let selectedDueItems: [SyllabusItem]
         if isBootstrap {
@@ -290,27 +271,35 @@ public struct SessionScheduler: Sendable {
             selectedDueItems = feasible.dueItems
         }
 
-        // 3. Select Assigned Grammar Patterns (1-2 per passage matching current week, Rule 6)
-        let weekGrammarCandidates = activeGrammar.filter { g in
-            let gw = g.grammarWeek ?? 1
-            let rec = records[g.id]
-            return gw <= week && (rec?.state != .productive)
-        }.sorted { lhs, rhs in
-            let rl = records[lhs.id]?.predictedRecall(at: now) ?? 0.0
-            let rr = records[rhs.id]?.predictedRecall(at: now) ?? 0.0
-            if (records[lhs.id]?.meetingsCount ?? 0) == 0 && (records[rhs.id]?.meetingsCount ?? 0) > 0 { return true }
-            return rl < rr
+        // 3. Select Assigned Grammar Patterns (Bootstrap Rule 6: 1 present-tense pattern per kit; Full: 1–2 per passage)
+        let selectedGrammar: [SyllabusItem]
+        if isBootstrap {
+            if let kitGram = kitGrammarItem {
+                selectedGrammar = [kitGram]
+            } else {
+                selectedGrammar = []
+            }
+        } else {
+            let weekGrammarCandidates = activeGrammar.filter { g in
+                let gw = g.grammarWeek ?? 1
+                let rec = records[g.id]
+                return gw <= week && (rec?.state != .productive)
+            }.sorted { lhs, rhs in
+                let rl = records[lhs.id]?.predictedRecall(at: now) ?? 0.0
+                let rr = records[rhs.id]?.predictedRecall(at: now) ?? 0.0
+                if (records[lhs.id]?.meetingsCount ?? 0) == 0 && (records[rhs.id]?.meetingsCount ?? 0) > 0 { return true }
+                return rl < rr
+            }
+            selectedGrammar = Array(weekGrammarCandidates.prefix(2))
         }
-        let selectedGrammar = Array(weekGrammarCandidates.prefix(isBootstrap ? 1 : 2))
 
         // 4. Compute Allowed Closed Vocabulary Set (Rule 1)
-        // Revised protocol (pp. 6–8):
-        //  - Bootstrap (Sessions 1–4): NOTHING is pre-loaded as Known! Allowed core (>=80%) is strictly
-        //    items met so far + passage due/new lists (+ names/numbers). Remaining <=20% must be glossed
-        //    transparent cognates (`transparentCognateLemmas`).
-        //  - Full Contract (Sessions 5+): Known + Learning(p > 85%) + due list + new list (+ names/numbers) = 100%.
+        //   - Bootstrap (Sessions 1–4): NOTHING pre-loaded as Known! Core (>=80%) is strictly items met so far +
+        //     passage kit/due items + fixed cast names + numbers. Remainder (<=20%) must be glossed transparent cognates.
+        //   - Full Contract (Sessions 5+): Known + Learning(p > 85%) + due list + new list (+ names/numbers) = 100%.
         var allowedSet: Set<String> = []
         var learningCandidates: [SyllabusItem] = []
+        var underExposedSessionItems: [SyllabusItem] = []
         let scheduledIds = Set((selectedDueItems + selectedNewItems).map(\.id))
 
         for item in activeLexical {
@@ -318,6 +307,12 @@ public struct SessionScheduler: Sendable {
             if isBootstrap {
                 if rec.meetingsCount > 0 {
                     allowedSet.insert(item.spanish.lowercased())
+                    if item.spanish.lowercased() == "uno" { allowedSet.insert("un") }
+                    if isBootstrapRecombination,
+                       rec.firstMeetingSession == profile.currentSessionNumber,
+                       (sessionSentenceCountsByItemId[item.id] ?? 0) < 3 {
+                        underExposedSessionItems.append(item)
+                    }
                 }
             } else if modelEngine.isSafeUnscheduledVocabulary(record: rec, at: now) {
                 allowedSet.insert(item.spanish.lowercased())
@@ -362,7 +357,12 @@ public struct SessionScheduler: Sendable {
             accent: accent,
             priorContextWordsByItem: priorMap,
             learningProbeCandidates: learningCandidates,
-            transparentCognateLemmas: transparentCognates
+            transparentCognateLemmas: transparentCognates,
+            bootstrapKitNumber: bootstrapKitNumber,
+            bootstrapPatternDescription: bootstrapPatternDesc,
+            bootstrapCastNames: isBootstrap ? BootstrapKitLibrary.fixedCastDisplayNames : [],
+            isBootstrapRecombination: isBootstrapRecombination,
+            sessionUnderExposedItems: Array(underExposedSessionItems.prefix(12))
         )
     }
 

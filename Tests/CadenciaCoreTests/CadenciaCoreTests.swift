@@ -431,7 +431,10 @@ final class CadenciaCoreTests: XCTestCase {
         XCTAssertEqual(ContractVerifier.maxSpacedOccurrences(positions: [3, 35, 68, 72, 110], minSpacing: 30), 4)
         XCTAssertEqual(ContractVerifier.maxSpacedOccurrences(positions: [3, 15, 28], minSpacing: 30), 1)
 
-        // 4. Hour 0 Session 1 Bootstrap Plan + Stage A against real cadencia_seed.sqlite
+        // 4. Official 8-Kit Verifier Acceptance Test (17-Page Protocol pp. 8–9):
+        //    "A hand-written passage for each kit passes a script check of this contract.
+        //     Those eight passages are the verifier's acceptance test. A verifier that rejects
+        //     any of them has the fault, not the generator."
         let tmpURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("cadencia_boot_test_\(UUID().uuidString).sqlite")
         defer { try? FileManager.default.removeItem(at: tmpURL) }
@@ -442,18 +445,81 @@ final class CadenciaCoreTests: XCTestCase {
         let inflections = try await db.loadInflectionDictionary()
         let genres = try await db.loadSerialGenres()
         let lemmatizer = SpanishLemmatizer(inflections: inflections, chunkItems: activeItems.filter { $0.itemType == .chunk })
+        let verifier = ContractVerifier(lemmatizer: lemmatizer, parameters: .protocolDefaults)
 
         let analytics = ResearchAnalyticsEngine()
-        let (h0Profile, h0Records) = analytics.buildSimulatedLearnerState(atHour: 0, allItems: activeItems)
+        var (h0Profile, h0Records) = analytics.buildSimulatedLearnerState(atHour: 0, allItems: activeItems)
         XCTAssertEqual(h0Profile.currentSessionNumber, 1)
         XCTAssertEqual(h0Records.values.filter { $0.meetingsCount > 0 }.count, 0, "Hour 0 must have 0 pre-loaded Known/met items")
 
         let scheduler = SessionScheduler(parameters: .protocolDefaults)
-        let plan = scheduler.planNextPassage(
+        var newRemaining = 60
+
+        for kitIdx in 0..<8 {
+            let plan = scheduler.planNextPassage(
+                profile: h0Profile,
+                blockType: .input1,
+                passageIndexInSession: kitIdx,
+                newItemsRemainingInSession: newRemaining,
+                allItems: activeItems,
+                holdoutItems: holdoutItems,
+                records: h0Records,
+                priorContextByItem: [:],
+                serialGenre: genres.first!,
+                serialEpisodeNumber: 0,
+                storySummarySoFar: ""
+            )
+
+            XCTAssertTrue(plan.isBootstrap)
+            XCTAssertEqual(plan.bootstrapKitNumber, kitIdx + 1)
+            XCTAssertTrue(BootstrapKitLibrary.checkKitFeasibility(items: plan.newItems), "Kit \(kitIdx + 1) must hold a verb and a noun")
+            XCTAssertEqual(plan.bootstrapCastNames, ["Ana", "Luis", "Carla", "Perú", "México"])
+            if kitIdx == 0 {
+                XCTAssertEqual(plan.newItems.map(\.spanish), ["ser", "el", "un", "de", "y", "doctor", "hotel", "famoso"])
+                XCTAssertEqual(plan.allowedKnownLemmas.count, 8, "Nothing pre-loaded as Known on Kit 1")
+            }
+
+            let handWritten = BootstrapKitLibrary.session1AcceptancePassages[kitIdx]
+            let bootSentences = handWritten.sentences.enumerated().map { idx, s in
+                PassageSentence(id: idx, spanish: s.es, englishLine: s.en, wordTokens: lemmatizer.extractWordTokens(s.es), visualSymbol: s.symbol)
+            }
+            let report = verifier.verifyStageA(
+                passageText: handWritten.sentences.map(\.es).joined(separator: " "),
+                sentences: bootSentences,
+                plan: plan,
+                priorContextByItem: [:]
+            )
+            XCTAssertTrue(
+                report.passed,
+                "ACCEPTANCE TEST FAILED on Kit \(kitIdx + 1)! Violations: \(report.violations.map { "\($0.ruleName): \($0.detail) [\($0.offendingTokens.joined(separator: ", "))]" }.joined(separator: " | "))"
+            )
+            XCTAssertGreaterThanOrEqual(report.closedVocabCompliance, 0.99, "Hand-written Kit \(kitIdx + 1) should achieve 100% core compliance via inflected-forms table + al/del split")
+
+            // Verify whole-sentence picture-matching probe maps to multiple new items in the sentence
+            if let firstProbe = handWritten.probes.first {
+                let matched = verifier.matchedItemIds(in: firstProbe.sentenceEs, from: plan.newItems)
+                XCTAssertGreaterThanOrEqual(matched.count, 2, "Kit \(kitIdx + 1) whole-sentence probe should match >=2 kit items")
+            }
+
+            // Mark this kit's items as met so subsequent kits accumulate metSoFar cleanly!
+            for item in plan.newItems {
+                var existing = h0Records[item.id] ?? LearnerItemRecord(learnerId: h0Profile.learnerId, itemId: item.id, halfLifeDays: 1.0)
+                existing.meetingsCount += 1
+                existing.firstMeetingSession = 1
+                existing.lastMeetingSession = 1
+                existing.lastMeetingAt = Date()
+                existing.state = .learning
+                h0Records[item.id] = existing
+            }
+            newRemaining = max(0, newRemaining - plan.newItems.count)
+        }
+
+        // Passage #9 (after all 8 kits = 60 items) MUST be a recombination passage adding 0 new items!
+        let recombPlan = scheduler.planNextPassage(
             profile: h0Profile,
             blockType: .input1,
-            passageIndexInSession: 0,
-            newItemsRemainingInSession: 60,
+            passageIndexInSession: 8,
+            newItemsRemainingInSession: newRemaining,
             allItems: activeItems,
             holdoutItems: holdoutItems,
             records: h0Records,
@@ -462,62 +528,36 @@ final class CadenciaCoreTests: XCTestCase {
             serialEpisodeNumber: 0,
             storySummarySoFar: ""
         )
+        XCTAssertTrue(recombPlan.isBootstrapRecombination)
+        XCTAssertTrue(recombPlan.newItems.isEmpty, "Post-kit recombination adds zero new items")
+        XCTAssertGreaterThanOrEqual(recombPlan.allowedKnownLemmas.count, 60, "All 60 Session 1 kit items are now met and available")
 
-        XCTAssertTrue(plan.isBootstrap)
-        XCTAssertTrue(plan.dueItems.isEmpty)
-        XCTAssertEqual(plan.newItems.count, 8, "Bootstrap allows up to 8 new items per passage")
-        XCTAssertEqual(plan.allowedKnownLemmas.count, 8, "Nothing pre-loaded as Known: only the 8 new items are in allowedKnownLemmas")
-        XCTAssertGreaterThan(plan.transparentCognateLemmas.count, 1000, "Bootstrap provides transparent cognates for <=20% glossed remainder")
+        // Verify `al` and `del` expand as TWO items (a+el, de+el)
+        XCTAssertEqual(BootstrapKitLibrary.expandTokenToCandidateItemSets(normalizedSurface: "al", lemmatizerLemma: "al").count, 2)
+        XCTAssertEqual(BootstrapKitLibrary.expandTokenToCandidateItemSets(normalizedSurface: "del", lemmatizerLemma: "del").count, 2)
 
-        // Build a 7-sentence Bootstrap micro-story (each <=8 words) using the 8 interleaved new items >=3 sentences each
-        // + proper names + 1 glossed transparent cognate ("hotel"), verifying >=80% core & 0 non-cognate off-list words!
-        let newWords = plan.newItems.map(\.spanish)
-        let w = { (idx: Int) -> String in newWords[min(idx, newWords.count - 1)] }
-        let rawBootstrapSentences = [
-            "Clara \(w(0)) \(w(1)) \(w(2)) \(w(3)) \(w(4)) \(w(5)) Madrid.",
-            "Mateo \(w(6)) \(w(7)) \(w(0)) \(w(1)) \(w(2)) hotel.",
-            "Ana \(w(3)) \(w(4)) \(w(5)) \(w(6)) \(w(7)) Madrid.",
-            "Pedro \(w(0)) \(w(1)) \(w(2)) \(w(3)) \(w(4)) hotel.",
-            "Laura \(w(5)) \(w(6)) \(w(7)) \(w(0)) \(w(1)) Madrid.",
-            "Pablo \(w(2)) \(w(3)) \(w(4)) \(w(5)) \(w(6)) \(w(7)).",
-            "Elena \(w(0)) \(w(2)) \(w(4)) \(w(6)) Madrid.",
-        ]
-        let bootSentences = rawBootstrapSentences.enumerated().map { idx, es in
-            PassageSentence(id: idx, spanish: es, englishLine: "Line \(idx)", wordTokens: lemmatizer.extractWordTokens(es), visualSymbol: "sparkles")
-        }
-        let verifier = ContractVerifier(lemmatizer: lemmatizer, parameters: .protocolDefaults)
-        let bootReport = verifier.verifyStageA(
-            passageText: rawBootstrapSentences.joined(separator: " "),
-            sentences: bootSentences,
-            plan: plan,
-            priorContextByItem: [:],
-            glossedTransparentCognates: ["hotel"]
-        )
-        XCTAssertTrue(
-            bootReport.passed,
-            "Bootstrap Contract MUST pass Stage A with >=80% met/new/names, <=20% glossed cognates, 6-10 sentences <=8 words, no share cap! Violations: \(bootReport.violations.map { "\($0.ruleName): \($0.detail) [\($0.offendingTokens.joined(separator: ", "))]" }.joined(separator: " | "))"
-        )
-        XCTAssertGreaterThan(bootReport.scheduledWordShare, 0.50, "Session 1 scheduled share starts high with NO cap")
-
-        // Verify Step 6 Reserve Passages contain ZERO hold-out leaks
+        // Verify Step 6 Reserve Passages (including all 8 Session 1 Kit reserves) contain ZERO hold-out leaks
         let holdoutSet = Set(holdoutItems.map { $0.spanish.lowercased() })
-        for isBoot in [true, false] {
-            for pIdx in 0..<2 {
-                let resPlan = PassagePlan(
-                    passageId: "res_\(isBoot)_\(pIdx)", sessionNumber: isBoot ? 1 : 10, passageIndexInSession: pIdx,
-                    blockType: .input1, isBootstrap: isBoot, isAudioFirst: false, targetWPM: 100,
-                    format: isBoot ? .bootstrapMicroStory : .serialEpisode, topicOrEpisodeTitle: "Reserve",
-                    storySummarySoFar: "", dueItems: [], newItems: [], grammarPatterns: [],
-                    allowedKnownLemmas: [], holdoutBannedLemmas: Array(holdoutSet),
-                    voice: .celia, accent: .castilian, priorContextWordsByItem: [:]
-                )
-                let reserve = ReservePassageBank.selectReserve(for: resPlan, lemmatizer: lemmatizer, generatorCallsUsed: 3)
-                XCTAssertTrue(reserve.isReserveFallback)
-                XCTAssertEqual(reserve.generatorCallsUsed, 3)
-                let toks = lemmatizer.analyze(reserve.fullText)
-                let leaks = toks.filter { holdoutSet.contains($0.lemma.lowercased()) }.map(\.surface)
-                XCTAssertTrue(leaks.isEmpty, "Reserve passage \(reserve.titleEs) leaked hold-out words: \(leaks)")
-            }
+        for kitNum in 1...8 {
+            let kit = BootstrapKitLibrary.resolveSession1Kit(kitNumber: kitNum, allItems: activeItems)!
+            let resPlan = PassagePlan(
+                passageId: "res_kit_\(kitNum)", sessionNumber: 1, passageIndexInSession: kitNum - 1,
+                blockType: .input1, isBootstrap: true, isAudioFirst: false, targetWPM: 75,
+                format: .bootstrapMicroStory, topicOrEpisodeTitle: "Kit \(kitNum)",
+                storySummarySoFar: "", dueItems: [], newItems: kit.items, grammarPatterns: [],
+                allowedKnownLemmas: kit.items.map(\.spanish), holdoutBannedLemmas: Array(holdoutSet),
+                voice: .celia, accent: .castilian, priorContextWordsByItem: [:],
+                bootstrapKitNumber: kitNum, bootstrapPatternDescription: kit.spec.pattern,
+                bootstrapCastNames: BootstrapKitLibrary.fixedCastDisplayNames
+            )
+            let reserve = ReservePassageBank.selectReserve(for: resPlan, lemmatizer: lemmatizer, generatorCallsUsed: 3)
+            XCTAssertTrue(reserve.isReserveFallback)
+            XCTAssertEqual(reserve.generatorCallsUsed, 3)
+            XCTAssertFalse(reserve.probes.isEmpty)
+            XCTAssertTrue(reserve.probes.allSatisfy { $0.isPictureMatch && ($0.targetSentenceSpanish?.isEmpty == false) })
+            let toks = lemmatizer.analyze(reserve.fullText)
+            let leaks = toks.filter { holdoutSet.contains($0.lemma.lowercased()) }.map(\.surface)
+            XCTAssertTrue(leaks.isEmpty, "Reserve Kit \(kitNum) leaked hold-out words: \(leaks)")
         }
 
         XCTAssertEqual(PhononComputeMode.fastCPU.rawValue, "cpu")

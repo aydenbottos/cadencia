@@ -369,7 +369,8 @@ public final class SessionController {
             priorContextByItem: priorContext,
             serialGenre: serial,
             serialEpisodeNumber: serialProg.episode,
-            storySummarySoFar: serialProg.summary
+            storySummarySoFar: serialProg.summary,
+            sessionSentenceCountsByItemId: sessionSentenceCountsByItemId
         )
 
         let (passage, report) = try await appState.terraClient.generateVerifiedPassage(
@@ -526,8 +527,15 @@ public final class SessionController {
         HapticDirector.shared.playGlossTap()
         let lower = surface.lowercased().trimmingCharacters(in: CharacterSet.letters.inverted)
         let (lemma, _, _) = appState.lemmatizer.lookupLemma(lower: lower)
+        let expandedCandidates = BootstrapKitLibrary.expandTokenToCandidateItemSets(
+            normalizedSurface: lower,
+            lemmatizerLemma: lemma
+        ).reduce(into: Set<String>()) { $0.formUnion($1) }
 
-        if let item = appState.allSyllabusItems.first(where: { $0.spanish.lowercased() == lemma || $0.spanish.lowercased() == lower }) {
+        if let item = appState.allSyllabusItems.first(where: {
+            let s = $0.spanish.lowercased()
+            return s == lemma || s == lower || expandedCandidates.contains(s)
+        }) {
             let clue = currentPassage?.newItemGlosses.first(where: { $0.itemId == item.id })?.contextClueNote
             selectedGlossItem = (item, clue, surface)
 
@@ -650,10 +658,16 @@ public final class SessionController {
             }
         }
 
-        let probeTargetMap = Dictionary(
-            passage.probes.map { ($0.targetDueItemId, probeAnswers[$0.id] == $0.correctOptionIndex) },
-            uniquingKeysWith: { a, b in a && b }
-        )
+        // Build probe target outcomes: in Bootstrap whole-sentence picture-matching probes,
+        // log the probe result against EVERY new item appearing in that sentence (Protocol p. 8)!
+        var probeTargetMap: [String: Bool] = [:]
+        for probe in passage.probes {
+            let hit = (probeAnswers[probe.id] == probe.correctOptionIndex)
+            let ids = probe.targetItemIds.isEmpty ? [probe.targetDueItemId] : probe.targetItemIds
+            for tid in ids where !tid.isEmpty {
+                probeTargetMap[tid] = (probeTargetMap[tid] ?? true) && hit
+            }
+        }
 
         // Apply half-life updates to every scheduled item (new + due + grammar)
         let scheduledIds = Array(Set(passage.newItemIds + passage.dueItemIds + passage.grammarItemIds))
@@ -688,20 +702,19 @@ public final class SessionController {
             )
         }
 
-        // Track distinct bootstrap sentence exposures for new items during this session (Bootstrap Rule 2)
+        // Track distinct bootstrap sentence exposures for items during this session using the inflected-forms table!
+        let verifier = ContractVerifier(lemmatizer: appState.lemmatizer, parameters: profile.parameters)
         if passage.isBootstrap {
-            for itemId in passage.newItemIds {
-                guard let item = itemMap[itemId] else { continue }
-                let target = item.spanish.lowercased()
-                let sentHits = passage.sentences.filter { s in
-                    appState.lemmatizer.analyze(s.spanish).contains { $0.lemma.lowercased() == target || $0.normalized == target }
-                }.count
-                sessionSentenceCountsByItemId[itemId, default: 0] += sentHits
+            let itemsToCount = Array(Set(passage.newItemIds + passage.dueItemIds)).compactMap { itemMap[$0] }
+            for sentence in passage.sentences {
+                let matchedIds = verifier.matchedItemIds(in: sentence.spanish, from: itemsToCount)
+                for mid in Set(matchedIds) {
+                    sessionSentenceCountsByItemId[mid, default: 0] += 1
+                }
             }
         }
 
         // Persist Rule 4 Fresh Context neighbor words for all tracked items in this passage
-        let verifier = ContractVerifier(lemmatizer: appState.lemmatizer, parameters: profile.parameters)
         let tracked = scheduledIds.compactMap { itemMap[$0] }
         for ctx in verifier.extractSentenceContexts(passage: passage, trackedItems: tracked) {
             try? await appState.database.recordItemSentenceContext(

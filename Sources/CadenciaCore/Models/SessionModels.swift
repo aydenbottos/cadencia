@@ -282,6 +282,16 @@ public struct PassagePlan: Codable, Sendable {
     public let learningProbeCandidates: [SyllabusItem]
     /// Transparent cognates allowed as the glossed <=20% remainder in Bootstrap Sessions 1–4.
     public let transparentCognateLemmas: [String]
+    /// Fixed Bootstrap kit number (1...8) when introducing a kit in Sessions 1–4, or nil for recombination / Sessions 5+.
+    public let bootstrapKitNumber: Int?
+    /// Single present-tense pattern assigned to this Bootstrap kit (Protocol p. 8: Rule 6).
+    public let bootstrapPatternDescription: String?
+    /// Fixed cast & place names allowed in Bootstrap Sessions 1–4 (names come from fixed cast list, NOT a tagger!).
+    public let bootstrapCastNames: [String]
+    /// True during post-kit recombination passages in Sessions 1–4 (adds 0 new items, recombines items met so far).
+    public let isBootstrapRecombination: Bool
+    /// Items introduced earlier in this Bootstrap session still under 3 distinct sentences (prioritized in recombination).
+    public let sessionUnderExposedItems: [SyllabusItem]
 
     public init(
         passageId: String,
@@ -303,7 +313,12 @@ public struct PassagePlan: Codable, Sendable {
         accent: SpanishRegionalAccent,
         priorContextWordsByItem: [String: [String]],
         learningProbeCandidates: [SyllabusItem] = [],
-        transparentCognateLemmas: [String] = []
+        transparentCognateLemmas: [String] = [],
+        bootstrapKitNumber: Int? = nil,
+        bootstrapPatternDescription: String? = nil,
+        bootstrapCastNames: [String] = [],
+        isBootstrapRecombination: Bool = false,
+        sessionUnderExposedItems: [SyllabusItem] = []
     ) {
         self.passageId = passageId
         self.sessionNumber = sessionNumber
@@ -325,6 +340,11 @@ public struct PassagePlan: Codable, Sendable {
         self.priorContextWordsByItem = priorContextWordsByItem
         self.learningProbeCandidates = learningProbeCandidates
         self.transparentCognateLemmas = transparentCognateLemmas
+        self.bootstrapKitNumber = bootstrapKitNumber
+        self.bootstrapPatternDescription = bootstrapPatternDescription
+        self.bootstrapCastNames = bootstrapCastNames
+        self.isBootstrapRecombination = isBootstrapRecombination
+        self.sessionUnderExposedItems = sessionUnderExposedItems
     }
 
     /// Rule 5 target probe items in strict protocol priority order:
@@ -365,9 +385,11 @@ public struct PassageProbe: Identifiable, Codable, Sendable, Hashable {
     public let options: [String]
     public let correctOptionIndex: Int
     public let hingeExplanation: String
-    /// Bootstrap Rule 5: picture-matching probe on new items when the due list is empty.
+    /// Bootstrap Rule 5: whole-sentence picture-matching probe; result is logged against each new item in that sentence!
     public let isPictureMatch: Bool
     public let optionSymbols: [String]?
+    public let targetSentenceSpanish: String?
+    public let targetItemIds: [String]
 
     public init(
         id: String,
@@ -378,7 +400,9 @@ public struct PassageProbe: Identifiable, Codable, Sendable, Hashable {
         correctOptionIndex: Int,
         hingeExplanation: String,
         isPictureMatch: Bool = false,
-        optionSymbols: [String]? = nil
+        optionSymbols: [String]? = nil,
+        targetSentenceSpanish: String? = nil,
+        targetItemIds: [String]? = nil
     ) {
         self.id = id
         self.targetDueItemId = targetDueItemId
@@ -389,6 +413,12 @@ public struct PassageProbe: Identifiable, Codable, Sendable, Hashable {
         self.hingeExplanation = hingeExplanation
         self.isPictureMatch = isPictureMatch
         self.optionSymbols = optionSymbols
+        self.targetSentenceSpanish = targetSentenceSpanish
+        if let ids = targetItemIds, !ids.isEmpty {
+            self.targetItemIds = ids
+        } else {
+            self.targetItemIds = targetDueItemId.isEmpty ? [] : [targetDueItemId]
+        }
     }
 
     public init(from decoder: Decoder) throws {
@@ -402,6 +432,9 @@ public struct PassageProbe: Identifiable, Codable, Sendable, Hashable {
         self.hingeExplanation = try c.decode(String.self, forKey: .hingeExplanation)
         self.isPictureMatch = (try? c.decode(Bool.self, forKey: .isPictureMatch)) ?? false
         self.optionSymbols = try? c.decode([String].self, forKey: .optionSymbols)
+        self.targetSentenceSpanish = try? c.decode(String.self, forKey: .targetSentenceSpanish)
+        let decodedIds = (try? c.decode([String].self, forKey: .targetItemIds)) ?? []
+        self.targetItemIds = decodedIds.isEmpty ? (self.targetDueItemId.isEmpty ? [] : [self.targetDueItemId]) : decodedIds
     }
 }
 

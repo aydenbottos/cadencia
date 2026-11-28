@@ -312,6 +312,7 @@ public actor GPT61TerraClient {
                 fullText: eval1.fullText,
                 plan: currentPlan,
                 report: eval1.report,
+                verifier: verifier,
                 generatorCallsUsed: callsUsed,
                 dueWasReduced: dueWasReduced
             )
@@ -342,6 +343,7 @@ public actor GPT61TerraClient {
                 fullText: eval2.fullText,
                 plan: currentPlan,
                 report: eval2.report,
+                verifier: verifier,
                 generatorCallsUsed: callsUsed,
                 dueWasReduced: dueWasReduced
             )
@@ -390,6 +392,7 @@ public actor GPT61TerraClient {
                 fullText: eval3.fullText,
                 plan: currentPlan,
                 report: eval3.report,
+                verifier: verifier,
                 generatorCallsUsed: callsUsed,
                 dueWasReduced: dueWasReduced
             )
@@ -436,7 +439,12 @@ public actor GPT61TerraClient {
             accent: plan.accent,
             priorContextWordsByItem: plan.priorContextWordsByItem,
             learningProbeCandidates: plan.learningProbeCandidates,
-            transparentCognateLemmas: plan.transparentCognateLemmas
+            transparentCognateLemmas: plan.transparentCognateLemmas,
+            bootstrapKitNumber: plan.bootstrapKitNumber,
+            bootstrapPatternDescription: plan.bootstrapPatternDescription,
+            bootstrapCastNames: plan.bootstrapCastNames,
+            isBootstrapRecombination: plan.isBootstrapRecombination,
+            sessionUnderExposedItems: plan.sessionUnderExposedItems
         )
     }
 
@@ -458,6 +466,7 @@ public actor GPT61TerraClient {
     private struct RawDraftProbe: Decodable {
         let targetDueItemId: String
         let targetDueLemma: String
+        let targetSentenceSpanish: String?
         let questionEn: String
         let options: [String]
         let correctOptionIndex: Int
@@ -504,22 +513,21 @@ public actor GPT61TerraClient {
 
         let instructions: String
         if plan.isBootstrap {
-            let probeRule = plan.dueItems.isEmpty
-                ? "5. PROBES (Bootstrap Picture-Matching): Return \(targetProbeCountDesc). Because DUE_ITEMS is empty, write PICTURE-MATCHING probes on the passage's NEW_ITEMS (`isPictureMatch: true`). Each probe asks which picture/meaning matches one NEW_ITEM from the passage, with 4 clear English options, `optionSymbols` (4 valid Apple SF Symbol names like `music.note`, `building.2.fill`, `person.2.fill`, `book.fill`, `sparkles`, `map.fill`), `targetDueItemId` set to that NEW_ITEM's id, and `targetDueLemma` set to its Spanish word."
-                : "5. PROBES: Return \(targetProbeCountDesc) hinging on DUE_ITEMS first, then NEW_ITEMS (`isPictureMatch: false`, `optionSymbols: null`)."
-            let grammarRule = plan.grammarPatterns.isEmpty
-                ? "6. GRAMMAR: Clean, natural beginner Spanish."
-                : "6. GRAMMAR PATTERNS: Weave each assigned grammar pattern at least TWICE with different lexical words."
+            let castList = (plan.bootstrapCastNames.isEmpty ? BootstrapKitLibrary.fixedCastDisplayNames : plan.bootstrapCastNames).joined(separator: ", ")
+            let kitPattern = plan.bootstrapPatternDescription ?? plan.grammarPatterns.first?.spanish ?? "present tense only"
+            let recombNote = plan.isBootstrapRecombination
+                ? "RECOMBINATION SCENE (no new items): Recombine ONLY items met so far + fixed cast names (\(castList)), weaving in the UNDER_EXPOSED_SESSION_ITEMS listed below so each reaches >=3 sentences this session."
+                : "KIT PASSAGE (Kit \(plan.bootstrapKitNumber ?? 1)/8): EVERY item in NEW_ITEMS (the passage's kit) MUST appear AT LEAST ONCE (aim for 2–3 sentences where natural; NO spacing rule and NO upper limit on uses!)."
 
             instructions = """
-            You are the Spanish Passage Generator inside Cadencia implementing the Bootstrap Contract (Sessions 1–4, Revised Protocol p. 8):
-            1. PASSAGE FORM: Write 6 to 10 crisp, natural Spanish sentences, EACH STRICTLY 8 WORDS OR FEWER! Include an accurate English translation in `englishLine` AND a fitting Apple SF Symbol icon name in `visualSymbol` (e.g. `building.2.fill`, `person.2.fill`, `music.note`, `cup.and.saucer.fill`, `sun.max.fill`, `book.fill`) for EVERY sentence.
-            2. CLOSED VOCABULARY (>=80% + Glossed Cognates): At least 80% of running words MUST come from ALLOWED_LEMMAS (items met so far + NEW_ITEMS + DUE_ITEMS) plus proper names (Clara, Mateo, Madrid, etc.) and numbers. ANY remaining word (at most 20% of words) MUST be a transparent English-Spanish cognate from TRANSPARENT_COGNATES AND listed in `transparentCognateGlosses`! NEVER use non-cognate off-list words or banned hold-out words!
-            3. NEW ITEMS (at most 8): EVERY item in NEW_ITEMS MUST appear in AT LEAST 3 DIFFERENT SENTENCES. There is NO minimum word-spacing limit and NO upper limit on uses! Make each first use clear in context.
-            4. SCHEDULED SHARE & DUE ITEMS: There is NO scheduled share cap or floor in Bootstrap! If DUE_ITEMS is non-empty, use each due item at least once and never beside its banned prior neighbors.
-            \(probeRule)
-            \(grammarRule)
-            7. CONTINUITY: Continue the serial scene vividly with authentic Spanish register (\(plan.accent.displayName)).
+            You are the Spanish Passage Generator inside Cadencia implementing the Fixed-Kit Bootstrap Contract (Sessions 1–4, 17-Page Protocol pp. 8–9):
+            1. PASSAGE FORM: Write 6 to 10 simple, grammatical Spanish sentences in PRESENT TENSE ONLY, EACH STRICTLY 8 WORDS OR FEWER! Include an accurate English translation in `englishLine` AND a fitting Apple SF Symbol name in `visualSymbol` (e.g. `stethoscope`, `building.2.fill`, `person.2.fill`, `fork.knife`, `cross.case.fill`, `music.note`, `cup.and.saucer.fill`, `book.fill`) for EVERY sentence.
+            2. CLOSED VOCABULARY (>=80% Core + Glossed Cognates): At least 80% of words MUST come from ALLOWED_LEMMAS (items met so far + this kit's NEW_ITEMS + DUE_ITEMS) plus ONLY the fixed cast & place names (\(castList)) and numbers. Do NOT invent any other character or city names! All inflected present-tense/gender/plural forms of allowed lemmas are welcome (e.g. doctor/doctora/doctores, famoso/famosa, un/una, el/la, ser->es/son, estar->está/están, a+el=al, de+el=del). Prefer 100% core words when possible; any extra word (<=20%) MUST be a transparent cognate from TRANSPARENT_COGNATES AND listed in `transparentCognateGlosses`!
+            3. \(recombNote)
+            4. SCHEDULED SHARE & DUE ITEMS: There is NO scheduled share limit in Bootstrap! If DUE_ITEMS is non-empty, include each at least once and avoid its banned prior neighbors.
+            5. PROBES (Whole-Sentence Picture Matching): Return 2 whole-sentence picture-matching probes (`isPictureMatch: true`). For EACH probe: set `targetSentenceSpanish` to one exact Spanish sentence from your passage containing kit/new items, `questionEn` to `"Which picture matches this sentence?"`, `options` to 4 distinct concise English scene descriptions (1 right, 3 clearly different distractors), `optionSymbols` to 4 matching Apple SF Symbol names, `targetDueItemId` to one kit item's id from that sentence, and `targetDueLemma` to that item's Spanish word.
+            6. GRAMMAR PATTERN (Present Tense Only): Demonstrate this single pattern clearly at least twice: \(kitPattern).
+            7. CONTINUITY: Simple scenes with the fixed cast (\(castList)). NO plot is required — crisp, clear standalone beginner sentences like "Ana es una doctora famosa. El hotel es famoso." are ideal!
             """
         } else {
             let dueRule = plan.dueItems.isEmpty
@@ -527,13 +535,13 @@ public actor GPT61TerraClient {
                 : "3. DUE ITEMS & SCHEDULED SHARE: EVERY item in DUE_ITEMS MUST appear at least once. Combined occurrences of NEW_ITEMS + DUE_ITEMS MUST be AT MOST 23% of total words (there is NO lower limit per passage)."
             let probeRule = eligibleTargets.isEmpty
                 ? "5. LOAD-BEARING PROBES: No eligible target items; return an empty `probes` array."
-                : "5. LOAD-BEARING PROBES: Write \(targetProbeCountDesc) (`isPictureMatch: false`, `optionSymbols: null`). Each probe MUST hinge on understanding ONE specific target item, drawn in strict priority order: DUE_ITEMS first, then NEW_ITEMS, then LEARNING_CANDIDATES if fewer than 2 due/new items exist. Provide 4 plausible options and 0-based `correctOptionIndex`."
+                : "5. LOAD-BEARING PROBES: Write \(targetProbeCountDesc) (`isPictureMatch: false`, `optionSymbols: null`, `targetSentenceSpanish: null`). Each probe MUST hinge on understanding ONE specific target item, drawn in strict priority order: DUE_ITEMS first, then NEW_ITEMS, then LEARNING_CANDIDATES if fewer than 2 due/new items exist. Provide 4 plausible options and 0-based `correctOptionIndex`."
             let grammarRule = plan.grammarPatterns.isEmpty
                 ? "6. GRAMMAR: Use natural, idiomatic Spanish."
                 : "6. GRAMMAR PATTERNS: Each assigned grammar pattern MUST appear at least TWICE with different lexical words."
 
             instructions = """
-            You are the Spanish Passage Generator inside Cadencia implementing the Full Input Contract (Sessions 5+, Revised Protocol pp. 6–7):
+            You are the Spanish Passage Generator inside Cadencia implementing the Full Input Contract (Sessions 5+, Protocol pp. 6–7):
             1. PASSAGE LENGTH & 100% CLOSED VOCABULARY: Write 180–250 natural, vivid Spanish words. EVERY SINGLE word lemma MUST come strictly from ALLOWED_LEMMAS (Known, Learning p>85%, DUE_ITEMS, NEW_ITEMS) or proper names/numbers — 100% compliance, ZERO off-list lemmas, ZERO banned hold-out words! Return `transparentCognateGlosses: []` and `visualSymbol: null`.
             2. NEW ITEMS (at most 6): If NEW_ITEMS is non-empty, EVERY item in NEW_ITEMS MUST appear at least 3 times, with 3 of those uses at least 30 words apart (further uses are free and never fail the rule!). Make the first use clearly guessable from context.
             \(dueRule)
@@ -544,29 +552,38 @@ public actor GPT61TerraClient {
             """
         }
 
+        let underExposedDesc = plan.sessionUnderExposedItems.map { "\($0.spanish) (\($0.englishGloss))" }.joined(separator: ", ")
+
         var userPrompt = """
-        MODE: \(plan.isBootstrap ? "BOOTSTRAP (Sessions 1–4)" : "FULL CONTRACT (Sessions 5+)")
+        MODE: \(plan.isBootstrap ? (plan.isBootstrapRecombination ? "BOOTSTRAP RECOMBINATION (Sessions 1–4)" : "BOOTSTRAP FIXED KIT \(plan.bootstrapKitNumber ?? 1)/8 (Sessions 1–4)") : "FULL CONTRACT (Sessions 5+)")
         FORMAT: \(plan.format.rawValue)
         TITLE / TOPIC: \(plan.topicOrEpisodeTitle)
-        STORY SO FAR: \(plan.storySummarySoFar.isEmpty ? "Opening episode — establish vivid setting, protagonist, and immediate hook." : plan.storySummarySoFar)
+        \(plan.isBootstrap ? "FIXED CAST & PLACES (ONLY names allowed): \((plan.bootstrapCastNames.isEmpty ? BootstrapKitLibrary.fixedCastDisplayNames : plan.bootstrapCastNames).joined(separator: ", "))" : "STORY SO FAR: \(plan.storySummarySoFar.isEmpty ? "Opening episode — establish vivid setting, protagonist, and immediate hook." : plan.storySummarySoFar)")
         REGIONAL ACCENT FLAVOR: \(plan.accent.displayName)
 
-        NEW_ITEMS (\(plan.isBootstrap ? "each in >=3 distinct sentences, no spacing limit" : "each >=3x with 3 uses >=30 words apart")):
+        NEW_ITEMS (\(plan.isBootstrap ? "every kit item >=1x in this passage, no spacing limit" : "each >=3x with 3 uses >=30 words apart")):
         \(newItemsDesc.isEmpty ? "None this passage." : newItemsDesc)
 
         DUE_ITEMS (each >=1x):
         \(dueItemsDesc.isEmpty ? "None." : dueItemsDesc)
+        """
+
+        if plan.isBootstrap && !underExposedDesc.isEmpty {
+            userPrompt += "\n\nUNDER_EXPOSED_SESSION_ITEMS (weave into sentences so they reach >=3 sentences this session):\n\(underExposedDesc)"
+        }
+
+        userPrompt += """
 
         LEARNING_CANDIDATES (tier-3 probe fallback only if due + new < 2):
         \(learningDesc.isEmpty ? "None." : learningDesc)
 
         ASSIGNED_GRAMMAR_PATTERNS (each >=2x with different words):
-        \(grammarDesc.isEmpty ? "None assigned." : grammarDesc)
+        \(plan.isBootstrap ? (plan.bootstrapPatternDescription ?? (grammarDesc.isEmpty ? "Present tense only." : grammarDesc)) : (grammarDesc.isEmpty ? "None assigned." : grammarDesc))
 
         RULE 4 BANNED PRIOR NEIGHBORS:
         \(priorNeighborsText)
 
-        ALLOWED_LEMMAS (\(plan.isBootstrap ? ">=80% of words must come from this set + names/numbers" : "100% of words must come from this set + names/numbers")):
+        ALLOWED_LEMMAS (\(plan.isBootstrap ? ">=80% of words must come from this set + fixed cast names/numbers" : "100% of words must come from this set + names/numbers")):
         \(allowedSample)
         """
 
@@ -630,6 +647,7 @@ public actor GPT61TerraClient {
                         "properties": [
                             "targetDueItemId": ["type": "string"],
                             "targetDueLemma": ["type": "string"],
+                            "targetSentenceSpanish": ["type": ["string", "null"]],
                             "questionEn": ["type": "string"],
                             "options": ["type": "array", "items": ["type": "string"]],
                             "correctOptionIndex": ["type": "integer"],
@@ -638,7 +656,7 @@ public actor GPT61TerraClient {
                             "optionSymbols": ["type": ["array", "null"], "items": ["type": "string"]],
                         ],
                         "required": [
-                            "targetDueItemId", "targetDueLemma", "questionEn", "options",
+                            "targetDueItemId", "targetDueLemma", "targetSentenceSpanish", "questionEn", "options",
                             "correctOptionIndex", "hingeExplanation", "isPictureMatch", "optionSymbols",
                         ],
                         "additionalProperties": false,
@@ -681,29 +699,33 @@ public actor GPT61TerraClient {
         let probeText = probes.isEmpty
             ? "(No probes)"
             : probes.enumerated().map { idx, p in
-                "Probe \(idx + 1) [target: \(p.targetDueLemma), pictureMatch: \(p.isPictureMatch)]: \(p.questionEn) | Options: \(p.options.joined(separator: " / ")) | Correct: \(p.correctOptionIndex)"
+                let sentNote = p.targetSentenceSpanish.map { " | Sentence: «\($0)»" } ?? ""
+                return "Probe \(idx + 1) [target: \(p.targetDueLemma), pictureMatch: \(p.isPictureMatch)\(sentNote)]: \(p.questionEn) | Options: \(p.options.joined(separator: " / ")) | Correct: \(p.correctOptionIndex)"
             }.joined(separator: "\n")
-        let gramText = plan.grammarPatterns.map { "\($0.id): \($0.spanish)" }.joined(separator: "\n")
+        let gramText = plan.isBootstrap
+            ? (plan.bootstrapPatternDescription ?? plan.grammarPatterns.map { "\($0.id): \($0.spanish)" }.joined(separator: "\n"))
+            : plan.grammarPatterns.map { "\($0.id): \($0.spanish)" }.joined(separator: "\n")
         let eligible = plan.eligibleProbeTargets
         let targetList = eligible.map { "\($0.spanish) (\($0.englishGloss))" }.joined(separator: ", ")
 
         let probeCheckRule: String
-        if eligible.isEmpty {
+        if plan.isBootstrap {
+            probeCheckRule = "1. Rule 5 (Bootstrap Whole-Sentence Picture Matching): Are there 2–3 probes where each presents a whole Spanish sentence from the passage and 4 distinct English picture/scene options with 1 unambiguously right match?"
+        } else if eligible.isEmpty {
             probeCheckRule = "1. Rule 5 (Probes): No eligible due/new/learning target items exist, so 0 probes is expected; set probesAreLoadBearing=true."
-        } else if plan.isBootstrap && plan.dueItems.isEmpty {
-            let minNeeded = min(2, eligible.count)
-            probeCheckRule = "1. Rule 5 (Bootstrap Picture-Matching Probes): Are there \(minNeeded)–3 picture-matching probes on the passage's NEW_ITEMS where each probe accurately tests understanding of its target word from the passage?"
         } else {
             let minNeeded = min(2, eligible.count)
             probeCheckRule = "1. Rule 5 (Load-bearing probes): Are there \(minNeeded)–3 probes (fewer eligible items means fewer probes), and does each hinge on understanding one specific eligible target item (priority: due list first, then new list, then Learning items)?"
         }
 
-        let grammarCheckRule = plan.grammarPatterns.isEmpty
+        let grammarCheckRule = gramText.isEmpty
             ? "2. Rule 6 (Grammar patterns): None assigned for this passage; set grammarPatternsVerified=true."
-            : "2. Rule 6 (Grammar patterns): Does each assigned grammar pattern appear at least twice with different lexical words?"
+            : (plan.isBootstrap
+                ? "2. Rule 6 (Bootstrap Present-Tense Pattern): Does the passage demonstrate the single assigned present-tense pattern (\(gramText)) cleanly in present tense?"
+                : "2. Rule 6 (Grammar patterns): Does each assigned grammar pattern appear at least twice with different lexical words?")
 
         let bootstrapContext = plan.isBootstrap
-            ? "\nNOTE: This is a Sessions 1–4 Bootstrap micro-story intentionally written in 6–10 short beginner sentences (<= 8 words each). Do NOT penalize simple beginner sentences as unnatural as long as the Spanish is grammatical and clear."
+            ? "\nIMPORTANT BOOTSTRAP CONTEXT: This is a Sessions 1–4 fixed-kit beginner scene built from ONLY a 6–8 word kit and the fixed cast (Ana, Luis, Carla; Perú, México). Present tense only; NO plot is required! Simple, repetitive sentences like 'Ana es una doctora famosa. El hotel es famoso.' are 100% INTENTIONAL and PASS naturalness as long as the Spanish grammar and agreement are accurate."
             : ""
 
         let instructions = """
@@ -1163,6 +1185,7 @@ public actor GPT61TerraClient {
         fullText: String,
         plan: PassagePlan,
         report: VerificationReport,
+        verifier: ContractVerifier,
         generatorCallsUsed: Int,
         dueWasReduced: Bool
     ) -> GeneratedPassage {
@@ -1197,16 +1220,28 @@ public actor GPT61TerraClient {
         }
 
         let probes: [PassageProbe] = draft.probes.enumerated().map { idx, p in
-            PassageProbe(
+            let targetSentence = p.targetSentenceSpanish?.trimmingCharacters(in: .whitespacesAndNewlines)
+            // Bootstrap Rule 5: log whole-sentence picture-matching result against EACH new item in that sentence!
+            let matchedSentenceItemIds: [String]
+            if plan.isBootstrap, let sent = targetSentence, !sent.isEmpty {
+                let candidates = plan.newItems.isEmpty ? plan.dueItems : plan.newItems
+                let ids = verifier.matchedItemIds(in: sent, from: candidates)
+                matchedSentenceItemIds = ids.isEmpty ? [p.targetDueItemId] : ids
+            } else {
+                matchedSentenceItemIds = [p.targetDueItemId]
+            }
+            return PassageProbe(
                 id: "\(plan.passageId)_probe_\(idx)",
-                targetDueItemId: p.targetDueItemId,
+                targetDueItemId: matchedSentenceItemIds.first ?? p.targetDueItemId,
                 targetDueLemma: p.targetDueLemma,
                 questionEn: p.questionEn,
                 options: p.options,
                 correctOptionIndex: max(0, min(p.correctOptionIndex, max(0, p.options.count - 1))),
                 hingeExplanation: p.hingeExplanation,
                 isPictureMatch: p.isPictureMatch,
-                optionSymbols: p.optionSymbols
+                optionSymbols: p.optionSymbols,
+                targetSentenceSpanish: targetSentence,
+                targetItemIds: matchedSentenceItemIds
             )
         }
 
