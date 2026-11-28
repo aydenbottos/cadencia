@@ -232,11 +232,13 @@ public struct ProtocolParameters: Codable, Sendable, Equatable {
     public var strongSuccessMultiplier: Double
     public var weakSuccessMultiplier: Double
     public var failureMultiplier: Double
+    public var maxWeakSuccessUpdatesPerSession: Int
     public var dueRecallThreshold: Double
     public var scheduledShareCap: Double
     public var scheduledShareFloor: Double
     public var maxNewItemsPerSession: Int
     public var maxNewItemsPerPassage: Int
+    public var maxNewItemsPerBootstrapPassage: Int
     public var passageMinWords: Int
     public var passageMaxWords: Int
     public var newItemMinOccurrences: Int
@@ -254,11 +256,13 @@ public struct ProtocolParameters: Codable, Sendable, Equatable {
         strongSuccessMultiplier: Double,
         weakSuccessMultiplier: Double,
         failureMultiplier: Double,
+        maxWeakSuccessUpdatesPerSession: Int = 3,
         dueRecallThreshold: Double,
         scheduledShareCap: Double,
         scheduledShareFloor: Double,
         maxNewItemsPerSession: Int,
         maxNewItemsPerPassage: Int,
+        maxNewItemsPerBootstrapPassage: Int = 8,
         passageMinWords: Int,
         passageMaxWords: Int,
         newItemMinOccurrences: Int,
@@ -275,11 +279,13 @@ public struct ProtocolParameters: Codable, Sendable, Equatable {
         self.strongSuccessMultiplier = strongSuccessMultiplier
         self.weakSuccessMultiplier = weakSuccessMultiplier
         self.failureMultiplier = failureMultiplier
+        self.maxWeakSuccessUpdatesPerSession = maxWeakSuccessUpdatesPerSession
         self.dueRecallThreshold = dueRecallThreshold
         self.scheduledShareCap = scheduledShareCap
         self.scheduledShareFloor = scheduledShareFloor
         self.maxNewItemsPerSession = maxNewItemsPerSession
         self.maxNewItemsPerPassage = maxNewItemsPerPassage
+        self.maxNewItemsPerBootstrapPassage = maxNewItemsPerBootstrapPassage
         self.passageMinWords = passageMinWords
         self.passageMaxWords = passageMaxWords
         self.newItemMinOccurrences = newItemMinOccurrences
@@ -294,16 +300,45 @@ public struct ProtocolParameters: Codable, Sendable, Equatable {
         self.isFrozen = isFrozen
     }
 
-    /// Exact defaults from Signal-starvation hypothesis test protocol (pp. 5-7, 14-15)
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let d = Self.protocolDefaults
+        self.strongSuccessMultiplier = (try? c.decode(Double.self, forKey: .strongSuccessMultiplier)) ?? d.strongSuccessMultiplier
+        self.weakSuccessMultiplier = (try? c.decode(Double.self, forKey: .weakSuccessMultiplier)) ?? d.weakSuccessMultiplier
+        self.failureMultiplier = (try? c.decode(Double.self, forKey: .failureMultiplier)) ?? d.failureMultiplier
+        self.maxWeakSuccessUpdatesPerSession = (try? c.decode(Int.self, forKey: .maxWeakSuccessUpdatesPerSession)) ?? d.maxWeakSuccessUpdatesPerSession
+        self.dueRecallThreshold = (try? c.decode(Double.self, forKey: .dueRecallThreshold)) ?? d.dueRecallThreshold
+        self.scheduledShareCap = (try? c.decode(Double.self, forKey: .scheduledShareCap)) ?? d.scheduledShareCap
+        self.scheduledShareFloor = (try? c.decode(Double.self, forKey: .scheduledShareFloor)) ?? d.scheduledShareFloor
+        self.maxNewItemsPerSession = (try? c.decode(Int.self, forKey: .maxNewItemsPerSession)) ?? d.maxNewItemsPerSession
+        self.maxNewItemsPerPassage = (try? c.decode(Int.self, forKey: .maxNewItemsPerPassage)) ?? d.maxNewItemsPerPassage
+        self.maxNewItemsPerBootstrapPassage = (try? c.decode(Int.self, forKey: .maxNewItemsPerBootstrapPassage)) ?? d.maxNewItemsPerBootstrapPassage
+        self.passageMinWords = (try? c.decode(Int.self, forKey: .passageMinWords)) ?? d.passageMinWords
+        self.passageMaxWords = (try? c.decode(Int.self, forKey: .passageMaxWords)) ?? d.passageMaxWords
+        self.newItemMinOccurrences = (try? c.decode(Int.self, forKey: .newItemMinOccurrences)) ?? d.newItemMinOccurrences
+        self.newItemMinWordSpacing = (try? c.decode(Int.self, forKey: .newItemMinWordSpacing)) ?? d.newItemMinWordSpacing
+        self.knownMinHalfLifeDays = (try? c.decode(Double.self, forKey: .knownMinHalfLifeDays)) ?? d.knownMinHalfLifeDays
+        self.knownMinSuccesses = (try? c.decode(Int.self, forKey: .knownMinSuccesses)) ?? d.knownMinSuccesses
+        self.knownMinEarSuccesses = (try? c.decode(Int.self, forKey: .knownMinEarSuccesses)) ?? d.knownMinEarSuccesses
+        self.productiveMinUses = (try? c.decode(Int.self, forKey: .productiveMinUses)) ?? d.productiveMinUses
+        self.doubtPaceMultiplier = (try? c.decode(Double.self, forKey: .doubtPaceMultiplier)) ?? d.doubtPaceMultiplier
+        self.newRegularHalfLifeDays = (try? c.decode(Double.self, forKey: .newRegularHalfLifeDays)) ?? d.newRegularHalfLifeDays
+        self.newCognateHalfLifeDays = (try? c.decode(Double.self, forKey: .newCognateHalfLifeDays)) ?? d.newCognateHalfLifeDays
+        self.isFrozen = (try? c.decode(Bool.self, forKey: .isFrozen)) ?? d.isFrozen
+    }
+
+    /// Exact defaults from Signal-starvation hypothesis test protocol (rev. 16-page edition, pp. 5–8, 15–16)
     public static let protocolDefaults = ProtocolParameters(
         strongSuccessMultiplier: 2.2,
         weakSuccessMultiplier: 1.6,
         failureMultiplier: 0.5,
+        maxWeakSuccessUpdatesPerSession: 3,
         dueRecallThreshold: 0.85,
         scheduledShareCap: 0.23,
-        scheduledShareFloor: 0.18,
+        scheduledShareFloor: 0.0, // Revised protocol p. 6: single passage has no lower limit; Stage 0 averages >=20% at hours 10-35
         maxNewItemsPerSession: 135,
         maxNewItemsPerPassage: 6,
+        maxNewItemsPerBootstrapPassage: 8,
         passageMinWords: 180,
         passageMaxWords: 250,
         newItemMinOccurrences: 3,

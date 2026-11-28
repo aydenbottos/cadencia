@@ -242,8 +242,8 @@ public struct ResearchLabView: View {
 
             labActionRow(
                 icon: "flask.fill",
-                title: "Stage 0 Bench Test (Hours 2 / 10 / 20 / 35 / 50)",
-                subtitle: "Stress-test GPT-6.1 Terra Generator + Verifier contract gate (≥95% pass, ≥20% share)",
+                title: "Stage 0 Bench Test (Hours 0 / 10 / 20 / 35 / 50)",
+                subtitle: "Stress-test 6-step GPT-6.1 Terra pipeline (≥95% pass in ≤3 calls, ≥20% avg share at h10–35)",
                 tint: CadenciaPalette.bioluminescentCobalt
             ) { activeSheet = .stage0BenchTest }
         }
@@ -1240,7 +1240,7 @@ private struct Stage0BenchTestSheet: View {
 
     @State private var passagesPerHour: Int = 2
     @State private var isRunning: Bool = false
-    @State private var progressLog: String = "Tests GPT-6.1 Terra Generator + Stage A/B Verifier across simulated learner states at hours 2, 10, 20, 35, and 50 (Stage 0 Gate: ≥95% pass within 3 rewrites, ≥20% scheduled share)."
+    @State private var progressLog: String = "Tests the 6-step GPT-6.1 Terra Generator + Stage A/B Verifier pipeline across simulated learner states at hours 0, 10, 20, 35, and 50 (Stage 0 Gate: ≥95% pass within 3 generator calls, ≥20% avg scheduled share at hours 10–35)."
     @State private var summary: BenchTestSummary?
 
     var body: some View {
@@ -1322,7 +1322,7 @@ private struct Stage0BenchTestSheet: View {
         defer { isRunning = false }
         await appState.ensureLinguisticResourcesLoaded()
 
-        let hours = [2, 10, 20, 35, 50]
+        let hours = [0, 10, 20, 35, 50]
         let scheduler = SessionScheduler(parameters: .protocolDefaults)
         let verifier = ContractVerifier(lemmatizer: appState.lemmatizer, parameters: .protocolDefaults)
         let serial = appState.serialGenres.first ?? SerialGenre(
@@ -1333,12 +1333,13 @@ private struct Stage0BenchTestSheet: View {
         var reports: [BenchTestStateReport] = []
         var totalPassed = 0
         var totalAttempted = 0
-        var shareSum = 0.0
+        var midCourseShareSum = 0.0
+        var midCourseCount = 0
 
         for h in hours {
             let (simProfile, simRecs) = appState.analyticsEngine.buildSimulatedLearnerState(atHour: h, allItems: appState.allSyllabusItems)
             var passed = 0
-            var rewritesSum = 0
+            var callsSum = 0
             var hourShareSum = 0.0
             var closedSum = 0.0
 
@@ -1362,10 +1363,16 @@ private struct Stage0BenchTestSheet: View {
                     let (passage, rep) = try await appState.terraClient.generateVerifiedPassage(
                         plan: plan, verifier: verifier, priorContextByItem: [:]
                     )
-                    if rep.passed && passage.rewriteAttempts <= 3 { passed += 1; totalPassed += 1 }
-                    rewritesSum += passage.rewriteAttempts
+                    if !passage.isReserveFallback && rep.passed && passage.generatorCallsUsed <= 3 {
+                        passed += 1
+                        totalPassed += 1
+                    }
+                    callsSum += passage.generatorCallsUsed
                     hourShareSum += passage.scheduledWordShare
-                    shareSum += passage.scheduledWordShare
+                    if h >= 10 && h <= 35 {
+                        midCourseShareSum += passage.scheduledWordShare
+                        midCourseCount += 1
+                    }
                     closedSum += rep.closedVocabCompliance
                 } catch {
                     progressLog = "Hour \(h) P\(pIdx + 1) failed: \(error.localizedDescription)"
@@ -1377,20 +1384,20 @@ private struct Stage0BenchTestSheet: View {
                 knownCount: simRecs.values.filter { $0.meetingsCount > 0 }.count,
                 passagesAttempted: passagesPerHour,
                 passedWithinThreeRewrites: passed,
-                averageRewrites: Double(rewritesSum) / Double(max(1, passagesPerHour)),
+                averageRewrites: Double(callsSum) / Double(max(1, passagesPerHour)),
                 averageScheduledShare: hourShareSum / Double(max(1, passagesPerHour)),
                 averageClosedVocabCompliance: closedSum / Double(max(1, passagesPerHour))
             ))
         }
 
         let overallPass = Double(totalPassed) / Double(max(1, totalAttempted))
-        let overallShare = shareSum / Double(max(1, totalAttempted))
+        let midCourseShare = midCourseShareSum / Double(max(1, midCourseCount))
         let sum = BenchTestSummary(
             runAt: Date(),
             totalPassages: totalAttempted,
             overallPassRate: overallPass,
-            overallScheduledShare: overallShare,
-            gatePassed: overallPass >= 0.95 && overallShare >= 0.20,
+            overallScheduledShare: midCourseShare,
+            gatePassed: overallPass >= 0.95 && midCourseShare >= 0.20,
             perHourStates: reports
         )
         summary = sum

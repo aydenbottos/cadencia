@@ -155,23 +155,25 @@ public struct ResearchAnalyticsEngine: Sendable {
         )
     }
 
-    // MARK: - Stage 0 Bench Test Simulator (Hours 2, 10, 20, 35, 50 — PDF p. 10)
+    // MARK: - Stage 0 Bench Test Simulator (Hours 0, 10, 20, 35, 50 — Revised Protocol p. 10)
 
-    /// Constructs a realistic simulated learner state at any target hour (2, 10, 20, 35, 50)
+    /// Constructs a realistic simulated learner state at any target hour (0, 10, 20, 35, 50)
     /// for Stage 0 Bench Testing of the Generator + Verifier contract.
+    /// Hour 0 represents a brand-new Session 1 Bootstrap learner with 0 met items!
     public func buildSimulatedLearnerState(
         atHour hour: Int,
         allItems: [SyllabusItem],
         parameters: ProtocolParameters = .protocolDefaults
     ) -> (profile: LearnerProfile, records: [String: LearnerItemRecord]) {
-        let sessionNum = max(1, min(48, Int((Double(hour) / 1.25).rounded())))
+        let sessionNum = hour <= 0 ? 1 : max(1, min(48, Int((Double(hour) / 1.25).rounded())))
         let now = Date()
         let active = allItems.filter { !$0.isHoldout }.sorted { $0.rankIndex < $1.rankIndex }
 
-        // Map hour -> approximate cumulative met items matching the 8-week simulation table (PDF p. 8)
+        // Map hour -> approximate cumulative met items matching the 8-week simulation table (p. 9)
         let targetMetCount: Int
         switch hour {
-        case ...3: targetMetCount = 150
+        case ...0: targetMetCount = 0
+        case 1...3: targetMetCount = 150
         case 4...12: targetMetCount = 720
         case 13...24: targetMetCount = 1650
         case 25...40: targetMetCount = 2900

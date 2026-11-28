@@ -136,31 +136,77 @@ public struct SessionScheduler: Sendable {
         let activeLexical = allItems.filter { !$0.isHoldout && ($0.itemType == .lemma || $0.itemType == .chunk) }
         let activeGrammar = allItems.filter { !$0.isHoldout && $0.itemType == .grammar }
 
-        // 1. Select New Items (at most 6 per passage, Rule 2)
+        // 1. Select New Items (at most 8 per passage in Bootstrap Sessions 1–4, at most 6 from Session 5+)
+        let maxNewThisPassage = isBootstrap
+            ? modelEngine.parameters.maxNewItemsPerBootstrapPassage
+            : modelEngine.parameters.maxNewItemsPerPassage
+
         let targetNewCount: Int
         if newItemsRemainingInSession <= 0 {
             targetNewCount = 0
         } else if isBootstrap {
-            targetNewCount = min(6, newItemsRemainingInSession)
+            targetNewCount = min(maxNewThisPassage, newItemsRemainingInSession)
         } else {
             let estimatedPassagesLeft = max(1, estimatedPassagesForWeek(week) - passageIndexInSession)
             let paced = Int(ceil(Double(newItemsRemainingInSession) / Double(estimatedPassagesLeft)))
-            targetNewCount = min(modelEngine.parameters.maxNewItemsPerPassage, max(1, min(paced, newItemsRemainingInSession)))
+            targetNewCount = min(maxNewThisPassage, max(1, min(paced, newItemsRemainingInSession)))
         }
 
-        let newPool: [SyllabusItem]
+        let selectedNewItemsRaw: [SyllabusItem]
         if isBootstrap {
-            // Sessions 1–4 prioritize the 240 commonest function words + transparent cognates
+            // Revised Bootstrap contract (p. 8): nothing is pre-loaded as Known; function words and
+            // transparent cognates enter via the new list (up to 8 per passage).
+            // Interleave unmet bootstrap function/core verbs (~5, ensuring a core verb like ser/estar
+            // joins early) with unmet bootstrap transparent cognates (~3) so even Passage 1 has
+            // nouns + verbs + function words on its new list and easily satisfies >=80% Rule 1!
             let bootstrapUnmet = activeLexical.filter { item in
                 let rec = records[item.id]
                 return item.isBootstrap && (rec?.meetingsCount ?? 0) == 0 && !(rec?.isHeldBackControl ?? false)
             }.sorted { $0.rankIndex < $1.rankIndex }
-            newPool = bootstrapUnmet.isEmpty
-                ? activeLexical.filter { (records[$0.id]?.meetingsCount ?? 0) == 0 && !(records[$0.id]?.isHeldBackControl ?? false) }.sorted { $0.rankIndex < $1.rankIndex }
-                : bootstrapUnmet
+
+            let fallbackUnmet = activeLexical.filter {
+                (records[$0.id]?.meetingsCount ?? 0) == 0 && !(records[$0.id]?.isHeldBackControl ?? false)
+            }.sorted { $0.rankIndex < $1.rankIndex }
+
+            let pool = bootstrapUnmet.isEmpty ? fallbackUnmet : bootstrapUnmet
+            let corePool = pool.filter { !$0.isTransparentCognate }
+            let cogPool = pool.filter { $0.isTransparentCognate }.sorted { lhs, rhs in
+                let lhsContent = (lhs.pos == "NOUN" || lhs.pos == "ADJ")
+                let rhsContent = (rhs.pos == "NOUN" || rhs.pos == "ADJ")
+                if lhsContent != rhsContent { return lhsContent }
+                return lhs.rankIndex < rhs.rankIndex
+            }
+            let verbPool = corePool.filter { $0.pos == "VERB" || $0.pos == "AUX" }
+
+            var chosen: [SyllabusItem] = []
+            var seenIds: Set<String> = []
+            let wantCogs = min(cogPool.count, max(1, targetNewCount / 3))
+            let wantCore = max(0, targetNewCount - wantCogs)
+
+            // Guarantee at least 1 core verb (e.g. ser / estar) in the very first passage so natural sentences flow
+            let hasAnyMetVerb = activeLexical.contains {
+                ($0.pos == "VERB" || $0.pos == "AUX") && (records[$0.id]?.meetingsCount ?? 0) > 0
+            }
+            if !hasAnyMetVerb, let firstVerb = verbPool.first, chosen.count < targetNewCount {
+                chosen.append(firstVerb)
+                seenIds.insert(firstVerb.id)
+            }
+            for item in corePool where chosen.count < wantCore && !seenIds.contains(item.id) {
+                chosen.append(item)
+                seenIds.insert(item.id)
+            }
+            for item in cogPool where chosen.count < targetNewCount && !seenIds.contains(item.id) {
+                chosen.append(item)
+                seenIds.insert(item.id)
+            }
+            for item in pool where chosen.count < targetNewCount && !seenIds.contains(item.id) {
+                chosen.append(item)
+                seenIds.insert(item.id)
+            }
+            selectedNewItemsRaw = chosen.sorted { $0.rankIndex < $1.rankIndex }
         } else {
             // Mix lemmas (~94%) and chunks (~6%) in frequency order
-            newPool = activeLexical.filter { item in
+            let newPool = activeLexical.filter { item in
                 let rec = records[item.id]
                 return (rec?.meetingsCount ?? 0) == 0 && !(rec?.isHeldBackControl ?? false)
             }.sorted { lhs, rhs in
@@ -168,34 +214,34 @@ public struct SessionScheduler: Sendable {
                 let rhsScore = rhs.itemType == .chunk ? rhs.rankIndex * 18 : rhs.rankIndex
                 return lhsScore < rhsScore
             }
+            selectedNewItemsRaw = Array(newPool.prefix(targetNewCount))
         }
-        let selectedNewItems = Array(newPool.prefix(targetNewCount))
 
-        // 2. Select Due Items (Rule 3: target 18%-23% combined scheduled word share on ~215 words -> ~30 due items mid-course)
-        // New items appear 3x each, so they occupy (3 * newCount) word slots out of ~215 words.
-        let targetPassageWords = isBootstrap ? 80.0 : 215.0
-        let maxScheduledWordSlots = Int((targetPassageWords * modelEngine.parameters.scheduledShareCap).rounded(.down))
-        let newWordSlots = selectedNewItems.count * modelEngine.parameters.newItemMinOccurrences
-        let rawDueBudget = max(4, min(32, maxScheduledWordSlots - newWordSlots))
-        let adjustedDueBudget = max(3, Int((Double(rawDueBudget) * dueReductionFactor).rounded()))
+        // 2. Select Due Items (Rule 3: from Session 5+, new + due <= 23% of target length, no per-passage floor)
+        let targetPassageWords = isBootstrap ? 60 : 215
+        let maxScheduledWordSlots = isBootstrap
+            ? 24 // Bootstrap has no scheduled share limit (p. 8)
+            : Int((Double(targetPassageWords) * modelEngine.parameters.scheduledShareCap).rounded(.down))
+        let newWordSlots = selectedNewItemsRaw.count * modelEngine.parameters.newItemMinOccurrences
+        let rawDueBudget = isBootstrap
+            ? 12
+            : max(0, min(32, maxScheduledWordSlots - newWordSlots))
+        let adjustedDueBudget = max(0, Int((Double(rawDueBudget) * dueReductionFactor).rounded()))
 
-        let selectedDueItems: [SyllabusItem]
-        if profile.studyMode == .groupBSchedulerOff {
+        let selectedDueItemsRaw: [SyllabusItem]
+        if adjustedDueBudget == 0 {
+            selectedDueItemsRaw = []
+        } else if profile.studyMode == .groupBSchedulerOff {
             // Group B (Control): NO forgetting timing — sample met items in natural frequency order
             let metLexical = activeLexical.filter { item in
                 guard let rec = records[item.id] else { return false }
                 return rec.meetingsCount > 0 && !rec.isHeldBackControl
             }.sorted { $0.rankIndex < $1.rankIndex }
-            let strideStart = (passageIndexInSession * adjustedDueBudget) % max(1, metLexical.count)
+            let strideStart = (passageIndexInSession * max(1, adjustedDueBudget)) % max(1, metLexical.count)
             let rotated = Array(metLexical.dropFirst(strideStart)) + Array(metLexical.prefix(strideStart))
-            selectedDueItems = Array(rotated.prefix(min(adjustedDueBudget, metLexical.count)))
+            selectedDueItemsRaw = Array(rotated.prefix(min(adjustedDueBudget, metLexical.count)))
         } else {
             // Group A / Solo Pilot / Stage 1: Forgetting-timed due priority!
-            // Priority order:
-            //   (a) Doubt extra-meeting items flagged this session
-            //   (b) Items in the golden retrieval window p in [0.70, 0.85]
-            //   (c) Overdue items p < 0.70 (sorted closest to recovery first so they aren't lost)
-            //   (d) Spacing milestones (1, 2, 4, 8, 16 sessions since last meeting)
             let spacingIntervals: Set<Int> = [1, 2, 4, 8, 16]
             let scoredDue: [(SyllabusItem, Double)] = activeLexical.compactMap { item in
                 guard let rec = records[item.id], rec.meetingsCount > 0, !rec.isHeldBackControl else { return nil }
@@ -218,10 +264,30 @@ public struct SessionScheduler: Sendable {
                 }
                 return (item, priority)
             }
-            selectedDueItems = scoredDue
+            selectedDueItemsRaw = scoredDue
                 .sorted { $0.1 > $1.1 }
                 .prefix(adjustedDueBudget)
                 .map(\.0)
+        }
+
+        // Step 1 Zero-Cost Feasibility Check (Protocol p. 7):
+        // From Session 5+, 3 uses of each new item + 1 use of each due item must fit inside 23% of target length.
+        // If they do not, split the lists across two passages (excess remains in queue for the next passage).
+        let selectedNewItems: [SyllabusItem]
+        let selectedDueItems: [SyllabusItem]
+        if isBootstrap {
+            selectedNewItems = selectedNewItemsRaw
+            selectedDueItems = selectedDueItemsRaw
+        } else {
+            let feasible = Self.enforceFeasibility(
+                newItems: selectedNewItemsRaw,
+                dueItems: selectedDueItemsRaw,
+                targetWords: targetPassageWords,
+                scheduledShareCap: modelEngine.parameters.scheduledShareCap,
+                minNewOccurrences: modelEngine.parameters.newItemMinOccurrences
+            )
+            selectedNewItems = feasible.newItems
+            selectedDueItems = feasible.dueItems
         }
 
         // 3. Select Assigned Grammar Patterns (1-2 per passage matching current week, Rule 6)
@@ -238,31 +304,35 @@ public struct SessionScheduler: Sendable {
         let selectedGrammar = Array(weekGrammarCandidates.prefix(isBootstrap ? 1 : 2))
 
         // 4. Compute Allowed Closed Vocabulary Set (Rule 1)
+        // Revised protocol (pp. 6–8):
+        //  - Bootstrap (Sessions 1–4): NOTHING is pre-loaded as Known! Allowed core (>=80%) is strictly
+        //    items met so far + passage due/new lists (+ names/numbers). Remaining <=20% must be glossed
+        //    transparent cognates (`transparentCognateLemmas`).
+        //  - Full Contract (Sessions 5+): Known + Learning(p > 85%) + due list + new list (+ names/numbers) = 100%.
         var allowedSet: Set<String> = []
+        var learningCandidates: [SyllabusItem] = []
+        let scheduledIds = Set((selectedDueItems + selectedNewItems).map(\.id))
+
         for item in activeLexical {
-            if let rec = records[item.id], modelEngine.isSafeUnscheduledVocabulary(record: rec, at: now) {
-                allowedSet.insert(item.spanish.lowercased())
-            }
-        }
-        // During Sessions 1–4 Bootstrap (or any fresh learner with < 80 safe lemmas, e.g. Stage 1 Session 1),
-        // include the 240 curated bootstrap lemmas (core function words, basic verbs, and transparent cognates)
-        // so the generator has a real beginner vocabulary to form natural Spanish sentences while still
-        // spacing today's 6 newItems 3x each!
-        if isBootstrap || allowedSet.count < 80 {
-            for item in activeLexical where item.isBootstrap {
-                allowedSet.insert(item.spanish.lowercased())
-            }
-        } else {
-            // Keep already-met bootstrap glue words safe so early post-bootstrap sessions never stall
-            // waiting for "el / de / la / y / ser" to cross the 7-day Known half-life threshold.
-            for item in activeLexical where item.isBootstrap {
-                if (records[item.id]?.meetingsCount ?? 0) > 0 {
+            guard let rec = records[item.id] else { continue }
+            if isBootstrap {
+                if rec.meetingsCount > 0 {
                     allowedSet.insert(item.spanish.lowercased())
                 }
+            } else if modelEngine.isSafeUnscheduledVocabulary(record: rec, at: now) {
+                allowedSet.insert(item.spanish.lowercased())
+            }
+            if rec.state == .learning && !scheduledIds.contains(item.id) && learningCandidates.count < 15 {
+                learningCandidates.append(item)
             }
         }
         for item in selectedDueItems { allowedSet.insert(item.spanish.lowercased()) }
         for item in selectedNewItems { allowedSet.insert(item.spanish.lowercased()) }
+
+        // Transparent cognates available as glossed <=20% remainder during Bootstrap Sessions 1–4
+        let transparentCognates: [String] = isBootstrap
+            ? activeLexical.filter { $0.isTransparentCognate }.map { $0.spanish.lowercased() }
+            : []
 
         // Prior neighbor words for Rule 4 prompt guidance
         var priorMap: [String: [String]] = [:]
@@ -290,8 +360,34 @@ public struct SessionScheduler: Sendable {
             holdoutBannedLemmas: holdoutItems.map(\.spanish),
             voice: voice,
             accent: accent,
-            priorContextWordsByItem: priorMap
+            priorContextWordsByItem: priorMap,
+            learningProbeCandidates: learningCandidates,
+            transparentCognateLemmas: transparentCognates
         )
+    }
+
+    /// Step 1 Feasibility Check (Protocol p. 7, zero model calls):
+    /// Ensures `minNewOccurrences * newItems.count + dueItems.count <= floor(scheduledShareCap * targetWords)`.
+    /// If not, trims due items first (and new items only if needed) so the overflow naturally splits to the next passage.
+    public static func enforceFeasibility(
+        newItems: [SyllabusItem],
+        dueItems: [SyllabusItem],
+        targetWords: Int = 215,
+        scheduledShareCap: Double = 0.23,
+        minNewOccurrences: Int = 3
+    ) -> (newItems: [SyllabusItem], dueItems: [SyllabusItem], didSplit: Bool) {
+        let maxSlots = max(0, Int((Double(targetWords) * scheduledShareCap).rounded(.down)))
+        let needed = newItems.count * minNewOccurrences + dueItems.count
+        if needed <= maxSlots {
+            return (newItems, dueItems, false)
+        }
+        var keptNew = newItems
+        if keptNew.count * minNewOccurrences > maxSlots {
+            keptNew = Array(keptNew.prefix(maxSlots / max(1, minNewOccurrences)))
+        }
+        let remainingForDue = max(0, maxSlots - keptNew.count * minNewOccurrences)
+        let keptDue = Array(dueItems.prefix(remainingForDue))
+        return (keptNew, keptDue, true)
     }
 
     /// Selects under-practiced lemmas from the top-2,000 productive coverage target (< 2 correct uses)

@@ -603,8 +603,8 @@ public struct HardwareSettingsView: View {
 
             LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
                 paramBadge("Due Threshold", "≤\(Int(p.dueRecallThreshold * 100))%")
-                paramBadge("Scheduled Cap", "\(Int(p.scheduledShareFloor * 100))–\(Int(p.scheduledShareCap * 100))%")
-                paramBadge("Weak Pass", "×\(String(format: "%.2f", p.weakSuccessMultiplier))")
+                paramBadge("Scheduled Cap", "≤\(Int(p.scheduledShareCap * 100))%")
+                paramBadge("Weak Pass", "×\(String(format: "%.2f", p.weakSuccessMultiplier)) (≤\(p.maxWeakSuccessUpdatesPerSession)/sess)")
                 paramBadge("Strong Pass", "×\(String(format: "%.2f", p.strongSuccessMultiplier))")
                 paramBadge("Failure", "×\(String(format: "%.2f", p.failureMultiplier))")
                 paramBadge("Doubt Pace", ">\(String(format: "%.1f", p.doubtPaceMultiplier))× med.")

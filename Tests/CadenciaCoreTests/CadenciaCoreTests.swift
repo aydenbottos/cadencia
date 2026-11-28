@@ -386,15 +386,52 @@ final class CadenciaCoreTests: XCTestCase {
         XCTAssertEqual(stitched.wordTimings[1].startTime, 1.1, accuracy: 1e-3)
     }
 
-    // MARK: - 9. Session 1 Bootstrap Contract Verification & Greedy Rule 2 Spacing Regression
+    // MARK: - 9. Revised 16-Page Protocol Compliance (Weak Cap, Feasibility, Bootstrap, Full Contract & Reserve Fallback)
 
-    func testSession1BootstrapPlanPassesStageAAndGreedySpacing() async throws {
-        // Greedy spaced-subsequence helper must allow natural extra uses of high-frequency words
-        // while still rejecting crammed occurrences.
-        XCTAssertEqual(ContractVerifier.maxSpacedOccurrences(positions: [3, 15, 29, 32, 48], minSpacing: 8), 4)
-        XCTAssertEqual(ContractVerifier.maxSpacedOccurrences(positions: [3, 5, 7], minSpacing: 8), 1)
-        XCTAssertEqual(ContractVerifier.maxSpacedOccurrences(positions: [2, 10, 12, 18], minSpacing: 6), 3)
+    func testRevisedProtocolWeakCapFeasibilityBootstrapAndFullContract() async throws {
+        // 1. Weak-success cap: at most 3 updates per item per session (Revised Protocol p. 6)
+        let modelEngine = LearnerModelEngine(parameters: .protocolDefaults)
+        let funcItem = SyllabusItem(
+            id: "lem_de", itemType: .lemma, rankIndex: 2, spanish: "de", englishGloss: "of",
+            pos: "ADP", cefr: .a1, ipaEs: "de", ipaLatam: "de",
+            isTransparentCognate: false, cognateScore: 0.0, isBootstrap: true, isHoldout: false,
+            isTop2000ProductiveTarget: true, zipfFrequency: 7.5, visualSymbol: "link"
+        )
+        var rec = LearnerItemRecord(learnerId: "u_cap", itemId: funcItem.id, halfLifeDays: modelEngine.initialHalfLifeDays(isTransparentCognate: false))
+        for i in 0..<3 {
+            rec = modelEngine.apply(outcome: .passedNormalPace, to: rec, item: funcItem, sessionNumber: 1, wasEarOnly: false, weakSuccessesThisSession: i).updated
+        }
+        let hAfterThree = rec.halfLifeDays
+        let successesAfterThree = rec.successesCount
+        XCTAssertEqual(successesAfterThree, 3)
 
+        // 4th & 5th weak successes in the SAME session MUST NOT grow halfLifeDays or successesCount!
+        let fourth = modelEngine.apply(outcome: .passedNormalPace, to: rec, item: funcItem, sessionNumber: 1, wasEarOnly: true, weakSuccessesThisSession: 3).updated
+        XCTAssertEqual(fourth.halfLifeDays, hAfterThree, accuracy: 1e-6, "4th weak success in same session must be capped")
+        XCTAssertEqual(fourth.successesCount, 3, "Capped weak success must not increment successesCount")
+        XCTAssertEqual(fourth.earSuccessesCount, 0, "Capped weak success must not grant ear credit")
+
+        // Strong success (probeCorrect) is NOT blocked by the weak-success cap!
+        let strong = modelEngine.apply(outcome: .probeCorrect, to: fourth, item: funcItem, sessionNumber: 1, wasEarOnly: false, weakSuccessesThisSession: 3).updated
+        XCTAssertGreaterThan(strong.halfLifeDays, hAfterThree)
+
+        // 2. Step 1 Zero-Cost Feasibility Check: 3*new + due <= floor(0.23 * 215) = 49
+        let dummyNew = (0..<6).map { i in
+            SyllabusItem(id: "n\(i)", itemType: .lemma, rankIndex: i, spanish: "nuevo\(i)", englishGloss: "new", pos: "NOUN", cefr: .a1, ipaEs: "", ipaLatam: "", isTransparentCognate: false, cognateScore: 0, isBootstrap: false, isHoldout: false, isTop2000ProductiveTarget: false, zipfFrequency: 4, visualSymbol: "star")
+        }
+        let dummyDue = (0..<40).map { i in
+            SyllabusItem(id: "d\(i)", itemType: .lemma, rankIndex: 100 + i, spanish: "due\(i)", englishGloss: "due", pos: "NOUN", cefr: .a1, ipaEs: "", ipaLatam: "", isTransparentCognate: false, cognateScore: 0, isBootstrap: false, isHoldout: false, isTop2000ProductiveTarget: false, zipfFrequency: 4, visualSymbol: "star")
+        }
+        let feasible = SessionScheduler.enforceFeasibility(newItems: dummyNew, dueItems: dummyDue, targetWords: 215, scheduledShareCap: 0.23, minNewOccurrences: 3)
+        XCTAssertTrue(feasible.didSplit, "6*3 + 40 = 58 > 49 must trigger Step 1 split")
+        XCTAssertEqual(feasible.newItems.count, 6)
+        XCTAssertEqual(feasible.dueItems.count, 31, "49 - 18 = 31 due items fit inside 23% of 215 words")
+
+        // 3. Greedy Rule 2 spaced-subsequence helper (extra uses are free and never fail)
+        XCTAssertEqual(ContractVerifier.maxSpacedOccurrences(positions: [3, 35, 68, 72, 110], minSpacing: 30), 4)
+        XCTAssertEqual(ContractVerifier.maxSpacedOccurrences(positions: [3, 15, 28], minSpacing: 30), 1)
+
+        // 4. Hour 0 Session 1 Bootstrap Plan + Stage A against real cadencia_seed.sqlite
         let tmpURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("cadencia_boot_test_\(UUID().uuidString).sqlite")
         defer { try? FileManager.default.removeItem(at: tmpURL) }
@@ -406,28 +443,20 @@ final class CadenciaCoreTests: XCTestCase {
         let genres = try await db.loadSerialGenres()
         let lemmatizer = SpanishLemmatizer(inflections: inflections, chunkItems: activeItems.filter { $0.itemType == .chunk })
 
-        let profile = LearnerProfile(
-            learnerId: "boot_tester",
-            codedGroupLabel: "SOLO-0001",
-            displayName: "Tester",
-            studyMode: .soloPilot,
-            selectedSerialId: genres.first?.id ?? "madrid_noir",
-            nonfictionTopics: ["Architecture"],
-            currentSessionNumber: 1,
-            totalLoggedSeconds: 0,
-            medianReadingWPM: 75,
-            parameters: .protocolDefaults,
-            createdAt: Date()
-        )
+        let analytics = ResearchAnalyticsEngine()
+        let (h0Profile, h0Records) = analytics.buildSimulatedLearnerState(atHour: 0, allItems: activeItems)
+        XCTAssertEqual(h0Profile.currentSessionNumber, 1)
+        XCTAssertEqual(h0Records.values.filter { $0.meetingsCount > 0 }.count, 0, "Hour 0 must have 0 pre-loaded Known/met items")
+
         let scheduler = SessionScheduler(parameters: .protocolDefaults)
         let plan = scheduler.planNextPassage(
-            profile: profile,
+            profile: h0Profile,
             blockType: .input1,
             passageIndexInSession: 0,
             newItemsRemainingInSession: 60,
             allItems: activeItems,
             holdoutItems: holdoutItems,
-            records: [:],
+            records: h0Records,
             priorContextByItem: [:],
             serialGenre: genres.first!,
             serialEpisodeNumber: 0,
@@ -436,39 +465,61 @@ final class CadenciaCoreTests: XCTestCase {
 
         XCTAssertTrue(plan.isBootstrap)
         XCTAssertTrue(plan.dueItems.isEmpty)
-        XCTAssertEqual(plan.newItems.count, 6)
-        XCTAssertGreaterThanOrEqual(plan.allowedKnownLemmas.count, 200, "Session 1 Bootstrap must allow the 240 foundation bootstrap lemmas")
+        XCTAssertEqual(plan.newItems.count, 8, "Bootstrap allows up to 8 new items per passage")
+        XCTAssertEqual(plan.allowedKnownLemmas.count, 8, "Nothing pre-loaded as Known: only the 8 new items are in allowedKnownLemmas")
+        XCTAssertGreaterThan(plan.transparentCognateLemmas.count, 1000, "Bootstrap provides transparent cognates for <=20% glossed remainder")
 
-        // Realistic 9-sentence Session 1 Bootstrap micro-story introducing el, de, la, que, en, y
-        let rawSentences = [
-            "Clara está en la parte principal de Madrid.",
-            "El grupo es grande y muy especial.",
-            "Ella ve que el proyecto tiene valor.",
-            "La historia de la familia es importante.",
-            "Mateo entra en el momento que importa.",
-            "Hay una persona local y real aquí.",
-            "El programa está en el centro de estudio.",
-            "Clara sabe que la idea es posible.",
-            "Ellos hablan de todo y ven la información.",
+        // Build a 7-sentence Bootstrap micro-story (each <=8 words) using the 8 interleaved new items >=3 sentences each
+        // + proper names + 1 glossed transparent cognate ("hotel"), verifying >=80% core & 0 non-cognate off-list words!
+        let newWords = plan.newItems.map(\.spanish)
+        let w = { (idx: Int) -> String in newWords[min(idx, newWords.count - 1)] }
+        let rawBootstrapSentences = [
+            "Clara \(w(0)) \(w(1)) \(w(2)) \(w(3)) \(w(4)) \(w(5)) Madrid.",
+            "Mateo \(w(6)) \(w(7)) \(w(0)) \(w(1)) \(w(2)) hotel.",
+            "Ana \(w(3)) \(w(4)) \(w(5)) \(w(6)) \(w(7)) Madrid.",
+            "Pedro \(w(0)) \(w(1)) \(w(2)) \(w(3)) \(w(4)) hotel.",
+            "Laura \(w(5)) \(w(6)) \(w(7)) \(w(0)) \(w(1)) Madrid.",
+            "Pablo \(w(2)) \(w(3)) \(w(4)) \(w(5)) \(w(6)) \(w(7)).",
+            "Elena \(w(0)) \(w(2)) \(w(4)) \(w(6)) Madrid.",
         ]
-        let sentences = rawSentences.enumerated().map { idx, es in
-            PassageSentence(id: idx, spanish: es, englishLine: "Line \(idx)", wordTokens: lemmatizer.extractWordTokens(es))
+        let bootSentences = rawBootstrapSentences.enumerated().map { idx, es in
+            PassageSentence(id: idx, spanish: es, englishLine: "Line \(idx)", wordTokens: lemmatizer.extractWordTokens(es), visualSymbol: "sparkles")
         }
-        let fullText = rawSentences.joined(separator: " ")
-
         let verifier = ContractVerifier(lemmatizer: lemmatizer, parameters: .protocolDefaults)
-        let report = verifier.verifyStageA(
-            passageText: fullText,
-            sentences: sentences,
+        let bootReport = verifier.verifyStageA(
+            passageText: rawBootstrapSentences.joined(separator: " "),
+            sentences: bootSentences,
             plan: plan,
-            priorContextByItem: [:]
+            priorContextByItem: [:],
+            glossedTransparentCognates: ["hotel"]
         )
-
         XCTAssertTrue(
-            report.passed,
-            "Session 1 Bootstrap micro-story MUST pass Stage A! Violations: \(report.violations.map { "\($0.ruleName): \($0.detail) [\($0.offendingTokens.joined(separator: ", "))]" }.joined(separator: " | "))"
+            bootReport.passed,
+            "Bootstrap Contract MUST pass Stage A with >=80% met/new/names, <=20% glossed cognates, 6-10 sentences <=8 words, no share cap! Violations: \(bootReport.violations.map { "\($0.ruleName): \($0.detail) [\($0.offendingTokens.joined(separator: ", "))]" }.joined(separator: " | "))"
         )
-        XCTAssertTrue(report.holdoutLeaks.isEmpty)
+        XCTAssertGreaterThan(bootReport.scheduledWordShare, 0.50, "Session 1 scheduled share starts high with NO cap")
+
+        // Verify Step 6 Reserve Passages contain ZERO hold-out leaks
+        let holdoutSet = Set(holdoutItems.map { $0.spanish.lowercased() })
+        for isBoot in [true, false] {
+            for pIdx in 0..<2 {
+                let resPlan = PassagePlan(
+                    passageId: "res_\(isBoot)_\(pIdx)", sessionNumber: isBoot ? 1 : 10, passageIndexInSession: pIdx,
+                    blockType: .input1, isBootstrap: isBoot, isAudioFirst: false, targetWPM: 100,
+                    format: isBoot ? .bootstrapMicroStory : .serialEpisode, topicOrEpisodeTitle: "Reserve",
+                    storySummarySoFar: "", dueItems: [], newItems: [], grammarPatterns: [],
+                    allowedKnownLemmas: [], holdoutBannedLemmas: Array(holdoutSet),
+                    voice: .celia, accent: .castilian, priorContextWordsByItem: [:]
+                )
+                let reserve = ReservePassageBank.selectReserve(for: resPlan, lemmatizer: lemmatizer, generatorCallsUsed: 3)
+                XCTAssertTrue(reserve.isReserveFallback)
+                XCTAssertEqual(reserve.generatorCallsUsed, 3)
+                let toks = lemmatizer.analyze(reserve.fullText)
+                let leaks = toks.filter { holdoutSet.contains($0.lemma.lowercased()) }.map(\.surface)
+                XCTAssertTrue(leaks.isEmpty, "Reserve passage \(reserve.titleEs) leaked hold-out words: \(leaks)")
+            }
+        }
+
         XCTAssertEqual(PhononComputeMode.fastCPU.rawValue, "cpu")
     }
 }

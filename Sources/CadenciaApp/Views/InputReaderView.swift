@@ -235,7 +235,9 @@ public struct InputReaderView: View {
                     // Passage masthead
                     VStack(alignment: .leading, spacing: 6) {
                         HStack {
-                            Text(passage.format == .serialEpisode ? "SERIAL EPISODE" : (passage.isBootstrap ? "BOOTSTRAP" : "NON-FICTION"))
+                            Text(passage.isReserveFallback
+                                 ? (passage.isBootstrap ? "BOOTSTRAP · RESERVE" : "RESERVE PASSAGE")
+                                 : (passage.format == .serialEpisode ? "SERIAL EPISODE" : (passage.isBootstrap ? "BOOTSTRAP" : "NON-FICTION")))
                                 .font(CadenciaFont.mono(10, weight: .bold))
                                 .tracking(2)
                                 .foregroundStyle(CadenciaPalette.saffronGold)
@@ -266,32 +268,36 @@ public struct InputReaderView: View {
                         }
                     }
 
-                    // Probes section
-                    if controller.showingProbes || passage.isAudioFirst {
-                        probesSection(passage)
-                    } else {
-                        Button {
-                            HapticDirector.shared.playGlossTap()
-                            withAnimation(.spring(response: 0.45)) {
-                                controller.proceedToProbes()
+                    // Probes section (Rule 5: fewer eligible items means fewer probes, and none means none!)
+                    if !passage.probes.isEmpty {
+                        if controller.showingProbes || passage.isAudioFirst {
+                            probesSection(passage)
+                        } else {
+                            Button {
+                                HapticDirector.shared.playGlossTap()
+                                withAnimation(.spring(response: 0.45)) {
+                                    controller.proceedToProbes()
+                                }
+                            } label: {
+                                HStack {
+                                    Text(passage.probes.first?.isPictureMatch == true
+                                         ? "Continue to Picture-Match Probes (\(passage.probes.count))"
+                                         : "Continue to Comprehension Probes (\(passage.probes.count))")
+                                        .font(.headline)
+                                    Spacer()
+                                    Image(systemName: "arrow.right")
+                                }
+                                .padding(.horizontal, 22)
+                                .padding(.vertical, 16)
+                                .foregroundStyle(CadenciaPalette.obsidian)
+                                .background(CadenciaPalette.saffronGold, in: Capsule())
                             }
-                        } label: {
-                            HStack {
-                                Text("Continue to Comprehension Probes (\(passage.probes.count))")
-                                    .font(.headline)
-                                Spacer()
-                                Image(systemName: "arrow.right")
-                            }
-                            .padding(.horizontal, 22)
-                            .padding(.vertical, 16)
-                            .foregroundStyle(CadenciaPalette.obsidian)
-                            .background(CadenciaPalette.saffronGold, in: Capsule())
+                            .buttonStyle(.plain)
+                            .padding(.top, 8)
                         }
-                        .buttonStyle(.plain)
-                        .padding(.top, 8)
                     }
 
-                    if !passage.probes.isEmpty && controller.probeAnswers.count >= passage.probes.count {
+                    if passage.probes.isEmpty || controller.probeAnswers.count >= passage.probes.count {
                         Button {
                             HapticDirector.shared.playStrongSuccess()
                             Task { await controller.completeCurrentPassageAndAdvance() }
@@ -339,7 +345,17 @@ public struct InputReaderView: View {
         let isReplayed = controller.replayedSentenceIndices.contains(sentence.id)
 
         return VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .top, spacing: 8) {
+            HStack(alignment: .top, spacing: 10) {
+                // Bootstrap Sessions 1-4: every sentence carries a visual picture cue (Revised Protocol p. 8)
+                if isBootstrap {
+                    let symbolName = (sentence.visualSymbol?.isEmpty == false ? sentence.visualSymbol! : "sparkles")
+                    Image(systemName: symbolName)
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(CadenciaPalette.saffronGold)
+                        .frame(width: 34, height: 34)
+                        .background(CadenciaPalette.saffronGold.opacity(0.16), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                }
+
                 WrappingWordsView(
                     words: rawWords,
                     startingIndex: startingWordIndex,
@@ -384,11 +400,12 @@ public struct InputReaderView: View {
         .cadenciaGlassCard(cornerRadius: 20, tint: isReplayed ? CadenciaPalette.saffronGold : nil)
     }
 
-    // MARK: - Load-Bearing Comprehension Probes (Rule 5)
+    // MARK: - Load-Bearing & Bootstrap Picture-Matching Probes (Rule 5)
 
     private func probesSection(_ passage: GeneratedPassage) -> some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Label("LOAD-BEARING PROBES", systemImage: "scope")
+        let hasPictureProbes = passage.probes.contains(where: \.isPictureMatch)
+        return VStack(alignment: .leading, spacing: 16) {
+            Label(hasPictureProbes ? "PICTURE-MATCHING PROBES" : "LOAD-BEARING PROBES", systemImage: hasPictureProbes ? "photo.on.rectangle.angled" : "scope")
                 .font(CadenciaFont.mono(11, weight: .bold))
                 .tracking(2)
                 .foregroundStyle(CadenciaPalette.saffronGold)
@@ -396,42 +413,103 @@ public struct InputReaderView: View {
             ForEach(passage.probes) { probe in
                 let chosen = controller.probeAnswers[probe.id]
                 VStack(alignment: .leading, spacing: 12) {
-                    Text(probe.questionEn)
-                        .font(CadenciaFont.uiTitle(16))
-                        .foregroundStyle(CadenciaPalette.ivoryText)
-
-                    ForEach(Array(probe.options.enumerated()), id: \.offset) { idx, opt in
-                        let isChosen = chosen == idx
-                        let isCorrect = idx == probe.correctOptionIndex
-                        let bg: Color = {
-                            guard chosen != nil else { return Color.white.opacity(0.07) }
-                            if isCorrect { return CadenciaPalette.mediterraneanJade.opacity(0.28) }
-                            if isChosen { return CadenciaPalette.crimsonAlert.opacity(0.28) }
-                            return Color.white.opacity(0.04)
-                        }()
-
-                        Button {
-                            Task { await controller.selectProbeOption(probe: probe, optionIndex: idx) }
-                        } label: {
-                            HStack {
-                                Text(opt)
-                                    .font(.subheadline)
-                                    .foregroundStyle(CadenciaPalette.ivoryText)
-                                    .multilineTextAlignment(.leading)
-                                Spacer()
-                                if chosen != nil && isCorrect {
-                                    Image(systemName: "checkmark.circle.fill")
-                                        .foregroundStyle(CadenciaPalette.mediterraneanJade)
-                                } else if isChosen && !isCorrect {
-                                    Image(systemName: "xmark.circle.fill")
-                                        .foregroundStyle(CadenciaPalette.crimsonAlert)
+                    HStack(spacing: 8) {
+                        Text(probe.questionEn)
+                            .font(CadenciaFont.uiTitle(16))
+                            .foregroundStyle(CadenciaPalette.ivoryText)
+                        if probe.isPictureMatch {
+                            Spacer()
+                            Button {
+                                Task {
+                                    await controller.speakSpanishLine(
+                                        probe.targetDueLemma,
+                                        voice: passage.voice,
+                                        accent: passage.accent
+                                    )
                                 }
+                            } label: {
+                                Image(systemName: "speaker.wave.2.fill")
+                                    .font(.caption.weight(.bold))
+                                    .foregroundStyle(CadenciaPalette.saffronGold)
+                                    .frame(width: 32, height: 32)
+                                    .background(CadenciaPalette.saffronGold.opacity(0.16), in: Circle())
                             }
-                            .padding(13)
-                            .background(bg, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                            .buttonStyle(.plain)
                         }
-                        .buttonStyle(.plain)
-                        .disabled(chosen != nil)
+                    }
+
+                    if probe.isPictureMatch {
+                        let symbols = probe.optionSymbols ?? []
+                        LazyVGrid(columns: [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)], spacing: 10) {
+                            ForEach(Array(probe.options.enumerated()), id: \.offset) { idx, opt in
+                                let isChosen = chosen == idx
+                                let isCorrect = idx == probe.correctOptionIndex
+                                let bg: Color = {
+                                    guard chosen != nil else { return Color.white.opacity(0.07) }
+                                    if isCorrect { return CadenciaPalette.mediterraneanJade.opacity(0.28) }
+                                    if isChosen { return CadenciaPalette.crimsonAlert.opacity(0.28) }
+                                    return Color.white.opacity(0.04)
+                                }()
+                                let icon = idx < symbols.count && !symbols[idx].isEmpty ? symbols[idx] : "sparkles"
+
+                                Button {
+                                    Task { await controller.selectProbeOption(probe: probe, optionIndex: idx) }
+                                } label: {
+                                    VStack(spacing: 8) {
+                                        Image(systemName: icon)
+                                            .font(.system(size: 26, weight: .semibold))
+                                            .foregroundStyle(
+                                                chosen != nil && isCorrect ? CadenciaPalette.mediterraneanJade :
+                                                (isChosen && !isCorrect ? CadenciaPalette.crimsonAlert : CadenciaPalette.saffronGold)
+                                            )
+                                        Text(opt)
+                                            .font(.subheadline.weight(.semibold))
+                                            .foregroundStyle(CadenciaPalette.ivoryText)
+                                            .multilineTextAlignment(.center)
+                                            .lineLimit(2)
+                                    }
+                                    .frame(maxWidth: .infinity, minHeight: 84)
+                                    .padding(10)
+                                    .background(bg, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                                }
+                                .buttonStyle(.plain)
+                                .disabled(chosen != nil)
+                            }
+                        }
+                    } else {
+                        ForEach(Array(probe.options.enumerated()), id: \.offset) { idx, opt in
+                            let isChosen = chosen == idx
+                            let isCorrect = idx == probe.correctOptionIndex
+                            let bg: Color = {
+                                guard chosen != nil else { return Color.white.opacity(0.07) }
+                                if isCorrect { return CadenciaPalette.mediterraneanJade.opacity(0.28) }
+                                if isChosen { return CadenciaPalette.crimsonAlert.opacity(0.28) }
+                                return Color.white.opacity(0.04)
+                            }()
+
+                            Button {
+                                Task { await controller.selectProbeOption(probe: probe, optionIndex: idx) }
+                            } label: {
+                                HStack {
+                                    Text(opt)
+                                        .font(.subheadline)
+                                        .foregroundStyle(CadenciaPalette.ivoryText)
+                                        .multilineTextAlignment(.leading)
+                                    Spacer()
+                                    if chosen != nil && isCorrect {
+                                        Image(systemName: "checkmark.circle.fill")
+                                            .foregroundStyle(CadenciaPalette.mediterraneanJade)
+                                    } else if isChosen && !isCorrect {
+                                        Image(systemName: "xmark.circle.fill")
+                                            .foregroundStyle(CadenciaPalette.crimsonAlert)
+                                    }
+                                }
+                                .padding(13)
+                                .background(bg, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(chosen != nil)
+                        }
                     }
 
                     if chosen != nil {

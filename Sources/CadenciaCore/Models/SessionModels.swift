@@ -278,6 +278,10 @@ public struct PassagePlan: Codable, Sendable {
     public let voice: TutorVoice
     public let accent: SpanishRegionalAccent
     public let priorContextWordsByItem: [String: [String]]
+    /// Rule 5 tier-3 probe candidates (Learning items with p > 85% or already met, used if due + new < 2).
+    public let learningProbeCandidates: [SyllabusItem]
+    /// Transparent cognates allowed as the glossed <=20% remainder in Bootstrap Sessions 1–4.
+    public let transparentCognateLemmas: [String]
 
     public init(
         passageId: String,
@@ -297,7 +301,9 @@ public struct PassagePlan: Codable, Sendable {
         holdoutBannedLemmas: [String],
         voice: TutorVoice,
         accent: SpanishRegionalAccent,
-        priorContextWordsByItem: [String: [String]]
+        priorContextWordsByItem: [String: [String]],
+        learningProbeCandidates: [SyllabusItem] = [],
+        transparentCognateLemmas: [String] = []
     ) {
         self.passageId = passageId
         self.sessionNumber = sessionNumber
@@ -317,6 +323,21 @@ public struct PassagePlan: Codable, Sendable {
         self.voice = voice
         self.accent = accent
         self.priorContextWordsByItem = priorContextWordsByItem
+        self.learningProbeCandidates = learningProbeCandidates
+        self.transparentCognateLemmas = transparentCognateLemmas
+    }
+
+    /// Rule 5 target probe items in strict protocol priority order:
+    /// due list first -> new list -> Learning items in context.
+    public var eligibleProbeTargets: [SyllabusItem] {
+        var seen: Set<String> = []
+        var out: [SyllabusItem] = []
+        for item in dueItems + newItems + learningProbeCandidates {
+            if seen.insert(item.id).inserted {
+                out.append(item)
+            }
+        }
+        return out
     }
 }
 
@@ -344,6 +365,9 @@ public struct PassageProbe: Identifiable, Codable, Sendable, Hashable {
     public let options: [String]
     public let correctOptionIndex: Int
     public let hingeExplanation: String
+    /// Bootstrap Rule 5: picture-matching probe on new items when the due list is empty.
+    public let isPictureMatch: Bool
+    public let optionSymbols: [String]?
 
     public init(
         id: String,
@@ -352,7 +376,9 @@ public struct PassageProbe: Identifiable, Codable, Sendable, Hashable {
         questionEn: String,
         options: [String],
         correctOptionIndex: Int,
-        hingeExplanation: String
+        hingeExplanation: String,
+        isPictureMatch: Bool = false,
+        optionSymbols: [String]? = nil
     ) {
         self.id = id
         self.targetDueItemId = targetDueItemId
@@ -361,6 +387,21 @@ public struct PassageProbe: Identifiable, Codable, Sendable, Hashable {
         self.options = options
         self.correctOptionIndex = correctOptionIndex
         self.hingeExplanation = hingeExplanation
+        self.isPictureMatch = isPictureMatch
+        self.optionSymbols = optionSymbols
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try c.decode(String.self, forKey: .id)
+        self.targetDueItemId = try c.decode(String.self, forKey: .targetDueItemId)
+        self.targetDueLemma = try c.decode(String.self, forKey: .targetDueLemma)
+        self.questionEn = try c.decode(String.self, forKey: .questionEn)
+        self.options = try c.decode([String].self, forKey: .options)
+        self.correctOptionIndex = try c.decode(Int.self, forKey: .correctOptionIndex)
+        self.hingeExplanation = try c.decode(String.self, forKey: .hingeExplanation)
+        self.isPictureMatch = (try? c.decode(Bool.self, forKey: .isPictureMatch)) ?? false
+        self.optionSymbols = try? c.decode([String].self, forKey: .optionSymbols)
     }
 }
 
@@ -398,12 +439,24 @@ public struct PassageSentence: Identifiable, Codable, Sendable, Hashable {
     public let spanish: String
     public let englishLine: String? // Shown on tap in Bootstrap Sessions 1-4
     public let wordTokens: [String]
+    /// SF Symbol visual illustration for Bootstrap Sessions 1-4 ("each with a picture and an English line on tap").
+    public let visualSymbol: String?
 
-    public init(id: Int, spanish: String, englishLine: String?, wordTokens: [String]) {
+    public init(id: Int, spanish: String, englishLine: String?, wordTokens: [String], visualSymbol: String? = nil) {
         self.id = id
         self.spanish = spanish
         self.englishLine = englishLine
         self.wordTokens = wordTokens
+        self.visualSymbol = visualSymbol
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try c.decode(Int.self, forKey: .id)
+        self.spanish = try c.decode(String.self, forKey: .spanish)
+        self.englishLine = try? c.decode(String.self, forKey: .englishLine)
+        self.wordTokens = try c.decode([String].self, forKey: .wordTokens)
+        self.visualSymbol = try? c.decode(String.self, forKey: .visualSymbol)
     }
 }
 
@@ -430,6 +483,8 @@ public struct GeneratedPassage: Identifiable, Codable, Sendable {
     public let isAudioFirst: Bool
     public let isBootstrap: Bool
     public let rewriteAttempts: Int
+    public let generatorCallsUsed: Int
+    public let isReserveFallback: Bool
     public let dueListWasReduced: Bool
     public let scheduledWordShare: Double
     public let flaggedForNativeAudit: Bool
@@ -458,6 +513,8 @@ public struct GeneratedPassage: Identifiable, Codable, Sendable {
         isAudioFirst: Bool,
         isBootstrap: Bool,
         rewriteAttempts: Int,
+        generatorCallsUsed: Int? = nil,
+        isReserveFallback: Bool = false,
         dueListWasReduced: Bool,
         scheduledWordShare: Double,
         flaggedForNativeAudit: Bool,
@@ -485,10 +542,44 @@ public struct GeneratedPassage: Identifiable, Codable, Sendable {
         self.isAudioFirst = isAudioFirst
         self.isBootstrap = isBootstrap
         self.rewriteAttempts = rewriteAttempts
+        self.generatorCallsUsed = generatorCallsUsed ?? (rewriteAttempts + 1)
+        self.isReserveFallback = isReserveFallback
         self.dueListWasReduced = dueListWasReduced
         self.scheduledWordShare = scheduledWordShare
         self.flaggedForNativeAudit = flaggedForNativeAudit
         self.createdAt = createdAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try c.decode(String.self, forKey: .id)
+        self.sessionNumber = try c.decode(Int.self, forKey: .sessionNumber)
+        self.blockType = try c.decode(SessionBlockType.self, forKey: .blockType)
+        self.format = try c.decode(PassageFormat.self, forKey: .format)
+        self.titleEs = try c.decode(String.self, forKey: .titleEs)
+        self.titleEn = try c.decode(String.self, forKey: .titleEn)
+        self.episodeSummaryForNext = try c.decode(String.self, forKey: .episodeSummaryForNext)
+        self.sentences = try c.decode([PassageSentence].self, forKey: .sentences)
+        self.fullText = try c.decode(String.self, forKey: .fullText)
+        self.wordCount = try c.decode(Int.self, forKey: .wordCount)
+        self.newItemGlosses = try c.decode([NewItemGloss].self, forKey: .newItemGlosses)
+        self.probes = try c.decode([PassageProbe].self, forKey: .probes)
+        self.grammarNotes = try c.decode([GrammarMicroNote].self, forKey: .grammarNotes)
+        self.dueItemIds = try c.decode([String].self, forKey: .dueItemIds)
+        self.newItemIds = try c.decode([String].self, forKey: .newItemIds)
+        self.grammarItemIds = try c.decode([String].self, forKey: .grammarItemIds)
+        self.voice = try c.decode(TutorVoice.self, forKey: .voice)
+        self.accent = try c.decode(SpanishRegionalAccent.self, forKey: .accent)
+        self.targetWPM = try c.decode(Int.self, forKey: .targetWPM)
+        self.isAudioFirst = try c.decode(Bool.self, forKey: .isAudioFirst)
+        self.isBootstrap = try c.decode(Bool.self, forKey: .isBootstrap)
+        self.rewriteAttempts = try c.decode(Int.self, forKey: .rewriteAttempts)
+        self.generatorCallsUsed = (try? c.decode(Int.self, forKey: .generatorCallsUsed)) ?? (self.rewriteAttempts + 1)
+        self.isReserveFallback = (try? c.decode(Bool.self, forKey: .isReserveFallback)) ?? false
+        self.dueListWasReduced = try c.decode(Bool.self, forKey: .dueListWasReduced)
+        self.scheduledWordShare = try c.decode(Double.self, forKey: .scheduledWordShare)
+        self.flaggedForNativeAudit = try c.decode(Bool.self, forKey: .flaggedForNativeAudit)
+        self.createdAt = try c.decode(Date.self, forKey: .createdAt)
     }
 }
 
@@ -497,12 +588,20 @@ public struct ContractViolation: Codable, Sendable, Hashable {
     public let ruleName: String
     public let detail: String
     public let offendingTokens: [String]
+    public let offendingSentenceIndices: [Int]
 
-    public init(ruleNumber: Int, ruleName: String, detail: String, offendingTokens: [String]) {
+    public init(
+        ruleNumber: Int,
+        ruleName: String,
+        detail: String,
+        offendingTokens: [String],
+        offendingSentenceIndices: [Int] = []
+    ) {
         self.ruleNumber = ruleNumber
         self.ruleName = ruleName
         self.detail = detail
         self.offendingTokens = offendingTokens
+        self.offendingSentenceIndices = offendingSentenceIndices
     }
 }
 
@@ -519,6 +618,32 @@ public struct VerificationReport: Codable, Sendable {
     public let stageBPassed: Bool
     public let stageBFeedback: String?
     public let violations: [ContractViolation]
+
+    /// True when the failure stemmed from overcrowding (protocol Step 5: only cut due list by 25% on overcrowding!).
+    public var isOvercrowdingFailure: Bool {
+        violations.contains { v in
+            v.ruleName.localizedCaseInsensitiveContains("Scheduled Share")
+                || v.ruleName.localizedCaseInsensitiveContains("Length")
+                || v.ruleName.localizedCaseInsensitiveContains("Due Items Coverage")
+                || v.ruleName.localizedCaseInsensitiveContains("Fresh Context")
+        }
+    }
+
+    /// Canonical violation fingerprint for Step 6 ("same violation twice in a row skips straight to fallback").
+    public var violationSignature: String {
+        violations
+            .map { v in
+                let toks = v.offendingTokens.prefix(5).sorted().joined(separator: ",")
+                return "\(v.ruleNumber):\(v.ruleName):\(toks)"
+            }
+            .sorted()
+            .joined(separator: "|")
+    }
+
+    /// Deduplicated 0-based sentence indices needing targeted repair in Step 4.
+    public var offendingSentenceIndices: [Int] {
+        Array(Set(violations.flatMap(\.offendingSentenceIndices))).sorted()
+    }
 
     public init(
         passed: Bool,

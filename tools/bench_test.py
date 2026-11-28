@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """
-Cadencia Stage 0 Bench Test CLI (Signal-Starvation Hypothesis Protocol p. 10).
+Cadencia Stage 0 Bench Test CLI (Revised 16-Page Signal-Starvation Protocol, pp. 6–10).
 
-Stress-tests the GPT-6.1 Terra Generator + Stage A/B Verifier contract across
-5 simulated learner states (hours 2, 10, 20, 35, and 50) without spending human
+Stress-tests the 6-step GPT-6.1 Terra Generator + Stage A/B Verifier pipeline across
+5 simulated learner states (hours 0, 10, 20, 35, and 50) without spending human
 participant hours. Evaluates the formal Stage 0 Gate:
-  - >= 95% of passages pass ALL contract rules within <= 3 rewrites
-  - >= 20% average scheduled-item word share
+  - >= 95% of passages pass ALL contract rules within <= 3 generator calls
+  - Scheduled word share averages >= 20% across hours 10 to 35
+  - Hour 0 runs on the Bootstrap Contract (6-10 sentences <=8 words, >=80% met/new/names,
+    <=20% glossed transparent cognates, <=8 new items in >=3 sentences, no spacing/share limit)
+  - Hours 10-50 run on the Full Contract (180-250 words, 100% closed vocab, greedy Rule 2
+    3x30w spacing with free extra uses, Rule 3 <=23% cap with NO per-passage floor)
 
 API Key Safety:
   Read strictly from the `OPENAI_API_KEY` environment variable (never hardcoded).
@@ -20,27 +24,24 @@ API Key Safety:
 import argparse
 import concurrent.futures
 import json
+import math
 import os
 import re
 import sqlite3
-import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Set, Tuple
 
 ROOT = Path(__file__).resolve().parent.parent
 SEED_DB = ROOT / "Sources" / "CadenciaCore" / "Resources" / "cadencia_seed.sqlite"
 MODEL_ID = "gpt-6.1-terra"
 
 WORD_RE = re.compile(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]+", re.UNICODE)
-FUNCTION_STOP = {
-    "el", "la", "los", "las", "un", "una", "unos", "unas", "de", "del", "a", "al",
-    "y", "o", "en", "con", "por", "para", "que", "se", "no", "es", "son", "su", "sus",
-    "me", "te", "le", "les", "lo", "nos", "mi", "tu", "más", "pero", "si", "sí", "ya",
-    "muy", "también", "como", "cuando", "donde", "este", "esta", "esto", "ese", "esa",
-    "hay", "ser", "estar", "tener", "hacer", "ir", "yo", "tú", "él", "ella", "nosotros",
-    "ellos", "ellas", "usted", "ustedes", "sin", "sobre", "entre", "hasta", "desde",
+PROPER_NAMES = {
+    "clara", "mateo", "lucía", "lucia", "tomás", "tomas", "ana", "pedro", "maría", "maria",
+    "juan", "carlos", "elena", "diego", "sofía", "sofia", "marta", "pablo", "laura",
+    "madrid", "barcelona", "sevilla", "valencia", "oaxaca", "patagonia", "españa", "méxico",
 }
 
 PASSAGE_JSON_SCHEMA = {
@@ -56,8 +57,9 @@ PASSAGE_JSON_SCHEMA = {
                 "properties": {
                     "spanish": {"type": "string"},
                     "englishLine": {"type": "string"},
+                    "visualSymbol": {"type": ["string", "null"]},
                 },
-                "required": ["spanish", "englishLine"],
+                "required": ["spanish", "englishLine", "visualSymbol"],
                 "additionalProperties": False,
             },
         },
@@ -75,6 +77,18 @@ PASSAGE_JSON_SCHEMA = {
                 "additionalProperties": False,
             },
         },
+        "transparentCognateGlosses": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "spanish": {"type": "string"},
+                    "englishGloss": {"type": "string"},
+                },
+                "required": ["spanish", "englishGloss"],
+                "additionalProperties": False,
+            },
+        },
         "probes": {
             "type": "array",
             "items": {
@@ -86,10 +100,11 @@ PASSAGE_JSON_SCHEMA = {
                     "options": {"type": "array", "items": {"type": "string"}},
                     "correctOptionIndex": {"type": "integer"},
                     "hingeExplanation": {"type": "string"},
+                    "isPictureMatch": {"type": "boolean"},
                 },
                 "required": [
                     "targetDueItemId", "targetDueLemma", "questionEn",
-                    "options", "correctOptionIndex", "hingeExplanation",
+                    "options", "correctOptionIndex", "hingeExplanation", "isPictureMatch",
                 ],
                 "additionalProperties": False,
             },
@@ -97,7 +112,7 @@ PASSAGE_JSON_SCHEMA = {
     },
     "required": [
         "titleEs", "titleEn", "episodeSummaryForNext",
-        "sentences", "newItemGlosses", "probes",
+        "sentences", "newItemGlosses", "transparentCognateGlosses", "probes",
     ],
     "additionalProperties": False,
 }
@@ -107,6 +122,7 @@ PASSAGE_JSON_SCHEMA = {
 class SeedBank:
     active_items: List[Dict]
     holdout_lemmas: Set[str]
+    transparent_cognates: Set[str]
     inflections: Dict[str, str]
     grammar_items: List[Dict]
 
@@ -117,7 +133,8 @@ def load_seed_bank(db_path: Path) -> SeedBank:
     active = [
         dict(r)
         for r in conn.execute(
-            "SELECT item_id, item_type, rank_index, spanish, english_gloss, is_transparent_cognate, grammar_week "
+            "SELECT item_id, item_type, rank_index, spanish, english_gloss, pos, "
+            "is_transparent_cognate, is_bootstrap, grammar_week "
             "FROM syllabus_items WHERE is_holdout = 0 ORDER BY rank_index"
         )
     ]
@@ -125,20 +142,28 @@ def load_seed_bank(db_path: Path) -> SeedBank:
         r["spanish"].lower()
         for r in conn.execute("SELECT spanish FROM syllabus_items WHERE is_holdout = 1")
     }
+    cognates = {
+        it["spanish"].lower() for it in active if it["is_transparent_cognate"] == 1
+    }
     inflections = {
         r["surface"].lower(): r["lemma"].lower()
         for r in conn.execute("SELECT surface, lemma FROM spanish_inflections")
     }
     grammar = [it for it in active if it["item_type"] == "grammar"]
     conn.close()
-    return SeedBank(active_items=active, holdout_lemmas=holdout, inflections=inflections, grammar_items=grammar)
+    return SeedBank(
+        active_items=active,
+        holdout_lemmas=holdout,
+        transparent_cognates=cognates,
+        inflections=inflections,
+        grammar_items=grammar,
+    )
 
 
 def lemmatize_word(surface: str, inflections: Dict[str, str]) -> str:
     low = surface.lower()
     if low in inflections:
         return inflections[low]
-    # Strip common enclitic pronouns on infinitives/gerunds
     for clitic in ("melo", "mela", "telo", "tela", "selo", "sela", "nos", "les", "las", "los", "me", "te", "se", "lo", "la", "le"):
         if len(low) > len(clitic) + 3 and low.endswith(clitic):
             stem = low[: -len(clitic)]
@@ -147,128 +172,232 @@ def lemmatize_word(surface: str, inflections: Dict[str, str]) -> str:
     return low
 
 
+def max_spaced_occurrences(positions: List[int], min_spacing: int) -> int:
+    """Greedy spaced-subsequence count (Rule 2: 3 uses >= 30 words apart; extra uses are free)."""
+    count = 0
+    last = -10**9
+    for p in sorted(positions):
+        if p - last >= min_spacing:
+            count += 1
+            last = p
+    return count
+
+
+def enforce_feasibility(new_items: List[Dict], due_items: List[Dict], target_words: int = 215) -> Tuple[List[Dict], List[Dict]]:
+    """Step 1 zero-cost feasibility check: 3*new + due <= floor(0.23 * target_words)."""
+    max_slots = int(math.floor(0.23 * target_words))
+    kept_new = list(new_items)
+    if len(kept_new) * 3 > max_slots:
+        kept_new = kept_new[: max_slots // 3]
+    rem_due = max(0, max_slots - len(kept_new) * 3)
+    kept_due = list(due_items[:rem_due])
+    return kept_new, kept_due
+
+
+def is_contraction_allowed(surface: str, lemma: str, allowed_set: Set[str]) -> bool:
+    if surface == "al":
+        return ("a" in allowed_set and "el" in allowed_set) or "al" in allowed_set
+    if surface == "del":
+        return ("de" in allowed_set and "el" in allowed_set) or "del" in allowed_set
+    if surface in ("los", "las"):
+        return "el" in allowed_set or "la" in allowed_set
+    if surface in ("un", "una", "unos", "unas"):
+        return "un" in allowed_set or "uno" in allowed_set
+    return (lemma == "uno" and "un" in allowed_set) or (lemma == "un" and "uno" in allowed_set)
+
+
 def verify_stage_a(
     passage: Dict,
     due_items: List[Dict],
     new_items: List[Dict],
     allowed_lemmas: Set[str],
-    holdout_lemmas: Set[str],
-    inflections: Dict[str, str],
-) -> Tuple[bool, List[str], Dict[str, float]]:
-    """Deterministic local Stage A Verifier matching ContractVerifier.swift Rules 1–4."""
-    full_text = " ".join(s["spanish"] for s in passage["sentences"])
-    words = WORD_RE.findall(full_text)
-    total_words = len(words)
+    bank: SeedBank,
+    is_bootstrap: bool,
+) -> Tuple[bool, List[str], Dict[str, float], bool]:
+    """Deterministic local Stage A Verifier matching revised ContractVerifier.swift."""
+    sentences = passage.get("sentences", [])
     violations: List[str] = []
+    overcrowding = False
 
-    if total_words < 175 or total_words > 265:
-        violations.append(f"Word count {total_words} outside 180–250 range.")
+    words: List[str] = []
+    lemmas: List[str] = []
+    word_sents: List[int] = []
+    sent_word_counts: List[int] = []
 
-    lemmas = [lemmatize_word(w, inflections) for w in words]
+    for s_idx, s in enumerate(sentences):
+        sw = WORD_RE.findall(s["spanish"])
+        sent_word_counts.append(len(sw))
+        for w in sw:
+            words.append(w)
+            lemmas.append(lemmatize_word(w, bank.inflections))
+            word_sents.append(s_idx)
+
+    total_words = len(words)
+
+    if is_bootstrap:
+        if len(sentences) < 6 or len(sentences) > 10:
+            violations.append(f"Bootstrap sentence count {len(sentences)} outside 6–10.")
+        overlong = [i + 1 for i, c in enumerate(sent_word_counts) if c > 8]
+        if overlong:
+            violations.append(f"Bootstrap sentences exceeding 8 words: {overlong}")
+    else:
+        if total_words < 180 or total_words > 250:
+            violations.append(f"Word count {total_words} outside 180–250 range.")
+            overcrowding = True
+
     due_set = {it["spanish"].lower() for it in due_items}
     new_set = {it["spanish"].lower() for it in new_items}
     scheduled_set = due_set | new_set
+    full_allowed = allowed_lemmas | scheduled_set
+    glossed_cogs = {g["spanish"].lower() for g in passage.get("transparentCognateGlosses", [])}
+    cog_pool = bank.transparent_cognates | glossed_cogs
 
-    # Rule 1: Closed vocabulary + zero hold-out leak
-    holdout_hits = [w for w, l in zip(words, lemmas) if l in holdout_lemmas]
+    holdout_hits = [w for w, l in zip(words, lemmas) if l in bank.holdout_lemmas and l not in full_allowed]
     if holdout_hits:
         violations.append(f"Rule 1 HOLDOUT LEAK: {holdout_hits[:5]}")
 
-    unknowns = []
+    core_ok = 0
+    off_list = []
+    non_cog_off = []
     for idx, (w, l) in enumerate(zip(words, lemmas)):
-        if l in allowed_lemmas or l in scheduled_set or l in FUNCTION_STOP:
-            continue
-        # Allow capitalized proper names mid-sentence
-        if idx > 0 and w[0].isupper():
-            continue
-        unknowns.append(f"{w}({l})")
+        low = w.lower()
+        is_name = low in PROPER_NAMES or (idx > 0 and w[0].isupper() and low not in bank.inflections)
+        if is_name or l in full_allowed or low in full_allowed or is_contraction_allowed(low, l, full_allowed):
+            core_ok += 1
+        else:
+            off_list.append(f"{w}({l})")
+            if is_bootstrap and not (l in cog_pool or low in cog_pool):
+                non_cog_off.append(f"{w}({l})")
 
-    closed_compliance = 1.0 - (len(unknowns) / max(1, total_words))
-    if closed_compliance < 0.96:
-        violations.append(
-            f"Rule 1 Closed Vocab ({closed_compliance*100:.1f}% < 96%): unapproved tokens {unknowns[:8]}"
-        )
+    closed_compliance = core_ok / max(1, total_words)
+    if is_bootstrap:
+        if closed_compliance < 0.80:
+            violations.append(f"Rule 1 Bootstrap compliance {closed_compliance*100:.1f}% < 80%: {off_list[:8]}")
+        if non_cog_off:
+            violations.append(f"Rule 1 Bootstrap non-cognate off-list words: {non_cog_off[:8]}")
+    else:
+        if closed_compliance < 1.0:
+            violations.append(f"Rule 1 Closed Vocab ({closed_compliance*100:.1f}% < 100%): {off_list[:10]}")
 
-    # Rule 2: New items >= 3 occurrences separated by >= 30 words
+    # Rule 2: New items (empty passes automatically)
     for it in new_items:
         target = it["spanish"].lower()
-        positions = [i for i, l in enumerate(lemmas) if l == target]
-        if len(positions) < 3:
-            violations.append(f"Rule 2 New item '{target}' appeared {len(positions)}x (need >=3).")
-        elif any((positions[k + 1] - positions[k]) < 25 for k in range(len(positions) - 1)):
-            violations.append(f"Rule 2 New item '{target}' spacing too tight: {positions}.")
+        positions = [i for i, (w, l) in enumerate(zip(words, lemmas)) if l == target or w.lower() == target]
+        if is_bootstrap:
+            distinct_sents = {word_sents[i] for i in positions}
+            if len(distinct_sents) < 3:
+                violations.append(f"Rule 2 Bootstrap new item '{target}' in {len(distinct_sents)}/3 sentences.")
+        else:
+            if len(positions) < 3:
+                violations.append(f"Rule 2 New item '{target}' appeared {len(positions)}x (need >=3).")
+            elif max_spaced_occurrences(positions, 30) < 3:
+                violations.append(f"Rule 2 New item '{target}' lacks 3 uses >=30 words apart: {positions}.")
 
-    # Rule 3: Due coverage & scheduled word share <= 23%
-    missing_due = [d for d in due_set if d not in set(lemmas)]
+    # Rule 3: Due coverage & scheduled word share <= 23% (no lower limit; no limit in Bootstrap)
+    missing_due = [d for d in due_set if d not in set(lemmas) and d not in {w.lower() for w in words}]
     if missing_due:
         violations.append(f"Rule 3 Missing due items: {missing_due[:6]}")
+        overcrowding = True
 
-    sched_count = sum(1 for l in lemmas if l in scheduled_set)
+    sched_count = sum(1 for w, l in zip(words, lemmas) if l in scheduled_set or w.lower() in scheduled_set)
     sched_share = sched_count / max(1, total_words)
-    if sched_share > 0.25:
-        violations.append(f"Rule 3 Scheduled share {sched_share*100:.1f}% > 23% cap.")
+    if not is_bootstrap and scheduled_set and sched_share > 0.2305:
+        violations.append(f"Rule 3 Scheduled share {sched_share*100:.1f}% > 23.0% cap.")
+        overcrowding = True
 
-    # Probes check
-    if len(passage.get("probes", [])) < 2:
-        violations.append("Rule 5 Needs 2–3 load-bearing probes.")
+    # Rule 5: Probes (empty eligible targets -> 0 allowed)
+    eligible_count = len(due_items) + len(new_items)
+    needed_probes = min(2, eligible_count)
+    if len(passage.get("probes", [])) < needed_probes:
+        violations.append(f"Rule 5 Needs at least {needed_probes} probe(s).")
 
     metrics = {
         "total_words": float(total_words),
         "closed_compliance": closed_compliance,
         "scheduled_share": sched_share,
     }
-    return len(violations) == 0, violations, metrics
+    return len(violations) == 0, violations, metrics, overcrowding
 
 
-def simulate_state_plan(bank: SeedBank, hour: int, idx: int) -> Tuple[List[Dict], List[Dict], Set[str]]:
+def simulate_state_plan(bank: SeedBank, hour: int, idx: int) -> Tuple[List[Dict], List[Dict], Set[str], bool]:
     lexical = [it for it in bank.active_items if it["item_type"] in ("lemma", "chunk")]
-    met_map = {2: 150, 10: 720, 20: 1650, 35: 2900, 50: 4150}
-    met_n = min(len(lexical) - 10, met_map.get(hour, 1650))
+    is_bootstrap = hour == 0
+    if is_bootstrap:
+        boot = [it for it in lexical if it["is_bootstrap"] == 1]
+        core = [it for it in boot if it["is_transparent_cognate"] == 0]
+        cogs = [it for it in boot if it["is_transparent_cognate"] == 1]
+        verbs = [it for it in core if it["pos"] in ("VERB", "AUX")]
+        offset = idx * 5
+        chosen = []
+        if idx == 0 and verbs:
+            chosen.append(verbs[0])
+        for it in core[offset : offset + 5]:
+            if it not in chosen and len(chosen) < 5:
+                chosen.append(it)
+        for it in cogs[(idx * 3) : (idx * 3) + 3]:
+            if it not in chosen and len(chosen) < 8:
+                chosen.append(it)
+        allowed = {it["spanish"].lower() for it in chosen}
+        return [], chosen, allowed, True
 
+    met_map = {10: 720, 20: 1650, 35: 2900, 50: 4150}
+    met_n = min(len(lexical) - 10, met_map.get(hour, 1650))
     known_slice = lexical[:met_n]
     unmet_slice = lexical[met_n:]
 
-    # Pick 4 new items and 14 due items rotated by idx
     new_items = unmet_slice[(idx * 4) % max(1, len(unmet_slice) - 4) : (idx * 4) % max(1, len(unmet_slice) - 4) + 4]
     due_pool = [it for i, it in enumerate(known_slice) if i % 7 == (idx % 7)]
-    due_items = due_pool[:14]
+    due_items = due_pool[:30]
+    new_items, due_items = enforce_feasibility(new_items, due_items, target_words=215)
     allowed = {it["spanish"].lower() for it in known_slice}
-    return due_items, new_items, allowed
+    return due_items, new_items, allowed, False
 
 
 def run_one_passage(client, bank: SeedBank, hour: int, idx: int) -> Dict:
-    due_items, new_items, allowed = simulate_state_plan(bank, hour, idx)
+    due_items, new_items, allowed, is_bootstrap = simulate_state_plan(bank, hour, idx)
     feedback = ""
+    prev_sig = None
     last_metrics = {"total_words": 0.0, "closed_compliance": 0.0, "scheduled_share": 0.0}
 
-    for attempt in range(4):
+    # Exact max-3-generator-call pipeline (Protocol pp. 7–8)
+    for call_num in (1, 2, 3):
+        effort = "low" if (call_num == 1 and is_bootstrap) else ("medium" if call_num <= 2 else "high")
         due_str = ", ".join(f"{it['item_id']}:{it['spanish']}" for it in due_items)
         new_str = ", ".join(f"{it['item_id']}:{it['spanish']} ({it['english_gloss']})" for it in new_items)
-        allowed_sample = ", ".join(sorted(list(allowed))[:350])
+        allowed_sample = ", ".join(sorted(list(allowed))[:500])
 
-        instructions = (
-            "You are Cadencia's Spanish Acquisition Passage Generator (Signal-Starvation Protocol). "
-            "Write a compelling 180-250 word natural Spanish story episode obeying ALL 6 contract rules:\n"
-            "1. Closed vocabulary: ONLY use words from ALLOWED_VOCAB, DUE_ITEMS, NEW_ITEMS, and standard Spanish function words. NEVER use BANNED holdout words.\n"
-            "2. Every NEW_ITEM must appear at least 3 times, spaced >= 30 words apart, with rich contextual clues.\n"
-            "3. Every DUE_ITEM must appear at least once; keep combined due+new tokens between 18% and 23% of total words.\n"
-            "4. Include 2-3 load-bearing English comprehension probes that hinge on DUE_ITEMS."
-        )
+        if is_bootstrap:
+            instructions = (
+                "Write a Bootstrap micro-story (6-10 sentences, EACH strictly <=8 words) with visualSymbol and englishLine:\n"
+                "1. >=80% of words MUST come from ALLOWED_VOCAB + NEW_ITEMS + proper names; remaining <=20% MUST be glossed transparent cognates.\n"
+                "2. Every NEW_ITEM appears in >=3 different sentences (no spacing limit, no upper limit).\n"
+                "3. Include 2 picture-matching probes (`isPictureMatch: true`) on NEW_ITEMS."
+            )
+        else:
+            instructions = (
+                "Write a 180-250 word natural Spanish story obeying ALL rules:\n"
+                "1. 100% Closed vocabulary: ONLY use words from ALLOWED_VOCAB, DUE_ITEMS, NEW_ITEMS, and names/numbers. NEVER use BANNED holdout words.\n"
+                "2. Every NEW_ITEM appears >=3x with 3 uses >=30 words apart (extra uses are free).\n"
+                "3. Every DUE_ITEM appears >=1x; combined due+new tokens <=23% of total words (no lower limit).\n"
+                "4. Include 2-3 load-bearing English probes hinging on DUE_ITEMS first, then NEW_ITEMS."
+            )
         user_msg = (
-            f"SIMULATED HOUR: {hour} | PASSAGE #{idx+1}\n"
-            f"NEW_ITEMS (each >=3x, >=30 words apart): {new_str}\n"
-            f"DUE_ITEMS (each >=1x): {due_str}\n"
-            f"ALLOWED_VOCAB SAMPLE: {allowed_sample}\n"
+            f"SIMULATED HOUR: {hour} ({'BOOTSTRAP' if is_bootstrap else 'FULL'}) | PASSAGE #{idx+1}\n"
+            f"NEW_ITEMS: {new_str}\n"
+            f"DUE_ITEMS: {due_str or 'None'}\n"
+            f"ALLOWED_VOCAB: {allowed_sample}\n"
             f"BANNED HOLDOUT SAMPLE: {', '.join(sorted(list(bank.holdout_lemmas))[:60])}\n"
         )
+        if is_bootstrap:
+            user_msg += f"TRANSPARENT COGNATES: {', '.join(sorted(list(bank.transparent_cognates))[:180])}\n"
         if feedback:
-            user_msg += f"\nREWRITE FIXES REQUIRED FROM PREVIOUS ATTEMPT:\n{feedback}"
+            user_msg += f"\n{feedback}"
 
         resp = client.responses.create(
             model=MODEL_ID,
             instructions=instructions,
             input=[{"role": "user", "content": user_msg}],
-            reasoning={"effort": "medium" if attempt == 0 else "high"},
+            reasoning={"effort": effort},
             text={
                 "format": {
                     "type": "json_schema",
@@ -278,31 +407,31 @@ def run_one_passage(client, bank: SeedBank, hour: int, idx: int) -> Dict:
                 }
             },
         )
-        raw_text = resp.output_text
-        passage = json.loads(raw_text)
-        passed, violations, metrics = verify_stage_a(
-            passage, due_items, new_items, allowed, bank.holdout_lemmas, bank.inflections
+        passage = json.loads(resp.output_text)
+        passed, violations, metrics, overcrowding = verify_stage_a(
+            passage, due_items, new_items, allowed, bank, is_bootstrap
         )
         last_metrics = metrics
         if passed:
-            return {
-                "hour": hour,
-                "passed": True,
-                "rewrites": attempt,
-                **metrics,
-            }
-        feedback = "\n".join(f"- {v}" for v in violations)
+            return {"hour": hour, "passed": True, "calls": call_num, **metrics}
 
-    return {
-        "hour": hour,
-        "passed": False,
-        "rewrites": 3,
-        **last_metrics,
-    }
+        sig = "|".join(sorted(violations))
+        if call_num == 2 and prev_sig == sig:
+            break  # Step 6 early exit on repeated violation!
+        prev_sig = sig
+
+        if call_num == 1:
+            feedback = "STEP 4 TARGETED REPAIR — Rewrite ONLY offending sentences:\n" + "\n".join(f"- {v}" for v in violations)
+        elif call_num == 2:
+            if due_items and overcrowding:
+                due_items = due_items[: max(1, int(len(due_items) * 0.75))]
+            feedback = "STEP 5 HIGH-EFFORT REGENERATION — Fix all violations:\n" + "\n".join(f"- {v}" for v in violations)
+
+    return {"hour": hour, "passed": False, "calls": 3, **last_metrics}
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Cadencia Stage 0 Bench Test CLI (GPT-6.1 Terra)")
+    parser = argparse.ArgumentParser(description="Cadencia Stage 0 Bench Test CLI (Revised Protocol)")
     parser.add_argument("--passages-per-hour", type=int, default=4, help="Passages per simulated hour (200 = full 1,000-passage cert)")
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--dry-run", action="store_true", help="Verify local SQLite seed & Stage A verifier without calling OpenAI")
@@ -313,8 +442,9 @@ def main() -> None:
     print(f"Loaded Cadencia seed bank: {len(bank.active_items)} active, {len(bank.holdout_lemmas)} holdout, {len(bank.inflections)} inflections.")
 
     if args.dry_run:
-        due, new, allowed = simulate_state_plan(bank, 20, 0)
-        print(f"Dry-run check OK: Hour 20 plan has {len(due)} due, {len(new)} new, {len(allowed)} allowed lemmas.")
+        due0, new0, allowed0, boot0 = simulate_state_plan(bank, 0, 0)
+        due20, new20, allowed20, boot20 = simulate_state_plan(bank, 20, 0)
+        print(f"Dry-run check OK: Hour 0 bootstrap={boot0} ({len(new0)} new, {len(due0)} due, {len(allowed0)} allowed) | Hour 20 plan has {len(due20)} due, {len(new20)} new, {len(allowed20)} allowed lemmas.")
         return
 
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
@@ -324,7 +454,7 @@ def main() -> None:
     from openai import OpenAI
     client = OpenAI(api_key=api_key)
 
-    hours = [2, 10, 20, 35, 50]
+    hours = [0, 10, 20, 35, 50]
     tasks = [(h, i) for h in hours for i in range(args.passages_per_hour)]
     print(f"Launching Stage 0 Bench Test: {len(tasks)} passages across hours {hours} using {MODEL_ID}…")
 
@@ -337,23 +467,24 @@ def main() -> None:
             results.append(res)
             status = "PASS" if res["passed"] else "FAIL"
             print(
-                f"  [H={res['hour']:2d}] {status} | rewrites={res['rewrites']} | "
+                f"  [H={res['hour']:2d}] {status} | calls={res['calls']}/3 | "
                 f"words={int(res['total_words'])} | closed={res['closed_compliance']*100:.1f}% | "
                 f"share={res['scheduled_share']*100:.1f}%"
             )
 
     pass_rate = sum(1 for r in results if r["passed"]) / max(1, len(results))
-    avg_share = sum(r["scheduled_share"] for r in results) / max(1, len(results))
-    avg_rewrites = sum(r["rewrites"] for r in results) / max(1, len(results))
-    gate_passed = pass_rate >= 0.95 and avg_share >= 0.20
+    mid_results = [r for r in results if 10 <= r["hour"] <= 35]
+    mid_share = sum(r["scheduled_share"] for r in mid_results) / max(1, len(mid_results))
+    avg_calls = sum(r["calls"] for r in results) / max(1, len(results))
+    gate_passed = pass_rate >= 0.95 and mid_share >= 0.20
 
     summary = {
         "model": MODEL_ID,
         "total_passages": len(results),
         "elapsed_seconds": round(time.time() - t0, 1),
-        "overall_pass_rate": round(pass_rate, 4),
-        "overall_scheduled_share": round(avg_share, 4),
-        "average_rewrites": round(avg_rewrites, 2),
+        "overall_pass_rate_within_3_calls": round(pass_rate, 4),
+        "hours_10_to_35_avg_scheduled_share": round(mid_share, 4),
+        "average_generator_calls": round(avg_calls, 2),
         "stage0_gate_passed": gate_passed,
         "per_hour": {
             str(h): {

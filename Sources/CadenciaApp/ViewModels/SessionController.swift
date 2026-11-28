@@ -39,7 +39,8 @@ public final class SessionController {
 
     // Input 1 & Input 2 state
     public var currentPassage: GeneratedPassage?
-    public var prefetchedNextPassage: GeneratedPassage?
+    /// Look-ahead passage buffer (Revised Protocol p. 8: "Passages are generated a few ahead of the learner, so a retry never stalls a session").
+    public var prefetchedPassageQueue: [GeneratedPassage] = []
     public var currentAudioClip: SynthesizedAudioClip?
     public var isGeneratingPassage: Bool = false
     public var generationStatusText: String = ""
@@ -86,6 +87,10 @@ public final class SessionController {
 
     private var passageCounterInSession: Int = 0
     private var introducedItemIdsThisSession: [String] = []
+    /// Tracks weak-success updates per item in this session (Revised Protocol p. 6: cap at 3/session).
+    private var weakSuccessCountsThisSession: [String: Int] = [:]
+    /// Tracks distinct bootstrap sentences each new item appeared in during this session (Rule 2 Bootstrap).
+    private var sessionSentenceCountsByItemId: [String: Int] = [:]
     private var activeBlockTask: Task<Void, Never>?
     private var playbackHighlightTask: Task<Void, Never>?
     private var prefetchTask: Task<Void, Never>?
@@ -120,6 +125,7 @@ public final class SessionController {
         activeBlockTask = nil
         prefetchTask?.cancel()
         prefetchTask = nil
+        prefetchedPassageQueue.removeAll()
         timerTask?.cancel()
         timerTask = nil
         playbackHighlightTask?.cancel()
@@ -277,15 +283,15 @@ public final class SessionController {
         audioFirstTextRevealed = false
         highlightedWordIndex = -1
 
-        if let ready = prefetchedNextPassage, ready.blockType == block {
-            prefetchedNextPassage = nil
+        if let readyIdx = prefetchedPassageQueue.firstIndex(where: { $0.blockType == block }) {
+            let ready = prefetchedPassageQueue.remove(at: readyIdx)
             await presentPassage(ready)
-            prefetchNextPassage(for: block)
+            topUpPrefetchQueue(for: block)
             return
         }
 
         isGeneratingPassage = true
-        generationStatusText = "Scheduling due & new items…"
+        generationStatusText = "Running feasibility check & scheduling items…"
         defer { isGeneratingPassage = false }
 
         do {
@@ -297,7 +303,7 @@ public final class SessionController {
             }
             guard !Task.isCancelled && !isCancelledSession else { return }
             await presentPassage(passage)
-            prefetchNextPassage(for: block)
+            topUpPrefetchQueue(for: block)
         } catch {
             guard !Task.isCancelled && !isCancelledSession else { return }
             errorMessage = error.localizedDescription
@@ -305,14 +311,27 @@ public final class SessionController {
     }
 
     private func prefetchNextPassage(for block: SessionBlockType) {
+        topUpPrefetchQueue(for: block)
+    }
+
+    /// Generates up to 2 passages ahead of the learner in the background so retries never stall a session (Protocol p. 8).
+    private func topUpPrefetchQueue(for block: SessionBlockType, targetAhead: Int = 2) {
+        let alreadyQueued = prefetchedPassageQueue.filter { $0.blockType == block }.count
+        guard alreadyQueued < targetAhead else { return }
         prefetchTask?.cancel()
         prefetchTask = Task { [weak self] in
             guard let self else { return }
-            if let next = try? await self.generateSingleVerifiedPassage(for: block, onProgress: nil) {
+            while !Task.isCancelled && !self.isCancelledSession {
+                let queuedCount = await MainActor.run {
+                    self.prefetchedPassageQueue.filter { $0.blockType == block }.count
+                }
+                if queuedCount >= targetAhead { break }
+                guard let next = try? await self.generateSingleVerifiedPassage(for: block, onProgress: nil) else {
+                    break
+                }
+                if Task.isCancelled || self.isCancelledSession { break }
                 await MainActor.run {
-                    if !Task.isCancelled {
-                        self.prefetchedNextPassage = next
-                    }
+                    self.prefetchedPassageQueue.append(next)
                 }
             }
         }
@@ -329,7 +348,8 @@ public final class SessionController {
             tagline: "", setting: "Madrid", premise: "", accentPalette: "", protagonist: "Clara"
         )
         let serialProg = try await appState.database.loadSerialProgress(learnerId: profile.learnerId, serialId: serial.id)
-        let remainingNew = max(0, targetNewItemsTotal - newItemsIntroducedCount)
+        let queuedNewCount = prefetchedPassageQueue.reduce(0) { $0 + $1.newItemIds.count }
+        let remainingNew = max(0, targetNewItemsTotal - newItemsIntroducedCount - queuedNewCount)
 
         // Load prior neighbor contexts for all currently due candidate items (Rule 4)
         let dueIds = appState.learnerRecords.values.filter { $0.meetingsCount > 0 }.map(\.itemId)
@@ -352,16 +372,31 @@ public final class SessionController {
             storySummarySoFar: serialProg.summary
         )
 
-        let (passage, _) = try await appState.terraClient.generateVerifiedPassage(
+        let (passage, report) = try await appState.terraClient.generateVerifiedPassage(
             plan: plan,
             verifier: verifier,
             priorContextByItem: priorContext,
+            priorSessionSentenceCountsByItemId: sessionSentenceCountsByItemId,
             onProgress: onProgress
         )
 
+        // Revised Protocol Step 6 (p. 8): log generation failure whenever a pre-verified reserve passage is served!
+        if passage.isReserveFallback {
+            let reasons = report.violations.map(\.ruleName).joined(separator: "; ")
+            try? await appState.database.appendEvidence(EvidenceEvent(
+                learnerId: profile.learnerId,
+                sessionId: sessionId,
+                sessionNumber: profile.currentSessionNumber,
+                passageId: passage.id,
+                eventType: .passageFallbackServed,
+                numericValue: Double(passage.generatorCallsUsed),
+                payloadJSON: "{\"callsUsed\":\(passage.generatorCallsUsed),\"violations\":\(jsonEscaped(reasons))}"
+            ))
+        }
+
         passageCounterInSession += 1
         try await appState.database.savePassage(passage, learnerId: profile.learnerId)
-        if passage.format == .serialEpisode {
+        if passage.format == .serialEpisode && !passage.isReserveFallback {
             try await appState.database.updateSerialProgress(
                 learnerId: profile.learnerId,
                 serialId: serial.id,
@@ -496,9 +531,10 @@ public final class SessionController {
             let clue = currentPassage?.newItemGlosses.first(where: { $0.itemId == item.id })?.contextClueNote
             selectedGlossItem = (item, clue, surface)
 
-            // Tapping a brand-new item on its first meeting is expected (meaning supplied); tapping a due/known item is a Failure (x0.5)!
-            let isFirstNew = currentPassage?.newItemIds.contains(item.id) == true && (appState.learnerRecords[item.id]?.meetingsCount ?? 0) == 0
-            if !isFirstNew {
+            // Tapping a brand-new item or glossed transparent cognate on its first meeting is expected (meaning supplied);
+            // tapping an already-met due/known item is a Failure (x0.5)!
+            let isFirstUnmet = (appState.learnerRecords[item.id]?.meetingsCount ?? 0) == 0
+            if !isFirstUnmet {
                 tappedItemIdsInCurrentPassage.insert(item.id)
                 try? await appState.database.appendEvidence(EvidenceEvent(
                     learnerId: profile.learnerId,
@@ -650,6 +686,18 @@ public final class SessionController {
                 isFirstMeetingGlossed: isFirstNew,
                 passageUnderstood: passageUnderstood
             )
+        }
+
+        // Track distinct bootstrap sentence exposures for new items during this session (Bootstrap Rule 2)
+        if passage.isBootstrap {
+            for itemId in passage.newItemIds {
+                guard let item = itemMap[itemId] else { continue }
+                let target = item.spanish.lowercased()
+                let sentHits = passage.sentences.filter { s in
+                    appState.lemmatizer.analyze(s.spanish).contains { $0.lemma.lowercased() == target || $0.normalized == target }
+                }.count
+                sessionSentenceCountsByItemId[itemId, default: 0] += sentHits
+            }
         }
 
         // Persist Rule 4 Fresh Context neighbor words for all tracked items in this passage
@@ -1090,13 +1138,18 @@ public final class SessionController {
             itemId: item.id,
             halfLifeDays: engine.initialHalfLifeDays(isTransparentCognate: item.isTransparentCognate)
         )
+        let priorWeakCount = weakSuccessCountsThisSession[item.id] ?? 0
         let (updated, prevState, predBefore) = engine.apply(
             outcome: outcome,
             to: existing,
             item: item,
             sessionNumber: profile.currentSessionNumber,
-            wasEarOnly: wasEarOnly
+            wasEarOnly: wasEarOnly,
+            weakSuccessesThisSession: priorWeakCount
         )
+        if outcome == .passedNormalPace {
+            weakSuccessCountsThisSession[item.id] = priorWeakCount + 1
+        }
 
         let usable = engine.isUsableEvent(
             predictedRecallBefore: predBefore,

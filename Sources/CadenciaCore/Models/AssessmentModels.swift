@@ -25,6 +25,7 @@ public enum EvidenceEventType: String, Codable, Sendable {
     case nativeListeningAnswered
     case dailyDiaryLogged
     case benchTestRun
+    case passageFallbackServed
 }
 
 public struct EvidenceEvent: Identifiable, Codable, Sendable {

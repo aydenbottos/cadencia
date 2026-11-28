@@ -196,180 +196,264 @@ public actor GPT61TerraClient {
         return parsed.greeting
     }
 
-    // MARK: - 1. Contract-Enforced Passage Generation + 2-Stage Verifier Loop
+    // MARK: - 1. Contract-Enforced Passage Generation (6-Step, Max-3-Generator-Call Pipeline, Protocol pp. 7–8)
 
-    /// Runs the full Generator -> Stage A Local Verifier -> Stage B Second-Model Verifier loop
-    /// with up to 3 rewrites, followed by cutting the due list by 25% and regenerating if needed (PDF p. 7).
+    /// Executes the exact revised 6-step checking & generation pipeline (at most 3 generator calls per passage):
+    ///  1. Zero-cost Feasibility Check: 3*new + due <= 23% of target length (splits excess to queue for next passage).
+    ///  2. Call 1: Generate at standard effort.
+    ///  3. Check by deterministic script (Stage A) FIRST, then second model (Stage B) only once Stage A passes.
+    ///  4. Call 2 (Repair): Send exact violations & offending sentence indices; rewrite ONLY offending sentences.
+    ///     If Call 2 fails with the exact same violation signature as Call 1 -> skip straight to Step 6!
+    ///  5. Call 3 (High-Effort Regen): Regenerate once at `.high` effort. Cut due list by 25% ONLY if it is
+    ///     non-empty AND the failure was overcrowding (cut items return to the queue).
+    ///  6. Fall back: If Call 3 fails (or repeated violation), serve a pre-verified reserve passage and return
+    ///     the failure report so the caller logs `passageFallbackServed`.
     public func generateVerifiedPassage(
         plan initialPlan: PassagePlan,
         verifier: ContractVerifier,
         priorContextByItem: [String: Set<String>],
+        priorSessionSentenceCountsByItemId: [String: Int] = [:],
         onProgress: (@Sendable (String) -> Void)? = nil
     ) async throws -> (passage: GeneratedPassage, report: VerificationReport) {
+        // Step 1: Zero-cost feasibility check (no model call)
         var currentPlan = initialPlan
-        var dueWasReduced = false
-        var lastReport: VerificationReport?
-        var totalAttempts = 0
-
-        // Outer loop: round 0 = full due list; round 1 = due list cut by 25% (only when there are >3 due items)
-        for reductionRound in 0...1 {
-            if reductionRound == 1 {
-                guard currentPlan.dueItems.count > 3 else { break }
-                let reducedCount = max(3, Int((Double(currentPlan.dueItems.count) * 0.75).rounded(.down)))
-                let reducedDue = Array(currentPlan.dueItems.prefix(reducedCount))
-                currentPlan = PassagePlan(
-                    passageId: currentPlan.passageId,
-                    sessionNumber: currentPlan.sessionNumber,
-                    passageIndexInSession: currentPlan.passageIndexInSession,
-                    blockType: currentPlan.blockType,
-                    isBootstrap: currentPlan.isBootstrap,
-                    isAudioFirst: currentPlan.isAudioFirst,
-                    targetWPM: currentPlan.targetWPM,
-                    format: currentPlan.format,
-                    topicOrEpisodeTitle: currentPlan.topicOrEpisodeTitle,
-                    storySummarySoFar: currentPlan.storySummarySoFar,
-                    dueItems: reducedDue,
-                    newItems: currentPlan.newItems,
-                    grammarPatterns: currentPlan.grammarPatterns,
-                    allowedKnownLemmas: currentPlan.allowedKnownLemmas,
-                    holdoutBannedLemmas: currentPlan.holdoutBannedLemmas,
-                    voice: currentPlan.voice,
-                    accent: currentPlan.accent,
-                    priorContextWordsByItem: currentPlan.priorContextWordsByItem
-                )
-                dueWasReduced = true
-                onProgress?("Reducing due list by 25% and regenerating…")
-            }
-
-            var feedbackFromPreviousAttempt: String? = nil
-            let maxRewriteAttempts = currentPlan.isBootstrap ? 2 : 3
-
-            for attempt in 0...maxRewriteAttempts {
-                totalAttempts += 1
-                if attempt == 0 {
-                    onProgress?("Drafting passage with GPT-6.1 Terra…")
-                } else {
-                    let ruleHint = lastReport?.violations.prefix(2).map(\.ruleName).joined(separator: ", ") ?? "contract checks"
-                    onProgress?("Refining passage (\(attempt)/\(maxRewriteAttempts)): \(ruleHint)…")
-                }
-
-                let draft = try await draftPassageOnce(
-                    plan: currentPlan,
-                    rewriteFeedback: feedbackFromPreviousAttempt,
-                    effort: attempt == 0 ? .low : .medium
-                )
-
-                let fullText = draft.sentences.map(\.spanish).joined(separator: " ")
-                let passageSentences = draft.sentences.enumerated().map { idx, s in
-                    PassageSentence(
-                        id: idx,
-                        spanish: s.spanish,
-                        englishLine: s.englishLine,
-                        wordTokens: verifier.lemmatizer.extractWordTokens(s.spanish)
-                    )
-                }
-
-                // Stage A: Deterministic Local Verifier (<10ms)
-                var report = verifier.verifyStageA(
-                    passageText: fullText,
-                    sentences: passageSentences,
-                    plan: currentPlan,
-                    priorContextByItem: priorContextByItem
-                )
-
-                if !report.passed {
-                    lastReport = report
-                    feedbackFromPreviousAttempt = formatViolationsForRewrite(report: report, previousText: fullText)
-                    continue
-                }
-
-                // Stage B: Isolated Second-Model Verifier (Rules 5 & 6 + Naturalness)
-                onProgress?("Verifying load-bearing probes & grammar (Stage B)…")
-                let stageB = try await verifyStageB(
-                    fullText: fullText,
-                    probes: draft.probes,
-                    plan: currentPlan
-                )
-
-                if !stageB.passed {
-                    var combinedViolations = report.violations
-                    combinedViolations.append(ContractViolation(
-                        ruleNumber: stageB.violatedRuleNumber ?? 5,
-                        ruleName: "Stage B Semantic & Grammar Check",
-                        detail: stageB.feedback,
-                        offendingTokens: []
-                    ))
-                    report = VerificationReport(
-                        passed: false,
-                        totalWords: report.totalWords,
-                        closedVocabCompliance: report.closedVocabCompliance,
-                        scheduledWordShare: report.scheduledWordShare,
-                        missingDueItems: report.missingDueItems,
-                        underSpacedNewItems: report.underSpacedNewItems,
-                        freshContextCollisions: report.freshContextCollisions,
-                        holdoutLeaks: report.holdoutLeaks,
-                        offListLemmas: report.offListLemmas,
-                        stageBPassed: false,
-                        stageBFeedback: stageB.feedback,
-                        violations: combinedViolations
-                    )
-                    lastReport = report
-                    feedbackFromPreviousAttempt = formatViolationsForRewrite(report: report, previousText: fullText)
-                    continue
-                }
-
-                // Passed BOTH Stage A and Stage B!
-                let passage = buildGeneratedPassage(
-                    draft: draft,
-                    sentences: passageSentences,
-                    fullText: fullText,
-                    plan: currentPlan,
-                    report: report,
-                    rewriteAttempts: totalAttempts - 1,
-                    dueWasReduced: dueWasReduced
-                )
-                return (passage, report)
-            }
-        }
-
-        // Best-effort fallback: draft once more with relaxed due list if somehow exhausted, flagging report honestly
-        let finalDraft = try await draftPassageOnce(plan: currentPlan, rewriteFeedback: nil, effort: .medium)
-        let fullText = finalDraft.sentences.map(\.spanish).joined(separator: " ")
-        let passageSentences = finalDraft.sentences.enumerated().map { idx, s in
-            PassageSentence(
-                id: idx,
-                spanish: s.spanish,
-                englishLine: s.englishLine,
-                wordTokens: verifier.lemmatizer.extractWordTokens(s.spanish)
+        if !currentPlan.isBootstrap {
+            let feasible = SessionScheduler.enforceFeasibility(
+                newItems: currentPlan.newItems,
+                dueItems: currentPlan.dueItems,
+                targetWords: 215,
+                scheduledShareCap: verifier.parameters.scheduledShareCap,
+                minNewOccurrences: verifier.parameters.newItemMinOccurrences
             )
+            if feasible.didSplit {
+                currentPlan = Self.withUpdatedLists(currentPlan, newItems: feasible.newItems, dueItems: feasible.dueItems)
+            }
         }
-        let finalReport = verifier.verifyStageA(
-            passageText: fullText,
-            sentences: passageSentences,
+
+        var dueWasReduced = false
+        var callsUsed = 0
+        var lastReport: VerificationReport?
+        var lastSignature: String?
+        var lastDraft: RawPassageDraft?
+
+        // Helper: runs Step 3 (Stage A script -> Stage B model only if Stage A passes)
+        func evaluateDraft(_ draft: RawPassageDraft, plan: PassagePlan) async throws -> (sentences: [PassageSentence], fullText: String, report: VerificationReport) {
+            let fullText = draft.sentences.map(\.spanish).joined(separator: " ")
+            let passageSentences = draft.sentences.enumerated().map { idx, s in
+                PassageSentence(
+                    id: idx,
+                    spanish: s.spanish,
+                    englishLine: s.englishLine,
+                    wordTokens: verifier.lemmatizer.extractWordTokens(s.spanish),
+                    visualSymbol: s.visualSymbol
+                )
+            }
+            let glossedCognates = Set(draft.transparentCognateGlosses.map { $0.spanish.lowercased() })
+
+            // Stage A: Deterministic local script verifier (<10ms)
+            var report = verifier.verifyStageA(
+                passageText: fullText,
+                sentences: passageSentences,
+                plan: plan,
+                priorContextByItem: priorContextByItem,
+                glossedTransparentCognates: glossedCognates,
+                priorSessionSentenceCountsByItemId: priorSessionSentenceCountsByItemId
+            )
+            if !report.passed {
+                return (passageSentences, fullText, report)
+            }
+
+            // Stage B: Second model checks Rules 5 & 6 + naturalness ONLY once Stage A passes
+            onProgress?("Verifying probes & grammar (Stage B)…")
+            let stageB = try await verifyStageB(
+                fullText: fullText,
+                probes: draft.probes,
+                plan: plan
+            )
+            if !stageB.passed {
+                var combinedViolations = report.violations
+                combinedViolations.append(ContractViolation(
+                    ruleNumber: stageB.violatedRuleNumber ?? 5,
+                    ruleName: "Stage B Semantic & Grammar Check",
+                    detail: stageB.feedback,
+                    offendingTokens: []
+                ))
+                report = VerificationReport(
+                    passed: false,
+                    totalWords: report.totalWords,
+                    closedVocabCompliance: report.closedVocabCompliance,
+                    scheduledWordShare: report.scheduledWordShare,
+                    missingDueItems: report.missingDueItems,
+                    underSpacedNewItems: report.underSpacedNewItems,
+                    freshContextCollisions: report.freshContextCollisions,
+                    holdoutLeaks: report.holdoutLeaks,
+                    offListLemmas: report.offListLemmas,
+                    stageBPassed: false,
+                    stageBFeedback: stageB.feedback,
+                    violations: combinedViolations
+                )
+            }
+            return (passageSentences, fullText, report)
+        }
+
+        // Step 2 (Call 1): Generate at standard effort
+        callsUsed = 1
+        onProgress?("Drafting passage (call 1/3)…")
+        let draft1 = try await draftPassageOnce(
             plan: currentPlan,
-            priorContextByItem: priorContextByItem
+            repairContext: nil,
+            effort: currentPlan.isBootstrap ? .low : .medium
         )
-        let passage = buildGeneratedPassage(
-            draft: finalDraft,
-            sentences: passageSentences,
-            fullText: fullText,
+        let eval1 = try await evaluateDraft(draft1, plan: currentPlan)
+        if eval1.report.passed {
+            let passage = buildGeneratedPassage(
+                draft: draft1,
+                sentences: eval1.sentences,
+                fullText: eval1.fullText,
+                plan: currentPlan,
+                report: eval1.report,
+                generatorCallsUsed: callsUsed,
+                dueWasReduced: dueWasReduced
+            )
+            return (passage, eval1.report)
+        }
+        lastReport = eval1.report
+        lastSignature = eval1.report.violationSignature
+        lastDraft = draft1
+
+        // Step 4 (Call 2): Targeted Repair — rewrite ONLY the offending sentences
+        callsUsed = 2
+        let ruleHint2 = eval1.report.violations.prefix(2).map(\.ruleName).joined(separator: ", ")
+        onProgress?("Repairing offending sentences (call 2/3): \(ruleHint2)…")
+        let repairPrompt = formatViolationsForTargetedRepair(
+            report: eval1.report,
+            previousSentences: eval1.sentences
+        )
+        let draft2 = try await draftPassageOnce(
             plan: currentPlan,
-            report: finalReport,
-            rewriteAttempts: totalAttempts,
-            dueWasReduced: dueWasReduced
+            repairContext: repairPrompt,
+            effort: .medium
         )
-        return (passage, lastReport ?? finalReport)
+        let eval2 = try await evaluateDraft(draft2, plan: currentPlan)
+        if eval2.report.passed {
+            let passage = buildGeneratedPassage(
+                draft: draft2,
+                sentences: eval2.sentences,
+                fullText: eval2.fullText,
+                plan: currentPlan,
+                report: eval2.report,
+                generatorCallsUsed: callsUsed,
+                dueWasReduced: dueWasReduced
+            )
+            return (passage, eval2.report)
+        }
+
+        let sig2 = eval2.report.violationSignature
+        lastReport = eval2.report
+        lastDraft = draft2
+
+        // Step 6 Early Exit: "The same violation twice in a row skips straight to this step."
+        if let prevSig = lastSignature, !prevSig.isEmpty, sig2 == prevSig {
+            onProgress?("Repeated violation — serving pre-verified reserve passage…")
+            let reserve = ReservePassageBank.selectReserve(
+                for: currentPlan,
+                lemmatizer: verifier.lemmatizer,
+                generatorCallsUsed: callsUsed
+            )
+            return (reserve, eval2.report)
+        }
+
+        // Step 5 (Call 3): Regenerate once at HIGH effort.
+        // Cut due list by 25% ONLY if it is non-empty AND the failure was overcrowding!
+        if !currentPlan.dueItems.isEmpty && eval2.report.isOvercrowdingFailure {
+            let reducedCount = max(1, Int((Double(currentPlan.dueItems.count) * 0.75).rounded(.down)))
+            let reducedDue = Array(currentPlan.dueItems.prefix(reducedCount))
+            currentPlan = Self.withUpdatedLists(currentPlan, newItems: currentPlan.newItems, dueItems: reducedDue)
+            dueWasReduced = true
+            onProgress?("Overcrowded — trimming due list 25% & regenerating at high effort (call 3/3)…")
+        } else {
+            onProgress?("Regenerating once at high effort (call 3/3)…")
+        }
+
+        callsUsed = 3
+        let regenGuidance = formatViolationsForFullRegen(report: eval2.report)
+        let draft3 = try await draftPassageOnce(
+            plan: currentPlan,
+            repairContext: regenGuidance,
+            effort: .high
+        )
+        let eval3 = try await evaluateDraft(draft3, plan: currentPlan)
+        if eval3.report.passed {
+            let passage = buildGeneratedPassage(
+                draft: draft3,
+                sentences: eval3.sentences,
+                fullText: eval3.fullText,
+                plan: currentPlan,
+                report: eval3.report,
+                generatorCallsUsed: callsUsed,
+                dueWasReduced: dueWasReduced
+            )
+            return (passage, eval3.report)
+        }
+        lastReport = eval3.report
+        _ = lastDraft
+
+        // Step 6: Third call failed -> serve pre-verified reserve passage & return failure report for logging!
+        onProgress?("Serving pre-verified reserve passage…")
+        let reserve = ReservePassageBank.selectReserve(
+            for: currentPlan,
+            lemmatizer: verifier.lemmatizer,
+            generatorCallsUsed: callsUsed
+        )
+        return (reserve, lastReport ?? eval3.report)
+    }
+
+    private static func withUpdatedLists(
+        _ plan: PassagePlan,
+        newItems: [SyllabusItem],
+        dueItems: [SyllabusItem]
+    ) -> PassagePlan {
+        var allowed = Set(plan.allowedKnownLemmas.map { $0.lowercased() })
+        for item in dueItems { allowed.insert(item.spanish.lowercased()) }
+        for item in newItems { allowed.insert(item.spanish.lowercased()) }
+        return PassagePlan(
+            passageId: plan.passageId,
+            sessionNumber: plan.sessionNumber,
+            passageIndexInSession: plan.passageIndexInSession,
+            blockType: plan.blockType,
+            isBootstrap: plan.isBootstrap,
+            isAudioFirst: plan.isAudioFirst,
+            targetWPM: plan.targetWPM,
+            format: plan.format,
+            topicOrEpisodeTitle: plan.topicOrEpisodeTitle,
+            storySummarySoFar: plan.storySummarySoFar,
+            dueItems: dueItems,
+            newItems: newItems,
+            grammarPatterns: plan.grammarPatterns,
+            allowedKnownLemmas: Array(allowed).sorted(),
+            holdoutBannedLemmas: plan.holdoutBannedLemmas,
+            voice: plan.voice,
+            accent: plan.accent,
+            priorContextWordsByItem: plan.priorContextWordsByItem,
+            learningProbeCandidates: plan.learningProbeCandidates,
+            transparentCognateLemmas: plan.transparentCognateLemmas
+        )
     }
 
     private struct RawDraftSentence: Decodable {
         let spanish: String
         let englishLine: String?
+        let visualSymbol: String?
     }
     private struct RawDraftGloss: Decodable {
         let itemId: String
         let spanish: String
         let englishGloss: String
         let contextClueNote: String
+    }
+    private struct RawTransparentCognateGloss: Decodable {
+        let spanish: String
+        let englishGloss: String
     }
     private struct RawDraftProbe: Decodable {
         let targetDueItemId: String
@@ -378,6 +462,8 @@ public actor GPT61TerraClient {
         let options: [String]
         let correctOptionIndex: Int
         let hingeExplanation: String
+        let isPictureMatch: Bool
+        let optionSymbols: [String]?
     }
     private struct RawPassageDraft: Decodable {
         let titleEs: String
@@ -385,16 +471,18 @@ public actor GPT61TerraClient {
         let episodeSummaryForNext: String
         let sentences: [RawDraftSentence]
         let newItemGlosses: [RawDraftGloss]
+        let transparentCognateGlosses: [RawTransparentCognateGloss]
         let probes: [RawDraftProbe]
     }
 
     private func draftPassageOnce(
         plan: PassagePlan,
-        rewriteFeedback: String?,
+        repairContext: String?,
         effort: TerraReasoningEffort
     ) async throws -> RawPassageDraft {
-        let newItemsDesc = plan.newItems.map { "\($0.id): \($0.spanish) = \($0.englishGloss) [\($0.pos)]" }.joined(separator: "\n")
+        let newItemsDesc = plan.newItems.map { "\($0.id): \($0.spanish) = \($0.englishGloss) [\($0.pos), icon:\($0.visualSymbol)]" }.joined(separator: "\n")
         let dueItemsDesc = plan.dueItems.map { "\($0.id): \($0.spanish) (\($0.englishGloss))" }.joined(separator: ", ")
+        let learningDesc = plan.learningProbeCandidates.map { "\($0.id): \($0.spanish) (\($0.englishGloss))" }.joined(separator: ", ")
         let grammarDesc = plan.grammarPatterns.map { g in
             "\(g.id) [\(g.cefr.rawValue)] \(g.spanish): \(g.microNoteEn ?? "") | Example: \(g.contrastAEs ?? "")"
         }.joined(separator: "\n")
@@ -404,60 +492,90 @@ public actor GPT61TerraClient {
             : plan.priorContextWordsByItem.map { "\($0.key) — NEVER place near: \($0.value.joined(separator: ", "))" }.joined(separator: "\n")
 
         let allowedSample = plan.allowedKnownLemmas.prefix(1200).joined(separator: ", ")
+        let cognateSample = plan.transparentCognateLemmas.prefix(260).joined(separator: ", ")
 
-        let lengthRule = plan.isBootstrap
-            ? "BOOTSTRAP MODE (Sessions 1–4): Write 8–10 crisp, natural Spanish sentences of 5–8 words each (~55–80 words total). Include an accurate English translation in `englishLine` for each sentence. Keep at least 75% of words inside ALLOWED_LEMMAS (or proper names/numbers)."
-            : "FULL CONTRACT: Write 185–240 natural, vivid Spanish words total. Keep >=96% of word lemmas strictly inside ALLOWED_LEMMAS (or proper names/numbers) and NEVER use any banned hold-out word."
+        let eligibleTargets = plan.eligibleProbeTargets
+        let targetProbeCountDesc: String = {
+            if eligibleTargets.isEmpty { return "0 probes (return an empty `probes` array because no eligible items exist)" }
+            if eligibleTargets.count == 1 { return "1 probe" }
+            if eligibleTargets.count == 2 { return "2 probes" }
+            return "2 or 3 probes"
+        }()
 
-        let minSpacing = plan.isBootstrap ? 6 : 30
-        let dueRule = plan.dueItems.isEmpty
-            ? "3. DUE ITEMS: None yet (early session). Focus on weaving NEW_ITEMS naturally across the story."
-            : "3. DUE ITEMS: EVERY item in DUE_ITEMS MUST appear at least once. Combined occurrences of NEW_ITEMS + DUE_ITEMS should be 18%–23% of total words."
+        let instructions: String
+        if plan.isBootstrap {
+            let probeRule = plan.dueItems.isEmpty
+                ? "5. PROBES (Bootstrap Picture-Matching): Return \(targetProbeCountDesc). Because DUE_ITEMS is empty, write PICTURE-MATCHING probes on the passage's NEW_ITEMS (`isPictureMatch: true`). Each probe asks which picture/meaning matches one NEW_ITEM from the passage, with 4 clear English options, `optionSymbols` (4 valid Apple SF Symbol names like `music.note`, `building.2.fill`, `person.2.fill`, `book.fill`, `sparkles`, `map.fill`), `targetDueItemId` set to that NEW_ITEM's id, and `targetDueLemma` set to its Spanish word."
+                : "5. PROBES: Return \(targetProbeCountDesc) hinging on DUE_ITEMS first, then NEW_ITEMS (`isPictureMatch: false`, `optionSymbols: null`)."
+            let grammarRule = plan.grammarPatterns.isEmpty
+                ? "6. GRAMMAR: Clean, natural beginner Spanish."
+                : "6. GRAMMAR PATTERNS: Weave each assigned grammar pattern at least TWICE with different lexical words."
 
-        let probeRule = plan.dueItems.isEmpty
-            ? "5. LOAD-BEARING PROBES: Write 2 concise English comprehension probes. Because DUE_ITEMS is empty in this early session, each probe MUST hinge on understanding ONE of the listed NEW_ITEMS (or a key sentence detail using it). Put that NEW_ITEM's `id` and Spanish word in `targetDueItemId` and `targetDueLemma`. Provide 4 plausible options and the 0-based `correctOptionIndex`."
-            : "5. LOAD-BEARING PROBES: Write 2 or 3 English comprehension probes. EACH probe MUST hinge specifically on understanding ONE listed due item (cannot be guessed without knowing that due word!). Provide 4 plausible options and the 0-based `correctOptionIndex`."
+            instructions = """
+            You are the Spanish Passage Generator inside Cadencia implementing the Bootstrap Contract (Sessions 1–4, Revised Protocol p. 8):
+            1. PASSAGE FORM: Write 6 to 10 crisp, natural Spanish sentences, EACH STRICTLY 8 WORDS OR FEWER! Include an accurate English translation in `englishLine` AND a fitting Apple SF Symbol icon name in `visualSymbol` (e.g. `building.2.fill`, `person.2.fill`, `music.note`, `cup.and.saucer.fill`, `sun.max.fill`, `book.fill`) for EVERY sentence.
+            2. CLOSED VOCABULARY (>=80% + Glossed Cognates): At least 80% of running words MUST come from ALLOWED_LEMMAS (items met so far + NEW_ITEMS + DUE_ITEMS) plus proper names (Clara, Mateo, Madrid, etc.) and numbers. ANY remaining word (at most 20% of words) MUST be a transparent English-Spanish cognate from TRANSPARENT_COGNATES AND listed in `transparentCognateGlosses`! NEVER use non-cognate off-list words or banned hold-out words!
+            3. NEW ITEMS (at most 8): EVERY item in NEW_ITEMS MUST appear in AT LEAST 3 DIFFERENT SENTENCES. There is NO minimum word-spacing limit and NO upper limit on uses! Make each first use clear in context.
+            4. SCHEDULED SHARE & DUE ITEMS: There is NO scheduled share cap or floor in Bootstrap! If DUE_ITEMS is non-empty, use each due item at least once and never beside its banned prior neighbors.
+            \(probeRule)
+            \(grammarRule)
+            7. CONTINUITY: Continue the serial scene vividly with authentic Spanish register (\(plan.accent.displayName)).
+            """
+        } else {
+            let dueRule = plan.dueItems.isEmpty
+                ? "3. DUE ITEMS & SCHEDULED SHARE: DUE_ITEMS is empty. Keep NEW_ITEMS occurrences at most 23% of total words (no lower limit)."
+                : "3. DUE ITEMS & SCHEDULED SHARE: EVERY item in DUE_ITEMS MUST appear at least once. Combined occurrences of NEW_ITEMS + DUE_ITEMS MUST be AT MOST 23% of total words (there is NO lower limit per passage)."
+            let probeRule = eligibleTargets.isEmpty
+                ? "5. LOAD-BEARING PROBES: No eligible target items; return an empty `probes` array."
+                : "5. LOAD-BEARING PROBES: Write \(targetProbeCountDesc) (`isPictureMatch: false`, `optionSymbols: null`). Each probe MUST hinge on understanding ONE specific target item, drawn in strict priority order: DUE_ITEMS first, then NEW_ITEMS, then LEARNING_CANDIDATES if fewer than 2 due/new items exist. Provide 4 plausible options and 0-based `correctOptionIndex`."
+            let grammarRule = plan.grammarPatterns.isEmpty
+                ? "6. GRAMMAR: Use natural, idiomatic Spanish."
+                : "6. GRAMMAR PATTERNS: Each assigned grammar pattern MUST appear at least TWICE with different lexical words."
 
-        let grammarRule = plan.grammarPatterns.isEmpty
-            ? "6. GRAMMAR: Use clean, natural Spanish grammar matching the learner's stage."
-            : "6. GRAMMAR PATTERNS: Each assigned grammar pattern MUST appear at least TWICE with different lexical words."
-
-        let instructions = """
-        You are the Spanish Passage Generator inside Cadencia, implementing the Signal-Starvation Hypothesis protocol.
-        You write extraordinarily natural, vivid, emotionally engaging Spanish prose while obeying EVERY mechanical rule strictly:
-        1. \(lengthRule)
-        2. NEW ITEMS (at most 6): Every item in NEW_ITEMS MUST appear at least 3 times, with at least 3 occurrences spaced at least \(minSpacing) words apart (e.g., spread across early, middle, and late sentences). Its FIRST use must make the meaning clearly guessable from context.
-        \(dueRule)
-        4. FRESH CONTEXT: Never place any due item within ±3 words of its banned prior neighbor words listed below.
-        \(probeRule)
-        \(grammarRule)
-        7. CONTINUITY: Continue the serial episode or write a gripping short non-fiction piece matching the topic, with authentic Spanish register (\(plan.accent.displayName)).
-        """
+            instructions = """
+            You are the Spanish Passage Generator inside Cadencia implementing the Full Input Contract (Sessions 5+, Revised Protocol pp. 6–7):
+            1. PASSAGE LENGTH & 100% CLOSED VOCABULARY: Write 180–250 natural, vivid Spanish words. EVERY SINGLE word lemma MUST come strictly from ALLOWED_LEMMAS (Known, Learning p>85%, DUE_ITEMS, NEW_ITEMS) or proper names/numbers — 100% compliance, ZERO off-list lemmas, ZERO banned hold-out words! Return `transparentCognateGlosses: []` and `visualSymbol: null`.
+            2. NEW ITEMS (at most 6): If NEW_ITEMS is non-empty, EVERY item in NEW_ITEMS MUST appear at least 3 times, with 3 of those uses at least 30 words apart (further uses are free and never fail the rule!). Make the first use clearly guessable from context.
+            \(dueRule)
+            4. FRESH CONTEXT: Never place any due item within ±3 words of its banned prior neighbor words listed below.
+            \(probeRule)
+            \(grammarRule)
+            7. CONTINUITY: Continue the serial episode or write a gripping short non-fiction piece matching the topic with authentic Spanish register (\(plan.accent.displayName)).
+            """
+        }
 
         var userPrompt = """
+        MODE: \(plan.isBootstrap ? "BOOTSTRAP (Sessions 1–4)" : "FULL CONTRACT (Sessions 5+)")
         FORMAT: \(plan.format.rawValue)
         TITLE / TOPIC: \(plan.topicOrEpisodeTitle)
         STORY SO FAR: \(plan.storySummarySoFar.isEmpty ? "Opening episode — establish vivid setting, protagonist, and immediate hook." : plan.storySummarySoFar)
         REGIONAL ACCENT FLAVOR: \(plan.accent.displayName)
 
-        NEW_ITEMS (3x each, spread >=\(minSpacing) words apart):
+        NEW_ITEMS (\(plan.isBootstrap ? "each in >=3 distinct sentences, no spacing limit" : "each >=3x with 3 uses >=30 words apart")):
         \(newItemsDesc.isEmpty ? "None this passage." : newItemsDesc)
 
         DUE_ITEMS (each >=1x):
-        \(dueItemsDesc.isEmpty ? "None yet." : dueItemsDesc)
+        \(dueItemsDesc.isEmpty ? "None." : dueItemsDesc)
+
+        LEARNING_CANDIDATES (tier-3 probe fallback only if due + new < 2):
+        \(learningDesc.isEmpty ? "None." : learningDesc)
 
         ASSIGNED_GRAMMAR_PATTERNS (each >=2x with different words):
-        \(grammarDesc.isEmpty ? "Natural A1-B2 grammar." : grammarDesc)
+        \(grammarDesc.isEmpty ? "None assigned." : grammarDesc)
 
         RULE 4 BANNED PRIOR NEIGHBORS:
         \(priorNeighborsText)
 
-        ALLOWED_LEMMAS (stay strictly inside this closed vocabulary + names/numbers):
+        ALLOWED_LEMMAS (\(plan.isBootstrap ? ">=80% of words must come from this set + names/numbers" : "100% of words must come from this set + names/numbers")):
         \(allowedSample)
         """
 
-        if let fb = rewriteFeedback {
-            userPrompt += "\n\nCRITICAL REWRITE FIXES REQUIRED FROM VERIFIER:\n\(fb)\nFix EVERY listed violation while keeping natural, vivid Spanish prose."
+        if plan.isBootstrap {
+            userPrompt += "\n\nTRANSPARENT_COGNATES (only allowed for the glossed <=20% remainder; gloss any you use in `transparentCognateGlosses`):\n\(cognateSample)"
+        }
+
+        if let repair = repairContext {
+            userPrompt += "\n\n\(repair)"
         }
 
         let schema: [String: Any] = [
@@ -473,8 +591,9 @@ public actor GPT61TerraClient {
                         "properties": [
                             "spanish": ["type": "string"],
                             "englishLine": ["type": ["string", "null"]],
+                            "visualSymbol": ["type": ["string", "null"]],
                         ],
-                        "required": ["spanish", "englishLine"],
+                        "required": ["spanish", "englishLine", "visualSymbol"],
                         "additionalProperties": false,
                     ],
                 ],
@@ -492,6 +611,18 @@ public actor GPT61TerraClient {
                         "additionalProperties": false,
                     ],
                 ],
+                "transparentCognateGlosses": [
+                    "type": "array",
+                    "items": [
+                        "type": "object",
+                        "properties": [
+                            "spanish": ["type": "string"],
+                            "englishGloss": ["type": "string"],
+                        ],
+                        "required": ["spanish", "englishGloss"],
+                        "additionalProperties": false,
+                    ],
+                ],
                 "probes": [
                     "type": "array",
                     "items": [
@@ -503,13 +634,21 @@ public actor GPT61TerraClient {
                             "options": ["type": "array", "items": ["type": "string"]],
                             "correctOptionIndex": ["type": "integer"],
                             "hingeExplanation": ["type": "string"],
+                            "isPictureMatch": ["type": "boolean"],
+                            "optionSymbols": ["type": ["array", "null"], "items": ["type": "string"]],
                         ],
-                        "required": ["targetDueItemId", "targetDueLemma", "questionEn", "options", "correctOptionIndex", "hingeExplanation"],
+                        "required": [
+                            "targetDueItemId", "targetDueLemma", "questionEn", "options",
+                            "correctOptionIndex", "hingeExplanation", "isPictureMatch", "optionSymbols",
+                        ],
                         "additionalProperties": false,
                     ],
                 ],
             ],
-            "required": ["titleEs", "titleEn", "episodeSummaryForNext", "sentences", "newItemGlosses", "probes"],
+            "required": [
+                "titleEs", "titleEn", "episodeSummaryForNext", "sentences",
+                "newItemGlosses", "transparentCognateGlosses", "probes",
+            ],
             "additionalProperties": false,
         ]
 
@@ -539,24 +678,32 @@ public actor GPT61TerraClient {
         probes: [RawDraftProbe],
         plan: PassagePlan
     ) async throws -> StageBVerdict {
-        let probeText = probes.enumerated().map { idx, p in
-            "Probe \(idx + 1) [target: \(p.targetDueLemma)]: \(p.questionEn) | Options: \(p.options.joined(separator: " / ")) | Correct: \(p.correctOptionIndex)"
-        }.joined(separator: "\n")
+        let probeText = probes.isEmpty
+            ? "(No probes)"
+            : probes.enumerated().map { idx, p in
+                "Probe \(idx + 1) [target: \(p.targetDueLemma), pictureMatch: \(p.isPictureMatch)]: \(p.questionEn) | Options: \(p.options.joined(separator: " / ")) | Correct: \(p.correctOptionIndex)"
+            }.joined(separator: "\n")
         let gramText = plan.grammarPatterns.map { "\($0.id): \($0.spanish)" }.joined(separator: "\n")
-        let targetList = (plan.dueItems.isEmpty ? plan.newItems : plan.dueItems)
-            .map { "\($0.spanish) (\($0.englishGloss))" }
-            .joined(separator: ", ")
+        let eligible = plan.eligibleProbeTargets
+        let targetList = eligible.map { "\($0.spanish) (\($0.englishGloss))" }.joined(separator: ", ")
 
-        let probeCheckRule = plan.dueItems.isEmpty
-            ? "1. Rule 5 (Load-bearing probes): Are there 2–3 probes, and does each genuinely test comprehension of the passage (hinging on its target NEW_ITEM or a key sentence detail in the passage, since there are no due items yet in this early session)?"
-            : "1. Rule 5 (Load-bearing probes): Are there 2–3 probes, and does each genuinely require understanding its bound Spanish due item (not guessable from general knowledge alone)?"
+        let probeCheckRule: String
+        if eligible.isEmpty {
+            probeCheckRule = "1. Rule 5 (Probes): No eligible due/new/learning target items exist, so 0 probes is expected; set probesAreLoadBearing=true."
+        } else if plan.isBootstrap && plan.dueItems.isEmpty {
+            let minNeeded = min(2, eligible.count)
+            probeCheckRule = "1. Rule 5 (Bootstrap Picture-Matching Probes): Are there \(minNeeded)–3 picture-matching probes on the passage's NEW_ITEMS where each probe accurately tests understanding of its target word from the passage?"
+        } else {
+            let minNeeded = min(2, eligible.count)
+            probeCheckRule = "1. Rule 5 (Load-bearing probes): Are there \(minNeeded)–3 probes (fewer eligible items means fewer probes), and does each hinge on understanding one specific eligible target item (priority: due list first, then new list, then Learning items)?"
+        }
 
         let grammarCheckRule = plan.grammarPatterns.isEmpty
             ? "2. Rule 6 (Grammar patterns): None assigned for this passage; set grammarPatternsVerified=true."
             : "2. Rule 6 (Grammar patterns): Does each assigned grammar pattern appear at least twice with different lexical words?"
 
         let bootstrapContext = plan.isBootstrap
-            ? "\nNOTE: This is an early Sessions 1–4 Bootstrap micro-story intentionally written in simple 5–8 word beginner sentences. Do NOT reject simple or short sentences as unnatural as long as the Spanish is grammatical and clear."
+            ? "\nNOTE: This is a Sessions 1–4 Bootstrap micro-story intentionally written in 6–10 short beginner sentences (<= 8 words each). Do NOT penalize simple beginner sentences as unnatural as long as the Spanish is grammatical and clear."
             : ""
 
         let instructions = """
@@ -568,8 +715,8 @@ public actor GPT61TerraClient {
         Return passed=true if all three checks are solid; otherwise return passed=false with concrete fix instructions.
         """
         let input = """
-        MODE: \(plan.isBootstrap ? "Bootstrap Micro-Story (Sessions 1–4)" : "Full Passage")
-        TARGET ITEMS (\(plan.dueItems.isEmpty ? "NEW ITEMS" : "DUE ITEMS")): \(targetList.isEmpty ? "None" : targetList)
+        MODE: \(plan.isBootstrap ? "Bootstrap Micro-Story (Sessions 1–4)" : "Full Passage (Sessions 5+)")
+        ELIGIBLE PROBE TARGETS (priority order: due -> new -> learning): \(targetList.isEmpty ? "None" : targetList)
 
         PASSAGE:
         \(fullText)
@@ -980,15 +1127,33 @@ public actor GPT61TerraClient {
         throw TerraAPIError.emptyOutput
     }
 
-    // MARK: - Formatting Helpers
+    // MARK: - Formatting Helpers (Step 4 Targeted Repair & Step 5 High-Effort Regen)
 
-    private func formatViolationsForRewrite(report: VerificationReport, previousText: String) -> String {
-        var lines: [String] = []
+    private func formatViolationsForTargetedRepair(
+        report: VerificationReport,
+        previousSentences: [PassageSentence]
+    ) -> String {
+        let offendingSet = Set(report.offendingSentenceIndices)
+        var lines: [String] = ["STEP 4 TARGETED REPAIR — REWRITE ONLY THE OFFENDING SENTENCES BELOW (keep clean sentences unchanged!):"]
         for v in report.violations {
             let toks = v.offendingTokens.isEmpty ? "" : " -> Offending: \(v.offendingTokens.joined(separator: ", "))"
+            let sentNums = v.offendingSentenceIndices.isEmpty ? "" : " [Sentences: \(v.offendingSentenceIndices.map { "#\($0 + 1)" }.joined(separator: ", "))]"
+            lines.append("- Rule \(v.ruleNumber) (\(v.ruleName))\(sentNums): \(v.detail)\(toks)")
+        }
+        lines.append("\nPREVIOUS NUMBERED SENTENCES (preserve all sentences marked [KEEP]; rewrite only [REPAIR]):")
+        for (idx, s) in previousSentences.enumerated() {
+            let tag = offendingSet.isEmpty || offendingSet.contains(idx) ? "[REPAIR]" : "[KEEP]"
+            lines.append("S\(idx + 1) \(tag): \(s.spanish)")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private func formatViolationsForFullRegen(report: VerificationReport) -> String {
+        var lines: [String] = ["STEP 5 HIGH-EFFORT REGENERATION — Write a fresh passage cleanly avoiding ALL previous violations:"]
+        for v in report.violations {
+            let toks = v.offendingTokens.isEmpty ? "" : " -> Avoid: \(v.offendingTokens.joined(separator: ", "))"
             lines.append("- Rule \(v.ruleNumber) (\(v.ruleName)): \(v.detail)\(toks)")
         }
-        lines.append("\nPREVIOUS DRAFT TO FIX:\n\(previousText)")
         return lines.joined(separator: "\n")
     }
 
@@ -998,11 +1163,10 @@ public actor GPT61TerraClient {
         fullText: String,
         plan: PassagePlan,
         report: VerificationReport,
-        rewriteAttempts: Int,
+        generatorCallsUsed: Int,
         dueWasReduced: Bool
     ) -> GeneratedPassage {
-        let newItemMap = Dictionary(uniqueKeysWithValues: plan.newItems.map { ($0.id, $0) })
-        let glosses: [NewItemGloss] = plan.newItems.map { item in
+        var glosses: [NewItemGloss] = plan.newItems.map { item in
             if let g = draft.newItemGlosses.first(where: { $0.itemId == item.id || $0.spanish.lowercased() == item.spanish.lowercased() }) {
                 return NewItemGloss(
                     itemId: item.id,
@@ -1020,7 +1184,17 @@ public actor GPT61TerraClient {
                 visualCueSymbol: item.visualSymbol
             )
         }
-        _ = newItemMap
+        // Include glossed transparent cognates for Bootstrap tap-to-gloss reference
+        let existingLower = Set(glosses.map { $0.spanish.lowercased() })
+        for cog in draft.transparentCognateGlosses where !existingLower.contains(cog.spanish.lowercased()) {
+            glosses.append(NewItemGloss(
+                itemId: "cog_\(cog.spanish.lowercased())",
+                spanish: cog.spanish,
+                englishGloss: cog.englishGloss,
+                contextClueNote: "Transparent cognate (Bootstrap)",
+                visualCueSymbol: "sparkles"
+            ))
+        }
 
         let probes: [PassageProbe] = draft.probes.enumerated().map { idx, p in
             PassageProbe(
@@ -1030,7 +1204,9 @@ public actor GPT61TerraClient {
                 questionEn: p.questionEn,
                 options: p.options,
                 correctOptionIndex: max(0, min(p.correctOptionIndex, max(0, p.options.count - 1))),
-                hingeExplanation: p.hingeExplanation
+                hingeExplanation: p.hingeExplanation,
+                isPictureMatch: p.isPictureMatch,
+                optionSymbols: p.optionSymbols
             )
         }
 
@@ -1047,7 +1223,7 @@ public actor GPT61TerraClient {
             )
         }
 
-        // Flag random 2% of passages for weekly native-speaker audit (PDF p. 7)
+        // Flag random 2% of passages for weekly native-speaker audit (PDF p. 8)
         let flaggedAudit = Int.random(in: 1...100) <= 2
 
         return GeneratedPassage(
@@ -1072,7 +1248,9 @@ public actor GPT61TerraClient {
             targetWPM: plan.targetWPM,
             isAudioFirst: plan.isAudioFirst,
             isBootstrap: plan.isBootstrap,
-            rewriteAttempts: rewriteAttempts,
+            rewriteAttempts: max(0, generatorCallsUsed - 1),
+            generatorCallsUsed: generatorCallsUsed,
+            isReserveFallback: false,
             dueListWasReduced: dueWasReduced,
             scheduledWordShare: report.scheduledWordShare,
             flaggedForNativeAudit: flaggedAudit,

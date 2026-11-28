@@ -43,12 +43,17 @@ public struct LearnerModelEngine: Sendable {
     }
 
     /// Applies one learning observation to a `LearnerItemRecord` and returns the updated record + promotion flag.
+    ///
+    /// Updated protocol (p. 6): Weak successes (`.passedNormalPace`) update an item at most
+    /// `parameters.maxWeakSuccessUpdatesPerSession` (default 3) times per session so a frequent
+    /// function word passed dozens of times in one sitting cannot look permanently learned.
     public func apply(
         outcome: LearningOutcome,
         to record: LearnerItemRecord,
         item: SyllabusItem,
         sessionNumber: Int,
         wasEarOnly: Bool,
+        weakSuccessesThisSession: Int = 0,
         now: Date = Date()
     ) -> (updated: LearnerItemRecord, previousState: MasteryState, predictedBefore: Double) {
         var next = record
@@ -83,10 +88,13 @@ public struct LearnerModelEngine: Sendable {
             next.needsExtraMeetingThisSession = false
 
         case .passedNormalPace:
-            next.halfLifeDays = min(maxHalfLife, next.halfLifeDays * parameters.weakSuccessMultiplier)
-            next.successesCount += 1
-            if wasEarOnly { next.earSuccessesCount += 1 }
-            next.needsExtraMeetingThisSession = false
+            // Cap weak-success half-life updates at 3 per session (protocol p. 6).
+            if weakSuccessesThisSession < parameters.maxWeakSuccessUpdatesPerSession {
+                next.halfLifeDays = min(maxHalfLife, next.halfLifeDays * parameters.weakSuccessMultiplier)
+                next.successesCount += 1
+                if wasEarOnly { next.earSuccessesCount += 1 }
+                next.needsExtraMeetingThisSession = false
+            }
 
         case .doubtReplayOrSlow:
             // Unchanged half-life, plus one extra meeting this session (PDF p. 6)
