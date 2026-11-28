@@ -234,24 +234,27 @@ public final class AppState {
         let mode = self.phononComputeMode
 
         // 1. Gradium Phonon-40m-es (Native Spanish — default CPU/AMX FP32 loads in <0.5s!)
-        if await assets.isModelInstalled(.phononSpanish),
-           !(await phonon.isLoaded && (await phonon.activeComputeMode) == mode) {
-            await MainActor.run {
-                self.warmingLabel = "WARMING PHONON"
-                self.engineRuntimeNote[.phononSpanish] = "Loading Phonon-40m-es on \(mode.shortHardwareLabel)…"
-            }
-            let dir = await assets.directory(for: .phononSpanish)
-            let t0 = Date()
-            do {
-                try await phonon.loadModels(from: dir, computeMode: mode)
-                let ms = Int(Date().timeIntervalSince(t0) * 1000)
-                let voices = await phonon.availableVoices.count
+        if await assets.isModelInstalled(.phononSpanish) {
+            let phononLoaded = await phonon.isLoaded
+            let phononMode = await phonon.activeComputeMode
+            if !phononLoaded || phononMode != mode {
                 await MainActor.run {
-                    self.engineRuntimeNote[.phononSpanish] = "Loaded on \(mode.shortHardwareLabel) · \(voices) voices · \(ms) ms"
+                    self.warmingLabel = "WARMING PHONON"
+                    self.engineRuntimeNote[.phononSpanish] = "Loading Phonon-40m-es on \(mode.shortHardwareLabel)…"
                 }
-            } catch {
-                await MainActor.run {
-                    self.engineRuntimeNote[.phononSpanish] = "Load error: \(error.localizedDescription)"
+                let dir = await assets.directory(for: .phononSpanish)
+                let t0 = Date()
+                do {
+                    try await phonon.loadModels(from: dir, computeMode: mode)
+                    let ms = Int(Date().timeIntervalSince(t0) * 1000)
+                    let voices = await phonon.availableVoices.count
+                    await MainActor.run {
+                        self.engineRuntimeNote[.phononSpanish] = "Loaded on \(mode.shortHardwareLabel) · \(voices) voices · \(ms) ms"
+                    }
+                } catch {
+                    await MainActor.run {
+                        self.engineRuntimeNote[.phononSpanish] = "Load error: \(error.localizedDescription)"
+                    }
                 }
             }
         }
