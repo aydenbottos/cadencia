@@ -191,7 +191,11 @@ pub fn export_bundle(
         .map_err(|e| format!("writing voice {name}: {e}"))?;
     }
 
-    let max_tokens = ptts::plan::MAX_FIT_TOKENS;
+    // Cap per-chunk graph budget at 64 tokens (Cadencia synthesizes one sentence at a time,
+    // typically 10-35 tokens, and ptts automatically splits longer utterances across chunks).
+    // Shrinking max_tokens from 200 -> 64 cuts `ctx` from ~1,200 -> ~497 (~8x smaller prefill
+    // attention matrix, drastically reducing on-device Core ML size, RAM, and ANE compile time).
+    let max_tokens: usize = 64;
     let temperature: f32 = 0.3;
     let max_frames = ptts::plan::frame_budget(max_tokens, m.frame_rate);
     let ctx = vlen + max_tokens + max_frames + 16;

@@ -9,6 +9,7 @@ import SwiftUI
 ///   while listening + answering probes by ear -> dramatic Curtain Reveal AFTER probes, earning `ear_success`!).
 public struct InputReaderView: View {
     @Bindable var controller: SessionController
+    public var onCancelAndExit: (() -> Void)? = nil
     @State private var revealedBootstrapLineIds: Set<Int> = []
 
     public var body: some View {
@@ -65,6 +66,21 @@ public struct InputReaderView: View {
                 .foregroundStyle(CadenciaPalette.mutedSilver)
                 .multilineTextAlignment(.center)
                 .padding(.horizontal, 36)
+
+            if let onCancelAndExit {
+                Button {
+                    onCancelAndExit()
+                } label: {
+                    Label("Cancel & Return to Studio", systemImage: "xmark.circle")
+                        .font(CadenciaFont.uiCaption(13, weight: .semibold))
+                        .foregroundStyle(CadenciaPalette.ivoryText)
+                        .padding(.horizontal, 18)
+                        .padding(.vertical, 11)
+                        .cadenciaGlassPill(interactive: false)
+                }
+                .buttonStyle(.plain)
+                .padding(.top, 8)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }

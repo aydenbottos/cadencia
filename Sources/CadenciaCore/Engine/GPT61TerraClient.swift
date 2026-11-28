@@ -211,9 +211,10 @@ public actor GPT61TerraClient {
         var lastReport: VerificationReport?
         var totalAttempts = 0
 
-        // Outer loop: round 0 = full due list (up to 3 rewrites); round 1 = due list cut by 25% (up to 3 rewrites)
+        // Outer loop: round 0 = full due list; round 1 = due list cut by 25% (only when there are >3 due items)
         for reductionRound in 0...1 {
             if reductionRound == 1 {
+                guard currentPlan.dueItems.count > 3 else { break }
                 let reducedCount = max(3, Int((Double(currentPlan.dueItems.count) * 0.75).rounded(.down)))
                 let reducedDue = Array(currentPlan.dueItems.prefix(reducedCount))
                 currentPlan = PassagePlan(
@@ -241,15 +242,21 @@ public actor GPT61TerraClient {
             }
 
             var feedbackFromPreviousAttempt: String? = nil
+            let maxRewriteAttempts = currentPlan.isBootstrap ? 2 : 3
 
-            for attempt in 0...3 {
+            for attempt in 0...maxRewriteAttempts {
                 totalAttempts += 1
-                onProgress?(attempt == 0 ? "Drafting passage with GPT-6.1 Terra…" : "Rewriting passage (attempt \(attempt)/3)…")
+                if attempt == 0 {
+                    onProgress?("Drafting passage with GPT-6.1 Terra…")
+                } else {
+                    let ruleHint = lastReport?.violations.prefix(2).map(\.ruleName).joined(separator: ", ") ?? "contract checks"
+                    onProgress?("Refining passage (\(attempt)/\(maxRewriteAttempts)): \(ruleHint)…")
+                }
 
                 let draft = try await draftPassageOnce(
                     plan: currentPlan,
                     rewriteFeedback: feedbackFromPreviousAttempt,
-                    effort: attempt == 0 ? .medium : .high
+                    effort: attempt == 0 ? .low : .medium
                 )
 
                 let fullText = draft.sentences.map(\.spanish).joined(separator: " ")
@@ -399,18 +406,31 @@ public actor GPT61TerraClient {
         let allowedSample = plan.allowedKnownLemmas.prefix(1200).joined(separator: ", ")
 
         let lengthRule = plan.isBootstrap
-            ? "BOOTSTRAP MODE (Sessions 1–4): Write 8–10 crisp sentences of AT MOST 8 words each. Include an accurate English translation in `englishLine` for each sentence. Keep vocabulary >=80% inside the allowed list."
-            : "FULL CONTRACT: Write 185–240 natural, vivid Spanish words total. EVERY SINGLE word lemma MUST come strictly from ALLOWED_LEMMAS (or proper names/numbers). NO off-list words."
+            ? "BOOTSTRAP MODE (Sessions 1–4): Write 8–10 crisp, natural Spanish sentences of 5–8 words each (~55–80 words total). Include an accurate English translation in `englishLine` for each sentence. Keep at least 75% of words inside ALLOWED_LEMMAS (or proper names/numbers)."
+            : "FULL CONTRACT: Write 185–240 natural, vivid Spanish words total. Keep >=96% of word lemmas strictly inside ALLOWED_LEMMAS (or proper names/numbers) and NEVER use any banned hold-out word."
+
+        let minSpacing = plan.isBootstrap ? 6 : 30
+        let dueRule = plan.dueItems.isEmpty
+            ? "3. DUE ITEMS: None yet (early session). Focus on weaving NEW_ITEMS naturally across the story."
+            : "3. DUE ITEMS: EVERY item in DUE_ITEMS MUST appear at least once. Combined occurrences of NEW_ITEMS + DUE_ITEMS should be 18%–23% of total words."
+
+        let probeRule = plan.dueItems.isEmpty
+            ? "5. LOAD-BEARING PROBES: Write 2 concise English comprehension probes. Because DUE_ITEMS is empty in this early session, each probe MUST hinge on understanding ONE of the listed NEW_ITEMS (or a key sentence detail using it). Put that NEW_ITEM's `id` and Spanish word in `targetDueItemId` and `targetDueLemma`. Provide 4 plausible options and the 0-based `correctOptionIndex`."
+            : "5. LOAD-BEARING PROBES: Write 2 or 3 English comprehension probes. EACH probe MUST hinge specifically on understanding ONE listed due item (cannot be guessed without knowing that due word!). Provide 4 plausible options and the 0-based `correctOptionIndex`."
+
+        let grammarRule = plan.grammarPatterns.isEmpty
+            ? "6. GRAMMAR: Use clean, natural Spanish grammar matching the learner's stage."
+            : "6. GRAMMAR PATTERNS: Each assigned grammar pattern MUST appear at least TWICE with different lexical words."
 
         let instructions = """
         You are the Spanish Passage Generator inside Cadencia, implementing the Signal-Starvation Hypothesis protocol.
         You write extraordinarily natural, vivid, emotionally engaging Spanish prose while obeying EVERY mechanical rule strictly:
         1. \(lengthRule)
-        2. NEW ITEMS (at most 6): Every item in NEW_ITEMS MUST appear at least 3 times, spaced at least \(plan.isBootstrap ? 8 : 30) words apart. Its FIRST use must make the meaning clearly guessable from context.
-        3. DUE ITEMS: EVERY item in DUE_ITEMS MUST appear at least once. Combined occurrences of NEW_ITEMS + DUE_ITEMS should be 18%–23% of total words.
+        2. NEW ITEMS (at most 6): Every item in NEW_ITEMS MUST appear at least 3 times, with at least 3 occurrences spaced at least \(minSpacing) words apart (e.g., spread across early, middle, and late sentences). Its FIRST use must make the meaning clearly guessable from context.
+        \(dueRule)
         4. FRESH CONTEXT: Never place any due item within ±3 words of its banned prior neighbor words listed below.
-        5. LOAD-BEARING PROBES: Write 2 or 3 English comprehension probes. EACH probe MUST hinge specifically on understanding ONE listed due item (cannot be guessed without knowing that due word!). Provide 4 plausible options and the 0-based `correctOptionIndex`.
-        6. GRAMMAR PATTERNS: Each assigned grammar pattern MUST appear at least TWICE with different lexical words.
+        \(probeRule)
+        \(grammarRule)
         7. CONTINUITY: Continue the serial episode or write a gripping short non-fiction piece matching the topic, with authentic Spanish register (\(plan.accent.displayName)).
         """
 
@@ -420,7 +440,7 @@ public actor GPT61TerraClient {
         STORY SO FAR: \(plan.storySummarySoFar.isEmpty ? "Opening episode — establish vivid setting, protagonist, and immediate hook." : plan.storySummarySoFar)
         REGIONAL ACCENT FLAVOR: \(plan.accent.displayName)
 
-        NEW_ITEMS (3x each, >=\(plan.isBootstrap ? 8 : 30) words apart):
+        NEW_ITEMS (3x each, spread >=\(minSpacing) words apart):
         \(newItemsDesc.isEmpty ? "None this passage." : newItemsDesc)
 
         DUE_ITEMS (each >=1x):
@@ -523,16 +543,34 @@ public actor GPT61TerraClient {
             "Probe \(idx + 1) [target: \(p.targetDueLemma)]: \(p.questionEn) | Options: \(p.options.joined(separator: " / ")) | Correct: \(p.correctOptionIndex)"
         }.joined(separator: "\n")
         let gramText = plan.grammarPatterns.map { "\($0.id): \($0.spanish)" }.joined(separator: "\n")
+        let targetList = (plan.dueItems.isEmpty ? plan.newItems : plan.dueItems)
+            .map { "\($0.spanish) (\($0.englishGloss))" }
+            .joined(separator: ", ")
+
+        let probeCheckRule = plan.dueItems.isEmpty
+            ? "1. Rule 5 (Load-bearing probes): Are there 2–3 probes, and does each genuinely test comprehension of the passage (hinging on its target NEW_ITEM or a key sentence detail in the passage, since there are no due items yet in this early session)?"
+            : "1. Rule 5 (Load-bearing probes): Are there 2–3 probes, and does each genuinely require understanding its bound Spanish due item (not guessable from general knowledge alone)?"
+
+        let grammarCheckRule = plan.grammarPatterns.isEmpty
+            ? "2. Rule 6 (Grammar patterns): None assigned for this passage; set grammarPatternsVerified=true."
+            : "2. Rule 6 (Grammar patterns): Does each assigned grammar pattern appear at least twice with different lexical words?"
+
+        let bootstrapContext = plan.isBootstrap
+            ? "\nNOTE: This is an early Sessions 1–4 Bootstrap micro-story intentionally written in simple 5–8 word beginner sentences. Do NOT reject simple or short sentences as unnatural as long as the Spanish is grammatical and clear."
+            : ""
 
         let instructions = """
-        You are an independent, strict native-level Spanish Linguistic Verifier (Stage B).
+        You are an independent, fair native-level Spanish Linguistic Verifier (Stage B).
         Evaluate ONLY three things:
-        1. Rule 5 (Load-bearing probes): Are there 2–3 probes, and does each genuinely require understanding its bound Spanish due item (not guessable from general knowledge alone)?
-        2. Rule 6 (Grammar patterns): Does each assigned grammar pattern appear at least twice with different lexical words?
-        3. Naturalness: Is the Spanish idiomatic, grammatically accurate, and coherent?
+        \(probeCheckRule)
+        \(grammarCheckRule)
+        3. Naturalness: Is the Spanish grammatically accurate, clear, and coherent?\(bootstrapContext)
         Return passed=true if all three checks are solid; otherwise return passed=false with concrete fix instructions.
         """
         let input = """
+        MODE: \(plan.isBootstrap ? "Bootstrap Micro-Story (Sessions 1–4)" : "Full Passage")
+        TARGET ITEMS (\(plan.dueItems.isEmpty ? "NEW ITEMS" : "DUE ITEMS")): \(targetList.isEmpty ? "None" : targetList)
+
         PASSAGE:
         \(fullText)
 

@@ -244,6 +244,23 @@ public struct SessionScheduler: Sendable {
                 allowedSet.insert(item.spanish.lowercased())
             }
         }
+        // During Sessions 1–4 Bootstrap (or any fresh learner with < 80 safe lemmas, e.g. Stage 1 Session 1),
+        // include the 240 curated bootstrap lemmas (core function words, basic verbs, and transparent cognates)
+        // so the generator has a real beginner vocabulary to form natural Spanish sentences while still
+        // spacing today's 6 newItems 3x each!
+        if isBootstrap || allowedSet.count < 80 {
+            for item in activeLexical where item.isBootstrap {
+                allowedSet.insert(item.spanish.lowercased())
+            }
+        } else {
+            // Keep already-met bootstrap glue words safe so early post-bootstrap sessions never stall
+            // waiting for "el / de / la / y / ser" to cross the 7-day Known half-life threshold.
+            for item in activeLexical where item.isBootstrap {
+                if (records[item.id]?.meetingsCount ?? 0) > 0 {
+                    allowedSet.insert(item.spanish.lowercased())
+                }
+            }
+        }
         for item in selectedDueItems { allowedSet.insert(item.spanish.lowercased()) }
         for item in selectedNewItems { allowedSet.insert(item.spanish.lowercased()) }
 

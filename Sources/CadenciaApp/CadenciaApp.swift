@@ -69,12 +69,12 @@ public struct CadenciaApp: App {
         .fullScreenCover(
             isPresented: Binding(
                 get: { appState.activeSessionController != nil },
-                set: { if !$0 { Task { await appState.finishActiveSession() } } }
+                set: { if !$0 { appState.dismissActiveSession() } }
             )
         ) {
             if let controller = appState.activeSessionController {
                 SessionOrchestratorView(controller: controller) {
-                    Task { await appState.finishActiveSession() }
+                    appState.dismissActiveSession()
                 }
             }
         }
@@ -82,12 +82,12 @@ public struct CadenciaApp: App {
         .sheet(
             isPresented: Binding(
                 get: { appState.activeSessionController != nil },
-                set: { if !$0 { Task { await appState.finishActiveSession() } } }
+                set: { if !$0 { appState.dismissActiveSession() } }
             )
         ) {
             if let controller = appState.activeSessionController {
                 SessionOrchestratorView(controller: controller) {
-                    Task { await appState.finishActiveSession() }
+                    appState.dismissActiveSession()
                 }
                 .frame(minWidth: 720, minHeight: 820)
             }

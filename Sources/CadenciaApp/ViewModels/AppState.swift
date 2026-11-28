@@ -36,8 +36,10 @@ public final class AppState {
     public private(set) var constellationStars: [StarPointGPU] = []
 
     // Hardware & Model readiness
+    private static let phononComputeModeKey = "cadencia.phonon.computeMode"
     public var hasOpenAIKey: Bool = false
     public var hasHuggingFaceToken: Bool = false
+    public var phononComputeMode: PhononComputeMode = .fastCPU
     public var modelStatus: [ManagedModelKind: ModelDownloadProgress] = [:]
     public var engineRuntimeNote: [ManagedModelKind: String] = [:]
     public var liveAudioEnergy: Float = 0.0
@@ -66,6 +68,10 @@ public final class AppState {
         self.speechRecognizer = DualSpeechRecognizer(zipaEngine: zipa)
         self.hasOpenAIKey = KeychainVault.loadAPIKey() != nil
         self.hasHuggingFaceToken = KeychainVault.loadHuggingFaceToken() != nil
+        if let savedMode = UserDefaults.standard.string(forKey: Self.phononComputeModeKey),
+           let parsed = PhononComputeMode(rawValue: savedMode) {
+            self.phononComputeMode = parsed
+        }
 
         for kind in ManagedModelKind.allCases {
             modelStatus[kind] = ModelDownloadProgress(
@@ -138,14 +144,16 @@ public final class AppState {
         await linguisticLoadTask?.value
     }
 
-    /// Starts (or joins) clean sequential ANE warmup without blocking the UI or contending on `aned`.
+    /// Starts (or joins) fast high-priority warmup without blocking the UI or stalling on ANE compilation.
+    /// Warms Phonon (CPU FP32, <0.5s) -> ZIPA (Metal GPU, ~0.5s) -> Parakeet Ultra (Metal GPU, ~1-2s).
+    /// Kokoro-82M English loads on demand when entering bilingual conversations or running the benchmark.
     public func startBackgroundModelWarmup() {
         if modelWarmupTask != nil { return }
         isWarmingModels = true
         warmingLabel = "WARMING"
-        modelWarmupTask = Task(priority: .utility) { [weak self] in
+        modelWarmupTask = Task(priority: .userInitiated) { [weak self] in
             guard let self else { return }
-            await self.warmInstalledModelsInBackground()
+            await self.warmInstalledModelsInBackground(includeKokoro: false)
             await MainActor.run {
                 self.isWarmingModels = false
                 self.warmingLabel = ""
@@ -154,18 +162,36 @@ public final class AppState {
         }
     }
 
-    /// Awaits any in-flight background Core ML warmup (used before Benchmark ANE or voice sessions).
-    public func ensureModelsWarmed() async {
+    /// Awaits any in-flight warmup and ensures all installed engines (including Kokoro) are loaded.
+    public func ensureModelsWarmed(includeKokoro: Bool = true) async {
         if let task = modelWarmupTask {
             await task.value
-        } else {
-            await warmInstalledModelsInBackground()
+        }
+        await warmInstalledModelsInBackground(includeKokoro: includeKokoro)
+    }
+
+    /// Switches Phonon-40m-es between Fast CPU/AMX FP32 (<0.5s instant load) and ANE FP16.
+    public func setPhononComputeMode(_ mode: PhononComputeMode) async {
+        phononComputeMode = mode
+        UserDefaults.standard.set(mode.rawValue, forKey: Self.phononComputeModeKey)
+        guard await assetManager.isModelInstalled(.phononSpanish) else { return }
+        let dir = await assetManager.directory(for: .phononSpanish)
+        engineRuntimeNote[.phononSpanish] = "Switching Phonon to \(mode.shortHardwareLabel)…"
+        let t0 = Date()
+        do {
+            try await phononEngine.loadModels(from: dir, computeMode: mode, forceReload: true)
+            let ms = Int(Date().timeIntervalSince(t0) * 1000)
+            let voices = await phononEngine.availableVoices.count
+            engineRuntimeNote[.phononSpanish] = "Loaded on \(mode.shortHardwareLabel) · \(voices) voices · \(ms) ms"
+        } catch {
+            engineRuntimeNote[.phononSpanish] = "Load error: \(error.localizedDescription)"
         }
     }
 
     /// On-demand loader for Gradium Phonon-40m-es native Spanish TTS.
     public func ensurePhononLoaded() async throws {
-        if await phononEngine.isLoaded { return }
+        let mode = self.phononComputeMode
+        if await phononEngine.isLoaded, await phononEngine.activeComputeMode == mode { return }
         guard await assetManager.isModelInstalled(.phononSpanish) else {
             throw NSError(domain: "PhononSpanishEngine", code: 503, userInfo: [
                 NSLocalizedDescriptionKey: "Phonon-40m-es is not installed yet. Add your Hugging Face token and install it in Settings."
@@ -173,10 +199,10 @@ public final class AppState {
         }
         let dir = await assetManager.directory(for: .phononSpanish)
         let t0 = Date()
-        try await phononEngine.loadModels(from: dir)
+        try await phononEngine.loadModels(from: dir, computeMode: mode)
         let ms = Int(Date().timeIntervalSince(t0) * 1000)
         let voiceCount = await phononEngine.availableVoices.count
-        engineRuntimeNote[.phononSpanish] = "Loaded on ANE · \(voiceCount) native voices · \(ms) ms"
+        engineRuntimeNote[.phononSpanish] = "Loaded on \(mode.shortHardwareLabel) · \(voiceCount) voices · \(ms) ms"
     }
 
     /// On-demand loader for Kokoro-82M English conversation voice.
@@ -194,28 +220,34 @@ public final class AppState {
         engineRuntimeNote[.kokoroEnglish] = "Loaded FP32 Vocoder (af_heart + am_michael) · \(ms) ms"
     }
 
-    /// Loads installed local Core ML models sequentially (Phonon ANE -> Kokoro EN -> Parakeet ANE -> ZIPA Metal GPU)
-    /// recording exact per-model load latencies or errors in `engineRuntimeNote`, then warms optional Silero VAD detached.
-    public func warmInstalledModelsInBackground() async {
+    /// Loads installed local Core ML models cleanly at `.userInitiated` priority:
+    /// 1. Phonon-40m-es (CPU/AMX FP32 default: <0.5s instant load, 10x+ RT, zero ANE compile wait!)
+    /// 2. ZIPA CR Large 300M FP16 (Metal GPU: ~0.5s)
+    /// 3. Parakeet Ultra 600M INT8 (`AsrModels.loadLocal` Metal GPU: ~1–2s, zero 5-branch ANE ladder!)
+    /// 4. Kokoro-82M English (only when `includeKokoro == true`, otherwise lazy-loaded on demand)
+    /// 5. Silero VAD (detached background)
+    public func warmInstalledModelsInBackground(includeKokoro: Bool = false) async {
         let phonon = self.phononEngine
         let kokoro = self.kokoroEngine
         let speech = self.speechRecognizer
         let assets = self.assetManager
+        let mode = self.phononComputeMode
 
-        // 1. Gradium Phonon-40m-es (Native Spanish on ANE)
-        if await assets.isModelInstalled(.phononSpanish), !(await phonon.isLoaded) {
+        // 1. Gradium Phonon-40m-es (Native Spanish — default CPU/AMX FP32 loads in <0.5s!)
+        if await assets.isModelInstalled(.phononSpanish),
+           !(await phonon.isLoaded && (await phonon.activeComputeMode) == mode) {
             await MainActor.run {
                 self.warmingLabel = "WARMING PHONON"
-                self.engineRuntimeNote[.phononSpanish] = "Loading Phonon-40m-es on ANE…"
+                self.engineRuntimeNote[.phononSpanish] = "Loading Phonon-40m-es on \(mode.shortHardwareLabel)…"
             }
             let dir = await assets.directory(for: .phononSpanish)
             let t0 = Date()
             do {
-                try await phonon.loadModels(from: dir)
+                try await phonon.loadModels(from: dir, computeMode: mode)
                 let ms = Int(Date().timeIntervalSince(t0) * 1000)
                 let voices = await phonon.availableVoices.count
                 await MainActor.run {
-                    self.engineRuntimeNote[.phononSpanish] = "Loaded on ANE · \(voices) native voices · \(ms) ms"
+                    self.engineRuntimeNote[.phononSpanish] = "Loaded on \(mode.shortHardwareLabel) · \(voices) voices · \(ms) ms"
                 }
             } catch {
                 await MainActor.run {
@@ -224,8 +256,40 @@ public final class AppState {
             }
         }
 
-        // 2. Kokoro-82M English Tutor (FP32 Vocoder)
-        if await assets.isModelInstalled(.kokoroEnglish), !(await kokoro.isLoaded) {
+        // 2. ZIPA CR Large 300M FP16 (Metal GPU — fast ~0.5s load)
+        if await assets.isModelInstalled(.zipaPhoneme), !(await speech.isZipaReady) {
+            await MainActor.run {
+                self.warmingLabel = "WARMING ZIPA"
+                self.engineRuntimeNote[.zipaPhoneme] = "Loading FP16 on Metal GPU…"
+            }
+            let t0 = Date()
+            do {
+                try await speech.ensureZipaLoaded(assetManager: assets)
+                let ms = Int(Date().timeIntervalSince(t0) * 1000)
+                await MainActor.run { self.engineRuntimeNote[.zipaPhoneme] = "Loaded FP16 on Metal GPU · \(ms) ms" }
+            } catch {
+                await MainActor.run { self.engineRuntimeNote[.zipaPhoneme] = "Load error: \(error.localizedDescription)" }
+            }
+        }
+
+        // 3. Parakeet Ultra 600M INT8 (Metal GPU via AsrModels.loadLocal — ~1–2s, zero ANE stall!)
+        if await assets.isModelInstalled(.parakeetUltra), !(await speech.isParakeetReady) {
+            await MainActor.run {
+                self.warmingLabel = "WARMING PARAKEET"
+                self.engineRuntimeNote[.parakeetUltra] = "Loading INT8 on Metal GPU…"
+            }
+            let t0 = Date()
+            do {
+                try await speech.ensureParakeetLoaded(assetManager: assets)
+                let ms = Int(Date().timeIntervalSince(t0) * 1000)
+                await MainActor.run { self.engineRuntimeNote[.parakeetUltra] = "Loaded INT8 on Metal GPU · \(ms) ms" }
+            } catch {
+                await MainActor.run { self.engineRuntimeNote[.parakeetUltra] = "Load error: \(error.localizedDescription)" }
+            }
+        }
+
+        // 4. Kokoro-82M English Tutor (lazy-loaded on conversation/benchmark so startup stays instant)
+        if includeKokoro, await assets.isModelInstalled(.kokoroEnglish), !(await kokoro.isLoaded) {
             await MainActor.run {
                 self.warmingLabel = "WARMING KOKORO"
                 self.engineRuntimeNote[.kokoroEnglish] = "Loading Kokoro-82M English (FP32 Vocoder)…"
@@ -243,37 +307,11 @@ public final class AppState {
                     self.engineRuntimeNote[.kokoroEnglish] = "Load error: \(error.localizedDescription)"
                 }
             }
-        }
-
-        // 3. Parakeet Ultra 600M INT8 (ANE)
-        if await assets.isModelInstalled(.parakeetUltra), !(await speech.isParakeetReady) {
+        } else if !includeKokoro, await assets.isModelInstalled(.kokoroEnglish), !(await kokoro.isLoaded) {
             await MainActor.run {
-                self.warmingLabel = "WARMING PARAKEET"
-                self.engineRuntimeNote[.parakeetUltra] = "Loading INT8 on ANE…"
-            }
-            let t0 = Date()
-            do {
-                try await speech.ensureParakeetLoaded(assetManager: assets)
-                let ms = Int(Date().timeIntervalSince(t0) * 1000)
-                await MainActor.run { self.engineRuntimeNote[.parakeetUltra] = "Loaded INT8 on ANE · \(ms) ms" }
-            } catch {
-                await MainActor.run { self.engineRuntimeNote[.parakeetUltra] = "Load error: \(error.localizedDescription)" }
-            }
-        }
-
-        // 4. ZIPA CR Large 300M FP16 (Metal GPU)
-        if await assets.isModelInstalled(.zipaPhoneme), !(await speech.isZipaReady) {
-            await MainActor.run {
-                self.warmingLabel = "WARMING ZIPA"
-                self.engineRuntimeNote[.zipaPhoneme] = "Loading FP16 on Metal GPU…"
-            }
-            let t0 = Date()
-            do {
-                try await speech.ensureZipaLoaded(assetManager: assets)
-                let ms = Int(Date().timeIntervalSince(t0) * 1000)
-                await MainActor.run { self.engineRuntimeNote[.zipaPhoneme] = "Loaded FP16 on Metal GPU · \(ms) ms" }
-            } catch {
-                await MainActor.run { self.engineRuntimeNote[.zipaPhoneme] = "Load error: \(error.localizedDescription)" }
+                if self.engineRuntimeNote[.kokoroEnglish] == nil {
+                    self.engineRuntimeNote[.kokoroEnglish] = "Ready on disk · loads on demand in conversations"
+                }
             }
         }
 
@@ -424,18 +462,19 @@ public final class AppState {
             let bundleDir = try await assetManager.downloadPhononSpanish(hfToken: hfToken) { [weak self] prog in
                 Task { @MainActor in self?.applyDownloadProgress(prog) }
             }
+            let mode = self.phononComputeMode
             modelStatus[.phononSpanish] = ModelDownloadProgress(
                 kind: .phononSpanish,
                 fractionCompleted: 0.94,
-                statusMessage: "Compiling Phonon-40m-es for Apple Neural Engine (once per install)…",
+                statusMessage: "Loading Phonon-40m-es on \(mode.shortHardwareLabel)…",
                 isReady: false,
                 errorMessage: nil
             )
             let t0 = Date()
-            try await phononEngine.loadModels(from: bundleDir, forceReload: true)
+            try await phononEngine.loadModels(from: bundleDir, computeMode: mode, forceReload: true)
             let ms = Int(Date().timeIntervalSince(t0) * 1000)
             let voiceCount = await phononEngine.availableVoices.count
-            self.engineRuntimeNote[.phononSpanish] = "Loaded on ANE · \(voiceCount) native voices · \(ms) ms"
+            self.engineRuntimeNote[.phononSpanish] = "Loaded on \(mode.shortHardwareLabel) · \(voiceCount) voices · \(ms) ms"
             modelStatus[.phononSpanish] = ModelDownloadProgress(
                 kind: .phononSpanish,
                 fractionCompleted: 1.0,
@@ -559,10 +598,17 @@ public final class AppState {
         guard let profile else { return }
         let controller = SessionController(appState: self, profile: profile)
         self.activeSessionController = controller
-        Task { await controller.beginSession() }
+        controller.startSessionAsync()
+    }
+
+    public func dismissActiveSession() {
+        activeSessionController?.cancelSession()
+        activeSessionController = nil
+        Task { try? await refreshLearnerData() }
     }
 
     public func finishActiveSession() async {
+        activeSessionController?.cancelSession()
         activeSessionController = nil
         try? await refreshLearnerData()
     }

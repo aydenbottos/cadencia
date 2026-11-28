@@ -385,4 +385,90 @@ final class CadenciaCoreTests: XCTestCase {
         XCTAssertEqual(stitched.wordTimings[1].wordIndex, 1)
         XCTAssertEqual(stitched.wordTimings[1].startTime, 1.1, accuracy: 1e-3)
     }
+
+    // MARK: - 9. Session 1 Bootstrap Contract Verification & Greedy Rule 2 Spacing Regression
+
+    func testSession1BootstrapPlanPassesStageAAndGreedySpacing() async throws {
+        // Greedy spaced-subsequence helper must allow natural extra uses of high-frequency words
+        // while still rejecting crammed occurrences.
+        XCTAssertEqual(ContractVerifier.maxSpacedOccurrences(positions: [3, 15, 29, 32, 48], minSpacing: 8), 4)
+        XCTAssertEqual(ContractVerifier.maxSpacedOccurrences(positions: [3, 5, 7], minSpacing: 8), 1)
+        XCTAssertEqual(ContractVerifier.maxSpacedOccurrences(positions: [2, 10, 12, 18], minSpacing: 6), 3)
+
+        let tmpURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cadencia_boot_test_\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: tmpURL) }
+
+        let db = try CadenciaDatabase(databaseURL: tmpURL)
+        let activeItems = try await db.loadAllSyllabusItems(includeHoldout: false)
+        let holdoutItems = try await db.loadHoldoutItems()
+        let inflections = try await db.loadInflectionDictionary()
+        let genres = try await db.loadSerialGenres()
+        let lemmatizer = SpanishLemmatizer(inflections: inflections, chunkItems: activeItems.filter { $0.itemType == .chunk })
+
+        let profile = LearnerProfile(
+            learnerId: "boot_tester",
+            codedGroupLabel: "SOLO-0001",
+            displayName: "Tester",
+            studyMode: .soloPilot,
+            selectedSerialId: genres.first?.id ?? "madrid_noir",
+            nonfictionTopics: ["Architecture"],
+            currentSessionNumber: 1,
+            totalLoggedSeconds: 0,
+            medianReadingWPM: 75,
+            parameters: .protocolDefaults,
+            createdAt: Date()
+        )
+        let scheduler = SessionScheduler(parameters: .protocolDefaults)
+        let plan = scheduler.planNextPassage(
+            profile: profile,
+            blockType: .input1,
+            passageIndexInSession: 0,
+            newItemsRemainingInSession: 60,
+            allItems: activeItems,
+            holdoutItems: holdoutItems,
+            records: [:],
+            priorContextByItem: [:],
+            serialGenre: genres.first!,
+            serialEpisodeNumber: 0,
+            storySummarySoFar: ""
+        )
+
+        XCTAssertTrue(plan.isBootstrap)
+        XCTAssertTrue(plan.dueItems.isEmpty)
+        XCTAssertEqual(plan.newItems.count, 6)
+        XCTAssertGreaterThanOrEqual(plan.allowedKnownLemmas.count, 200, "Session 1 Bootstrap must allow the 240 foundation bootstrap lemmas")
+
+        // Realistic 9-sentence Session 1 Bootstrap micro-story introducing el, de, la, que, en, y
+        let rawSentences = [
+            "Clara está en la parte principal de Madrid.",
+            "El grupo es grande y muy especial.",
+            "Ella ve que el proyecto tiene valor.",
+            "La historia de la familia es importante.",
+            "Mateo entra en el momento que importa.",
+            "Hay una persona local y real aquí.",
+            "El programa está en el centro de estudio.",
+            "Clara sabe que la idea es posible.",
+            "Ellos hablan de todo y ven la información.",
+        ]
+        let sentences = rawSentences.enumerated().map { idx, es in
+            PassageSentence(id: idx, spanish: es, englishLine: "Line \(idx)", wordTokens: lemmatizer.extractWordTokens(es))
+        }
+        let fullText = rawSentences.joined(separator: " ")
+
+        let verifier = ContractVerifier(lemmatizer: lemmatizer, parameters: .protocolDefaults)
+        let report = verifier.verifyStageA(
+            passageText: fullText,
+            sentences: sentences,
+            plan: plan,
+            priorContextByItem: [:]
+        )
+
+        XCTAssertTrue(
+            report.passed,
+            "Session 1 Bootstrap micro-story MUST pass Stage A! Violations: \(report.violations.map { "\($0.ruleName): \($0.detail) [\($0.offendingTokens.joined(separator: ", "))]" }.joined(separator: " | "))"
+        )
+        XCTAssertTrue(report.holdoutLeaks.isEmpty)
+        XCTAssertEqual(PhononComputeMode.fastCPU.rawValue, "cpu")
+    }
 }

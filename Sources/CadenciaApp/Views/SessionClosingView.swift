@@ -197,6 +197,18 @@ public struct SessionClosingView: View {
                         )
                     }
                     .disabled(isSaving)
+
+                    Button {
+                        controller.cancelSession()
+                        onDismiss()
+                    } label: {
+                        Text("Exit Without Saving")
+                            .font(CadenciaFont.uiCaption(14, weight: .semibold))
+                            .foregroundStyle(CadenciaPalette.mutedSilver)
+                            .padding(.vertical, 8)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(isSaving)
                 } else {
                     // Sealed confirmation card
                     VStack(spacing: 12) {

@@ -86,9 +86,11 @@ public final class SessionController {
 
     private var passageCounterInSession: Int = 0
     private var introducedItemIdsThisSession: [String] = []
+    private var activeBlockTask: Task<Void, Never>?
     private var playbackHighlightTask: Task<Void, Never>?
     private var prefetchTask: Task<Void, Never>?
     private var recentPassageSummaries: [String] = []
+    private var isCancelledSession: Bool = false
 
     public init(appState: AppState, profile: LearnerProfile) {
         self.appState = appState
@@ -103,8 +105,35 @@ public final class SessionController {
         self.currentWPMOverride = WeeklyPlanSpec.forWeek(profile.currentWeek).paceWPM
     }
 
+    /// Starts the session inside a tracked, cancellable task so tapping X during drafting cancels cleanly.
+    public func startSessionAsync() {
+        activeBlockTask?.cancel()
+        activeBlockTask = Task { [weak self] in
+            await self?.beginSession()
+        }
+    }
+
+    /// Cancels all in-flight passage generation, prefetch, timers, and audio playback immediately.
+    public func cancelSession() {
+        isCancelledSession = true
+        activeBlockTask?.cancel()
+        activeBlockTask = nil
+        prefetchTask?.cancel()
+        prefetchTask = nil
+        timerTask?.cancel()
+        timerTask = nil
+        playbackHighlightTask?.cancel()
+        playbackHighlightTask = nil
+        isGeneratingPassage = false
+        isPlayingAudio = false
+        orbMode = .idle
+        let player = appState.audioPlayer
+        Task { await player.stopPlayback() }
+    }
+
     public func beginSession() async {
         await appState.ensureLinguisticResourcesLoaded()
+        guard !Task.isCancelled && !isCancelledSession else { return }
         // Log immutable sessionStarted event
         try? await appState.database.appendEvidence(EvidenceEvent(
             learnerId: profile.learnerId,
@@ -261,11 +290,16 @@ public final class SessionController {
 
         do {
             let passage = try await generateSingleVerifiedPassage(for: block) { [weak self] status in
-                Task { @MainActor in self?.generationStatusText = status }
+                Task { @MainActor in
+                    guard let self, !self.isCancelledSession else { return }
+                    self.generationStatusText = status
+                }
             }
+            guard !Task.isCancelled && !isCancelledSession else { return }
             await presentPassage(passage)
             prefetchNextPassage(for: block)
         } catch {
+            guard !Task.isCancelled && !isCancelledSession else { return }
             errorMessage = error.localizedDescription
         }
     }

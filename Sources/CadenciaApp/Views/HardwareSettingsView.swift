@@ -310,6 +310,21 @@ public struct HardwareSettingsView: View {
                 Task { await appState.downloadPhononSpanish() }
             }
 
+            HStack(spacing: 10) {
+                Text("Phonon Backend")
+                    .font(CadenciaFont.mono(10, weight: .semibold))
+                    .foregroundStyle(CadenciaPalette.mutedSilver)
+                Picker("Phonon Backend", selection: Binding(
+                    get: { appState.phononComputeMode },
+                    set: { next in Task { await appState.setPhononComputeMode(next) } }
+                )) {
+                    ForEach(PhononComputeMode.allCases) { mode in
+                        Text(mode.displayName).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+            }
+
             Divider().overlay(Color.white.opacity(0.1))
 
             // 2. Kokoro-82M (English Conversation Tutor)
@@ -371,9 +386,10 @@ public struct HardwareSettingsView: View {
                 if prog?.isReady == true {
                     let badge: String = {
                         if prog?.statusMessage.hasPrefix("Built-in") == true { return "BUILT-IN · GPU" }
-                        if kind == .phononSpanish { return "ANE READY" }
+                        if kind == .phononSpanish { return appState.phononComputeMode.badgeLabel }
                         if kind == .kokoroEnglish { return "FP32 READY" }
-                        return "ANE READY"
+                        if kind == .parakeetUltra || kind == .zipaPhoneme { return "GPU READY" }
+                        return "READY"
                     }()
                     Label(badge, systemImage: "checkmark.circle.fill")
                         .font(CadenciaFont.mono(10, weight: .bold))
@@ -458,8 +474,8 @@ public struct HardwareSettingsView: View {
                                 let ms = Date().timeIntervalSince(t0) * 1000.0
                                 let rtfx = (ms > 0) ? (clip.durationSeconds / (ms / 1000.0)) : 0
                                 phononSummary = String(
-                                    format: "Phonon-40m-es (Celia es-ES · 24 kHz ANE): %.0f ms for %.1fs audio (%.1f× RT)",
-                                    ms, clip.durationSeconds, rtfx
+                                    format: "Phonon-40m-es (Celia es-ES · 24 kHz %@): %.0f ms for %.1fs audio (%.1f× RT)",
+                                    appState.phononComputeMode.badgeLabel, ms, clip.durationSeconds, rtfx
                                 )
                             } catch {
                                 phononSummary = "Phonon-40m-es error: \(error.localizedDescription)"
@@ -489,14 +505,14 @@ public struct HardwareSettingsView: View {
                         }
 
                         benchmarkOutput = String(
-                            format: "3.0s Concurrent Dual-STT -> Parakeet Ultra INT8: %.0f ms | ZIPA 300M FP16: %.0f ms\n%@\n%@",
+                            format: "3.0s Concurrent Dual-STT (Metal GPU) -> Parakeet INT8: %.0f ms | ZIPA FP16: %.0f ms\n%@\n%@",
                             stt.parakeetMs, stt.zipaMs, phononSummary, kokoroSummary
                         )
                     }
                 } label: {
                     HStack(spacing: 6) {
                         if isBenchmarking { ProgressView().scaleEffect(0.75) }
-                        Text(isBenchmarking ? "Running…" : "Benchmark ANE")
+                        Text(isBenchmarking ? "Running…" : "Run Benchmark")
                             .font(CadenciaFont.mono(11, weight: .bold))
                     }
                     .foregroundStyle(CadenciaPalette.obsidian)

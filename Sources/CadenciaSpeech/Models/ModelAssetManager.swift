@@ -25,9 +25,9 @@ public enum ManagedModelKind: String, CaseIterable, Identifiable, Sendable {
 
     public var roleDescription: String {
         switch self {
-        case .phononSpanish: return "Native Spanish voice for all passages & ledger · 24 kHz ANE · 8 es-ES & es-MX voices"
+        case .phononSpanish: return "Native Spanish voice for all passages & ledger · 24 kHz · 8 es-ES & es-MX voices"
         case .kokoroEnglish: return "On-device English conversation tutor · 24 kHz · FP32 Vocoder"
-        case .parakeetUltra: return "On-device learner speech-to-text · INT8 ANE · >100× real-time"
+        case .parakeetUltra: return "On-device learner speech-to-text · INT8 Metal GPU · Fast load & >100× RT"
         case .zipaPhoneme: return "On-device IPA phoneme recognizer · FP16 Multifunction Metal GPU"
         case .sileroVAD: return "Real-time speech endpointing & silence trimming"
         }
@@ -252,8 +252,8 @@ public actor ModelAssetManager {
 
         onProgress(.init(
             kind: .phononSpanish,
-            fractionCompleted: 0.90,
-            statusMessage: "Compiling Phonon-40m-es for Apple Neural Engine…",
+            fractionCompleted: 0.92,
+            statusMessage: "Initializing Phonon-40m-es voice engine…",
             isReady: false,
             errorMessage: nil
         ))
@@ -338,10 +338,10 @@ public actor ModelAssetManager {
         let targetDir = try await AsrModels.download(
             version: .ultra,
             encoderPrecision: .int8,
-            encoderComputeUnits: .cpuAndNeuralEngine,
+            encoderComputeUnits: .cpuAndGPU,
             progressHandler: { prog in
                 let dlFrac = min(1.0, max(0.0, prog.fractionCompleted <= 0.51 ? prog.fractionCompleted * 2.0 : prog.fractionCompleted))
-                let uiFrac = 0.05 + 0.70 * dlFrac
+                let uiFrac = 0.05 + 0.78 * dlFrac
                 let message: String
                 switch prog.phase {
                 case .listing:
@@ -353,7 +353,7 @@ public actor ModelAssetManager {
                         message = "Downloading Parakeet Ultra INT8 (\(Int(dlFrac * 100))%)…"
                     }
                 case .compiling(let name):
-                    message = "Compiling \(name) for Apple Neural Engine…"
+                    message = "Preparing \(name) for Metal GPU…"
                 }
                 onProgress(.init(
                     kind: .parakeetUltra,
@@ -367,40 +367,18 @@ public actor ModelAssetManager {
 
         onProgress(.init(
             kind: .parakeetUltra,
-            fractionCompleted: 0.78,
-            statusMessage: "Download complete · Compiling Parakeet INT8 for Neural Engine…",
+            fractionCompleted: 0.88,
+            statusMessage: "Download complete · Loading Parakeet INT8 on Metal GPU…",
             isReady: false,
             errorMessage: nil
         ))
 
-        let models = try await AsrModels.load(
-            from: targetDir,
-            version: .ultra,
-            encoderPrecision: .int8,
-            encoderComputeUnits: .cpuAndNeuralEngine,
-            progressHandler: { prog in
-                let compileMsg: String
-                switch prog.phase {
-                case .compiling(let name):
-                    compileMsg = "Compiling \(name) for Neural Engine…"
-                default:
-                    compileMsg = "Optimizing Parakeet Ultra INT8 on Neural Engine…"
-                }
-                let uiFrac = min(0.96, max(0.80, 0.78 + 0.18 * prog.fractionCompleted))
-                onProgress(.init(
-                    kind: .parakeetUltra,
-                    fractionCompleted: uiFrac,
-                    statusMessage: compileMsg,
-                    isReady: false,
-                    errorMessage: nil
-                ))
-            }
-        )
+        let models = try await DualSpeechRecognizer.loadParakeetUltraLocalFast(from: targetDir)
 
         onProgress(.init(
             kind: .parakeetUltra,
             fractionCompleted: 1.0,
-            statusMessage: "Installed & ready on device",
+            statusMessage: "Installed & ready on Metal GPU",
             isReady: true,
             errorMessage: nil
         ))

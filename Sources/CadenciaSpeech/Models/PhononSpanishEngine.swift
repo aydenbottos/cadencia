@@ -25,11 +25,54 @@ private final class PhononHandleBox: @unchecked Sendable {
     }
 }
 
-/// Native on-device Gradium **Phonon-40m-es** Spanish TTS engine running on Apple Neural Engine
-/// via `PhononCore.xcframework` (`gradium-ai/xn-ptts` v0.7.1).
+/// Compute placement for Gradium **Phonon-40m-es** Core ML inference.
+///
+/// - `.fastCPU` (`PTTS_UNIT_CPU`, default): runs in FP32 on Apple Silicon CPU/AMX (~10–14× real-time
+///   on iPhone 18 Pro Max, ~55 ms TTFA, highest numerical precision, and **loads in < 0.5 seconds**
+///   because it completely bypasses iOS 26/27 `anecompilerservice` cold compilation!).
+/// - `.neuralEngine` (`PTTS_UNIT_ANE`): runs in FP16 on Apple Neural Engine (~12–14.5× real-time,
+///   lower battery draw, but requires an initial iOS `ANECCompile` compilation step on first load).
+public enum PhononComputeMode: String, Sendable, CaseIterable, Identifiable {
+    case fastCPU = "cpu"
+    case neuralEngine = "ane"
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .fastCPU: return "Fast CPU (FP32)"
+        case .neuralEngine: return "ANE (FP16)"
+        }
+    }
+
+    public var badgeLabel: String {
+        switch self {
+        case .fastCPU: return "CPU FP32"
+        case .neuralEngine: return "ANE FP16"
+        }
+    }
+
+    public var shortHardwareLabel: String {
+        switch self {
+        case .fastCPU: return "CPU/AMX FP32"
+        case .neuralEngine: return "ANE FP16"
+        }
+    }
+
+    var pttsUnit: UInt32 {
+        switch self {
+        case .fastCPU: return UInt32(PTTS_UNIT_CPU)
+        case .neuralEngine: return UInt32(PTTS_UNIT_ANE)
+        }
+    }
+}
+
+/// Native on-device Gradium **Phonon-40m-es** Spanish TTS engine via `PhononCore.xcframework`
+/// (`gradium-ai/xn-ptts` v0.7.1).
 ///
 /// Characteristics:
-///  - 24 kHz mono Float32 native Spanish speech (~12–14.5× real-time on Apple Silicon ANE)
+///  - 24 kHz mono Float32 native Spanish speech (~10–14.5× real-time on Apple Silicon)
+///  - Defaults to `.fastCPU` (Apple Silicon AMX FP32) for <0.5s instant load without iOS ANE compile stalls
 ///  - 8 authentic native Spanish voices (`es-ES` Castilian & `es-MX` Latin American)
 ///  - Pure-Rust on-device Core ML bundle exporter (`ptts_export_coreml`) — zero Python, zero computer
 ///  - SHA-256 disk WAV cache for instant repeat word/sentence playback
@@ -44,6 +87,7 @@ public actor PhononSpanishEngine {
     public private(set) var availableVoices: [String] = []
     public private(set) var activeVoiceName: String = ""
     public private(set) var loadedDirectory: URL?
+    public private(set) var activeComputeMode: PhononComputeMode = .fastCPU
 
     public init(cacheDirectory: URL? = nil) {
         if let cacheDirectory {
@@ -97,11 +141,15 @@ public actor PhononSpanishEngine {
 
     // MARK: - Load & Lifecycle
 
-    public func loadModels(from bundleDir: URL, forceReload: Bool = false) async throws {
-        if isLoaded && !forceReload && loadedDirectory == bundleDir {
+    public func loadModels(
+        from bundleDir: URL,
+        computeMode: PhononComputeMode = .fastCPU,
+        forceReload: Bool = false
+    ) async throws {
+        if isLoaded && !forceReload && loadedDirectory == bundleDir && activeComputeMode == computeMode {
             return
         }
-        if forceReload {
+        if forceReload || isLoaded {
             handleBox = nil
             isLoaded = false
             availableVoices = []
@@ -110,10 +158,11 @@ public actor PhononSpanishEngine {
 
         let dirPath = bundleDir.path
         let queue = self.ffiQueue
+        let unit = computeMode.pttsUnit
         let loaded: (PhononHandleBox, [String]) = try await runOnQueue(queue) {
             guard let ptr = dirPath.withCString({ cDir in
                 "es".withCString { cLang in
-                    ptts_new(cDir, UInt32(PTTS_UNIT_ANE), cLang)
+                    ptts_new(cDir, unit, cLang)
                 }
             }) else {
                 let msg = ptts_last_error(nil).map { String(cString: $0) } ?? "Failed to initialize Phonon-40m-es"
@@ -130,6 +179,7 @@ public actor PhononSpanishEngine {
         self.availableVoices = loaded.1
         self.activeVoiceName = loaded.1.first ?? ""
         self.loadedDirectory = bundleDir
+        self.activeComputeMode = computeMode
         self.isLoaded = true
     }
 

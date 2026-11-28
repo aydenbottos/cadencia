@@ -35,6 +35,7 @@ public struct SessionOrchestratorView: View {
                         .padding(.horizontal, 16)
                         .padding(.top, 8)
                         .padding(.bottom, 6)
+                        .zIndex(10)
                 }
 
                 Group {
@@ -42,7 +43,10 @@ public struct SessionOrchestratorView: View {
                     case .warmup:
                         WarmupBlockView(controller: controller)
                     case .input1, .input2:
-                        InputReaderView(controller: controller)
+                        InputReaderView(controller: controller, onCancelAndExit: {
+                            controller.cancelSession()
+                            onDismiss()
+                        })
                     case .output1:
                         SpeakingPartnerView(controller: controller)
                     case .output2:
@@ -59,13 +63,17 @@ public struct SessionOrchestratorView: View {
             }
         }
         .preferredColorScheme(.dark)
-        .confirmationDialog("End Session Early?", isPresented: $showExitConfirm, titleVisibility: .visible) {
-            Button("Finish & Log Progress", role: .destructive) {
+        .alert("End Session Early?", isPresented: $showExitConfirm) {
+            Button("Finish & Log Progress") {
                 Task { await controller.transitionToBlock(.closing) }
+            }
+            Button("Exit Without Saving", role: .destructive) {
+                controller.cancelSession()
+                onDismiss()
             }
             Button("Keep Going", role: .cancel) {}
         } message: {
-            Text("All active minutes and append-only evidence events logged so far will be saved.")
+            Text("Log your active minutes to SQLite, or exit straight back to Studio.")
         }
         .alert("Notice", isPresented: Binding(
             get: { controller.errorMessage != nil },
@@ -81,15 +89,25 @@ public struct SessionOrchestratorView: View {
         CadenciaGlassContainer(spacing: 10) {
             HStack(spacing: 10) {
                 Button {
-                    showExitConfirm = true
+                    let hasLoggedProgress = controller.passagesCompleted > 0
+                        || !controller.speakingTurns.isEmpty
+                        || controller.usableEventsThisSession > 0
+                    if controller.isGeneratingPassage || !hasLoggedProgress {
+                        controller.cancelSession()
+                        onDismiss()
+                    } else {
+                        showExitConfirm = true
+                    }
                 } label: {
                     Image(systemName: "xmark")
                         .font(.subheadline.weight(.bold))
                         .foregroundStyle(CadenciaPalette.ivoryText)
-                        .frame(width: 36, height: 36)
-                        .cadenciaGlassPill()
+                        .frame(width: 44, height: 44)
+                        .contentShape(Circle())
+                        .cadenciaGlassPill(interactive: false)
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel("Close Session")
 
                 // Block progress pill
                 HStack(spacing: 8) {
@@ -124,8 +142,9 @@ public struct SessionOrchestratorView: View {
                     Image(systemName: controller.isTimerPaused ? "play.fill" : "ellipsis")
                         .font(.subheadline.weight(.bold))
                         .foregroundStyle(CadenciaPalette.ivoryText)
-                        .frame(width: 36, height: 36)
-                        .cadenciaGlassPill()
+                        .frame(width: 44, height: 44)
+                        .contentShape(Circle())
+                        .cadenciaGlassPill(interactive: false)
                 }
             }
         }
